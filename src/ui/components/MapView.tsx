@@ -372,6 +372,7 @@ export default function MapView({
             style: '/styles/high_contrast_outdoor_style.json',
             center: HIKE_LOCATIONS[0].coords,
             zoom: HIKE_LOCATIONS[0].zoom,
+            pitch: 45,
             maxZoom: 18,
             // Prevent zooming out past the tile extent of our offline
             // alps_basemap.pmtiles / alps_terrain.pmtiles files (z5-z14).
@@ -392,6 +393,12 @@ export default function MapView({
             (activeMap as any).style?.sourceCaches?.['basemap-local']?.setMaxTiles(25);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (activeMap as any).style?.sourceCaches?.['terrain-local']?.setMaxTiles(25);
+
+            // Enable 3D terrain mesh mapping using the offline raster DEM source
+            activeMap.setTerrain({
+              source: 'terrain-local',
+              exaggeration: 1.3,
+            });
 
             // ── Expose imperative region-switcher to the parent ───────────
             // loadOfflineRegion() lets App (or a future download manager UI)

@@ -1,0 +1,51 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Geospatial Data & Local Map Archives
+*.pmtiles
+*.mbtiles
+*.bin
+*.geojson
+*_index.json
+
+# Local environment keys/tokens
+.env*
+
+# Large binaries and tools
+planetiler.jar
+
+# Local Geospatial & Route Engines
+data/
+valhalla_data/
+
+# Nested project target build outputs
+offline_sandbox/gdal/target/
+offline_sandbox/massif/target/
+
+# Expo & React Native Build Folders
+node_modules/
+.expo/
+ios/Pods/
+android/app/build/

@@ -59,7 +59,7 @@ class WorkerPMTilesSource implements Source {
   }
 
   /** PMTiles protocol uses the key to de-duplicate sources in its registry. */
-  getKey() { return this.filename; }
+  getKey() { return `pmtiles://local/${this.filename}`; }
 
   async getBytes(offset: number, length: number, signal?: AbortSignal): Promise<RangeResponse> {
     const startTime = performance.now();

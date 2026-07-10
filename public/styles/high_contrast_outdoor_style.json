@@ -37,7 +37,7 @@
       "type": "fill",
       "source": "basemap-local",
       "source-layer": "landuse",
-      "filter": ["==", ["get", "class"], "forest"],
+      "filter": ["==", ["get", "landuse"], "forest"],
       "paint": {
         "fill-color": "#1B4D3E",
         "fill-opacity": 1.0
@@ -48,7 +48,7 @@
       "type": "fill",
       "source": "basemap-local",
       "source-layer": "landuse",
-      "filter": ["match", ["get", "class"], ["scrub", "grass"], true, false],
+      "filter": ["match", ["get", "landuse"], ["scrub", "grass"], true, false],
       "paint": {
         "fill-color": "#A3B899",
         "fill-opacity": 1.0
@@ -59,7 +59,7 @@
       "type": "fill",
       "source": "basemap-local",
       "source-layer": "natural",
-      "filter": ["==", ["get", "class"], "rock"],
+      "filter": ["==", ["get", "natural"], "rock"],
       "paint": {
         "fill-color": "#D3D3D3",
         "fill-opacity": 1.0
@@ -131,7 +131,7 @@
       "type": "line",
       "source": "basemap-local",
       "source-layer": "roads",
-      "filter": ["==", ["geometry-type"], "LineString"],
+      "filter": ["has", "sac_scale"],
       "paint": {
         "line-width": [
           "interpolate",

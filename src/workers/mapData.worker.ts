@@ -243,23 +243,36 @@ async function initFiles(filenames: string[]): Promise<void> {
   for (const filename of filenames) {
     const handle = await getHandle(filename);
 
-    // Only seed the fallback legacy file when it is genuinely empty.
-    if (filename === 'hike.pmtiles' && handle.getSize() === 0) {
-      console.log('[mapData.worker] hike.pmtiles is empty \u2014 seeding with sample dataset\u2026');
-      try {
-        const res = await fetch('https://pmtiles.io/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles');
-        if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-        const buf = await res.arrayBuffer();
-        handle.write(new Uint8Array(buf), { at: 0 });
-        handle.flush();
-        console.log(`[mapData.worker] Sample PMTiles written. Size: ${handle.getSize()} bytes`);
-      } catch (err) {
-        console.error('[mapData.worker] Seed fetch failed \u2014 writing stub header:', err);
-        // Minimal PMTiles v3 magic + version byte so the library does not crash.
-        const stub = new Uint8Array(127);
-        stub.set([0x50, 0x4D, 0x54, 0x69, 0x6C, 0x65, 0x73, 3]); // "PMTiles" + v3
-        handle.write(stub, { at: 0 });
-        handle.flush();
+    if (handle.getSize() === 0) {
+      if (filename === 'hike.pmtiles') {
+        console.log('[mapData.worker] hike.pmtiles is empty — seeding with sample dataset…');
+        try {
+          const res = await fetch('https://pmtiles.io/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles');
+          if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
+          const buf = await res.arrayBuffer();
+          handle.write(new Uint8Array(buf), { at: 0 });
+          handle.flush();
+          console.log(`[mapData.worker] Sample PMTiles written. Size: ${handle.getSize()} bytes`);
+        } catch (err) {
+          console.error('[mapData.worker] Seed fetch failed — writing stub header:', err);
+          // Minimal PMTiles v3 magic + version byte so the library does not crash.
+          const stub = new Uint8Array(127);
+          stub.set([0x50, 0x4D, 0x54, 0x69, 0x6C, 0x65, 0x73, 3]); // "PMTiles" + v3
+          handle.write(stub, { at: 0 });
+          handle.flush();
+        }
+      } else {
+        console.log(`[mapData.worker] "${filename}" is empty — provisioning from local assets /local/${filename}…`);
+        try {
+          const res = await fetch(`/local/${filename}`);
+          if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
+          const buf = await res.arrayBuffer();
+          handle.write(new Uint8Array(buf), { at: 0 });
+          handle.flush();
+          console.log(`[mapData.worker] Provisioned "${filename}" from local assets. Size: ${handle.getSize()} bytes`);
+        } catch (err) {
+          console.error(`[mapData.worker] Failed to provision "${filename}" from local assets:`, err);
+        }
       }
     }
   }

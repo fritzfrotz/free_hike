@@ -23,12 +23,15 @@
  */
 
 import Flatbush from 'flatbush';
+import { geojson as flatgeobufGeojson } from 'flatgeobuf';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
   ElevationProfileRequestPayload,
   ElevationProfileSuccessPayload,
 } from '../shared/types';
+
+const { serialize: serializeFgb } = flatgeobufGeojson;
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -131,7 +134,7 @@ const MAX_RETRIES = 3;
 
 /** OPFS file names. */
 const OPFS_INDEX_FILENAME = 'trails_index.bin';
-const OPFS_FEATURES_FILENAME = 'trails_features.json';
+const OPFS_FEATURES_FILENAME = 'trails_features.fgb';
 
 // ---------------------------------------------------------------------------
 // Message router
@@ -210,6 +213,8 @@ async function handleFetchBounds(id: string, payload: FetchBoundsPayload): Promi
 
   // 6. Build GeoJSON FeatureCollection from parsed ways so the main thread
   //    can inject it directly into the MapLibre source without a second RPC.
+  //    This is kept lean (stripping heavy properties like name and highway) to keep memory footprint low,
+  //    while full metadata rests in the .fgb file in OPFS.
   const geojsonFeatures = features.map((f) => {
     const coordPairs: [number, number][] = [];
     for (let i = 0; i < f.coords.length; i += 2) {
@@ -217,7 +222,7 @@ async function handleFetchBounds(id: string, payload: FetchBoundsPayload): Promi
     }
     return {
       type: 'Feature' as const,
-      properties: { name: f.name, highway: f.highway, id: f.id },
+      properties: { id: f.id },
       geometry: { type: 'LineString' as const, coordinates: coordPairs },
     };
   });
@@ -420,32 +425,42 @@ async function persistToOpfs(index: Flatbush, features: OsmWayFeature[]): Promis
       `[spatial.worker] Wrote ${index.data.byteLength} bytes → OPFS/${OPFS_INDEX_FILENAME}`
     );
 
-    // --- Persist feature metadata as JSON (coords excluded to save space) ---
-    const metaArray = features.map((f) => ({
-      id: f.id,
-      name: f.name,
-      highway: f.highway,
-      minX: f.minX,
-      minY: f.minY,
-      maxX: f.maxX,
-      maxY: f.maxY,
-      // coords are stored as a regular array for JSON serialisability
-      coords: Array.from(f.coords),
-    }));
-    const featuresJson = JSON.stringify(metaArray);
-    const featuresBytes = new TextEncoder().encode(featuresJson);
+    // --- Persist feature metadata as FlatGeobuf ---
+    const geojsonFeatures = features.map((f) => {
+      const coordPairs: [number, number][] = [];
+      for (let i = 0; i < f.coords.length; i += 2) {
+        coordPairs.push([f.coords[i], f.coords[i + 1]]);
+      }
+      return {
+        type: 'Feature' as const,
+        properties: {
+          id: f.id,
+          name: f.name,
+          highway: f.highway,
+        },
+        geometry: {
+          type: 'LineString' as const,
+          coordinates: coordPairs,
+        },
+      };
+    });
+    const featureCollection = {
+      type: 'FeatureCollection' as const,
+      features: geojsonFeatures,
+    };
+    const fgbBytes = serializeFgb(featureCollection);
 
     const featuresHandle = await root.getFileHandle(OPFS_FEATURES_FILENAME, { create: true });
     const featuresSync = await featuresHandle.createSyncAccessHandle();
     try {
       featuresSync.truncate(0);
-      featuresSync.write(featuresBytes, { at: 0 });
+      featuresSync.write(fgbBytes, { at: 0 });
       featuresSync.flush();
     } finally {
       featuresSync.close();
     }
     console.log(
-      `[spatial.worker] Wrote ${featuresBytes.byteLength} bytes → OPFS/${OPFS_FEATURES_FILENAME}`
+      `[spatial.worker] Wrote ${fgbBytes.byteLength} bytes → OPFS/${OPFS_FEATURES_FILENAME}`
     );
   } catch (err) {
     // OPFS failure is non-fatal – index is still live in memory.

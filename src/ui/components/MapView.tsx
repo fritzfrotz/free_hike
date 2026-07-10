@@ -5,6 +5,7 @@ import type { Source, RangeResponse } from 'pmtiles';
 import type { WorkerRequestMessage, WorkerResponseMessage } from '../../shared/types';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import mlcontour from 'maplibre-contour';
+import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
 
 // ---------------------------------------------------------------------------
 // Telemetry (OPFS byte-range reads from the mapData worker)
@@ -242,8 +243,11 @@ export default function MapView({
   /** Ref mirror of isTrackingCamera so the long-lived GPS watcher closure
    *  always reads the current value without needing to re-register. */
   const isTrackingCameraRef = useRef(false);
-  /** Stores the watchPosition ID so we can clearWatch on unmount. */
-  const gpsWatchIdRef     = useRef<number | null>(null);
+  /** Stores the active tracker handle so we can stop it on unmount.
+   *  TrackerHandle is a tagged union — kind:'native' holds a string watcher
+   *  ID from the Capacitor plugin; kind:'web' holds a number from the
+   *  Web Geolocation API.  stopTracking() selects the right path. */
+  const gpsWatchIdRef = useRef<TrackerHandle | null>(null);
   /** Latest known GPS fix — [lng, lat] + accuracy metres. */
   const userLocationRef   = useRef<{ lng: number; lat: number; accuracy: number } | null>(null);
 
@@ -405,7 +409,7 @@ export default function MapView({
             // ── Phase 9: user-location source + layers ──────────────────────
             // Registered once on load; data is updated dynamically by the GPS
             // watcher via source.setData() — no layer teardown ever needed.
-            const emptyFC = { type: 'FeatureCollection' as const, features: [] as unknown[] };
+            const emptyFC = { type: 'FeatureCollection' as const, features: [] as any[] };
             activeMap.addSource('user-location-source', {
               type: 'geojson',
               data: emptyFC,
@@ -501,7 +505,7 @@ export default function MapView({
         // Inject the GeoJSON FeatureCollection into the MapLibre source.
         const map = mapRef.current;
         if (map && geojson) {
-          const parsed = JSON.parse(geojson) as { type: 'FeatureCollection'; features: unknown[] };
+          const parsed = JSON.parse(geojson) as { type: 'FeatureCollection'; features: any[] };
 
           if (map.getSource(TRAIL_SOURCE_ID)) {
             // Source already exists from a previous scan — just update data.
@@ -882,15 +886,24 @@ export default function MapView({
   }, [hoveredElevIndex, initStatus]);
 
   // ---------------------------------------------------------------------------
-  // Phase 9: GPS watchPosition — updates blue dot and auto-follows camera
+  // Phase 9: GPS tracking — updates blue dot and auto-follows camera
   // ---------------------------------------------------------------------------
+  //
+  // Runtime selection is delegated to locationTracker.ts:
+  //   • iOS / Android (Capacitor) → BackgroundGeolocation.addWatcher()
+  //     Continues delivering fixes even when the screen is locked or the app
+  //     is backgrounded, via the OS native background location API.
+  //   • Desktop browser / PWA    → navigator.geolocation.watchPosition()
+  //     Standard Web API, adequate for development and desktop use.
 
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    let cancelled = false;
 
-    const watchId = navigator.geolocation.watchPosition(
-      (position) => {
-        const { longitude: lng, latitude: lat, accuracy } = position.coords;
+    startTracking(
+      // onPosition — identical MapLibre update logic as the old watchPosition cb
+      ({ lng, lat, accuracy }) => {
+        if (cancelled) return;
+
         userLocationRef.current = { lng, lat, accuracy };
 
         const map = mapRef.current;
@@ -923,20 +936,28 @@ export default function MapView({
           map.flyTo({ center: [lng, lat], zoom: 15, essential: true });
         }
       },
+      // onError
       (err) => {
-        console.warn('[GPS] watchPosition error:', err.message);
-      },
-      { enableHighAccuracy: true, timeout: 5_000, maximumAge: 0 },
-    );
-
-    gpsWatchIdRef.current = watchId;
+        console.warn('[GPS] Tracker error:', err.message);
+      }
+    ).then((handle) => {
+      if (cancelled) {
+        // Component unmounted before the async init resolved — stop immediately.
+        stopTracking(handle);
+        return;
+      }
+      gpsWatchIdRef.current = handle;
+    }).catch((err) => {
+      console.error('[GPS] Failed to start tracker:', err);
+    });
 
     return () => {
-      navigator.geolocation.clearWatch(watchId);
+      cancelled = true;
+      stopTracking(gpsWatchIdRef.current);
       gpsWatchIdRef.current = null;
     };
   // isTrackingCamera is read via isTrackingCameraRef to avoid stale closures;
-  // re-registering watchPosition on every tracking toggle would create duplicate
+  // re-registering the watcher on every tracking toggle would create duplicate
   // watchers and drain battery.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

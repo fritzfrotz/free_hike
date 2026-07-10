@@ -1,4 +1,11 @@
-import { createRouter, decodePolyline, type ValhallaRouter, type CostingModel } from '@jansoft/mbujkanji-valhalla-wasm';
+import {
+  createRouter,
+  decodePolyline,
+  isValhallaError,
+  ValhallaErrorCode,
+  type ValhallaRouter,
+  type CostingModel,
+} from '@jansoft/mbujkanji-valhalla-wasm';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
@@ -12,6 +19,21 @@ import type {
 const activeHandles = new Map<string, FileSystemSyncAccessHandle>();
 
 let router: ValhallaRouter | null = null;
+
+/**
+ * Maximum WASM linear memory in 64 KB pages.
+ *
+ * 8 192 pages × 65 536 bytes = 536 870 912 bytes ≈ 512 MB.
+ *
+ * This caps Valhalla's mjolnir tile cache and prevents the WASM instance
+ * from ballooning past the 4 GB hard limit on devices with constrained RAM.
+ * Tune down to 1 638 pages (≈ 100 MB) for ultra-low-memory targets.
+ */
+const WASM_MAX_MEMORY_PAGES = 8_192; // 512 MB
+
+/** User-facing message shown when a route overflows WASM memory. */
+const OOM_USER_MESSAGE =
+  'Route too complex. Memory limit exceeded. Please try a shorter route.';
 
 // Provision test_graph.tar from server / Vite public folder if not already cached in OPFS
 async function provisionGraph(): Promise<void> {
@@ -51,10 +73,20 @@ async function initValhalla(): Promise<void> {
   console.log('[Routing Worker] Initializing Valhalla WASM module...');
   router = createRouter();
   await router.init({
-    wasmPath: '/valhalla.wasm',
+    wasmPath:   '/valhalla.wasm',
     jsGluePath: '/valhalla.js',
+    // Cap WASM linear memory to prevent mjolnir tile-cache OOM crashes.
+    // WASM memory grows in 64 KB pages; enforcing a ceiling here triggers a
+    // predictable RangeError instead of a silent tab/worker kill.
+    memory: {
+      maximum: WASM_MAX_MEMORY_PAGES,
+    },
   });
-  console.log('[Routing Worker] Valhalla WASM module initialized.');
+  console.log(
+    `[Routing Worker] Valhalla WASM module initialized ` +
+    `(memory cap: ${WASM_MAX_MEMORY_PAGES} pages / ` +
+    `${((WASM_MAX_MEMORY_PAGES * 65_536) / (1024 ** 2)).toFixed(0)} MB).`
+  );
 
   // Check and fetch test_graph.tar
   await provisionGraph();
@@ -162,8 +194,55 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
           } else {
             throw new Error('Invalid or empty route response leg from Valhalla.');
           }
-        } catch (err) {
-          console.error('[Routing Worker] Valhalla routing call failed:', err);
+        } catch (routeErr: unknown) {
+          // ── OOM / fatal WASM memory error detection ──────────────────────────
+          //
+          // Three signal sources we classify as OOM / too-complex:
+          //   1. RangeError — V8's signal when WebAssembly.Memory.grow() is denied
+          //      because we hit WASM_MAX_MEMORY_PAGES.
+          //   2. Generic Error whose message contains 'memory', 'oom', or 'allocation'
+          //      (Emscripten abort() messages bubble up this way).
+          //   3. ValhallaErrorCode.ROUTE_LOCATIONS_TOO_FAR — the wrapper's own
+          //      "route exceeds dataset" error, which often precedes a tile-load
+          //      cascade that would overflow memory on long cross-region routes.
+          const isRangeErr = routeErr instanceof RangeError;
+          const isMemoryMsg =
+            routeErr instanceof Error &&
+            /memory|oom|allocation/i.test(routeErr.message);
+          const isTooFar =
+            isValhallaError(routeErr) &&
+            routeErr.code === ValhallaErrorCode.ROUTE_LOCATIONS_TOO_FAR;
+
+          if (isRangeErr || isMemoryMsg || isTooFar) {
+            console.error(
+              '[Routing Worker] ⚠️  WASM MEMORY LIMIT REACHED. Disposing router and recovering.',
+              routeErr
+            );
+
+            // Attempt graceful WASM heap teardown so the worker survives
+            // and can re-initialize on the user's next (shorter) request.
+            try {
+              router?.dispose();
+            } catch (disposeErr) {
+              console.warn('[Routing Worker] dispose() threw during OOM recovery:', disposeErr);
+            } finally {
+              router = null;
+            }
+
+            // Reply with a user-friendly error and bail out of the handler.
+            // The outer postMessage path below will not be reached.
+            const oomResponse: WorkerResponseMessage = {
+              id,
+              type: 'ERROR',
+              payload: null,
+              error: OOM_USER_MESSAGE,
+            };
+            self.postMessage(oomResponse);
+            return; // Exit the entire message handler for this request
+          }
+
+          // ── Non-OOM routing failure ───────────────────────────────────────────
+          console.error('[Routing Worker] Valhalla routing call failed:', routeErr);
           // Return empty coordinates and 0 distance on failure
           coords = [];
           distanceMeters = 0;

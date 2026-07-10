@@ -39,6 +39,7 @@ import { featuresToGpx } from './services/gpxSerializer';
 import SavedRoutesPanel from './components/SavedRoutesPanel';
 import { saveRoute, deleteRoute } from '../shared/db';
 import type { SavedRoute } from '../shared/db';
+import { requestPersistentStorage } from './services/storageGuard';
 
 
 export default function App() {
@@ -78,6 +79,7 @@ export default function App() {
   // ── Phase 11: Route State Management state ───────────────────────────────
   const [isSavedRoutesOpen, setIsSavedRoutesOpen] = useState(false);
   const [savedRoutesRefreshKey, setSavedRoutesRefreshKey] = useState(0);
+  const [isStorageDurable, setIsStorageDurable] = useState<boolean | null>(null);
 
   // ── Effect 1: OAuth callback interception + existing token restoration ───────
   //
@@ -184,6 +186,12 @@ export default function App() {
         } catch { /* non-critical */ }
       })();
     }
+
+    // Check and request persistent storage (durable storage)
+    (async () => {
+      const status = await requestPersistentStorage();
+      setIsStorageDurable(status.isPersistent);
+    })();
   }, []);
 
   // ── Effect 2: Dummy background worker (Phase 1 scaffold) ────────────────────
@@ -484,16 +492,46 @@ export default function App() {
     setSyncStatus('syncing');
 
     try {
-      // 1. Read the spatial index feature cache from OPFS.
+      // 1. Read the spatial index feature cache from OPFS (FlatGeobuf format).
       let features: CachedTrailFeature[] = [];
       try {
         const root       = await navigator.storage.getDirectory();
-        const fileHandle = await root.getFileHandle('trails_features.json');
+        const fileHandle = await root.getFileHandle('trails_features.fgb');
         const file       = await fileHandle.getFile();
-        const text       = await file.text();
-        features         = JSON.parse(text) as CachedTrailFeature[];
-      } catch {
-        // trails_features.json is absent if no Overpass scan has run yet.
+        const buffer     = await file.arrayBuffer();
+        const uint8Array = new Uint8Array(buffer);
+        const { geojson: fgbGeojson } = await import('flatgeobuf');
+        for await (const feature of fgbGeojson.deserialize(uint8Array)) {
+          const properties = (feature.properties || {}) as Record<string, any>;
+          const geometry = feature.geometry;
+          if (geometry && geometry.type === 'LineString') {
+            const coordsFlat: number[] = [];
+            for (const pt of geometry.coordinates) {
+              coordsFlat.push(pt[0], pt[1]);
+            }
+            // Compute bounding box
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const pt of geometry.coordinates) {
+              if (pt[0] < minX) minX = pt[0];
+              if (pt[1] < minY) minY = pt[1];
+              if (pt[0] > maxX) maxX = pt[0];
+              if (pt[1] > maxY) maxY = pt[1];
+            }
+            features.push({
+              id: Number(properties.id || 0),
+              name: String(properties.name || 'Unnamed Trail'),
+              highway: String(properties.highway || 'path'),
+              coords: coordsFlat,
+              minX,
+              minY,
+              maxX,
+              maxY,
+            });
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to read or deserialize trails_features.fgb:', err);
+        // trails_features.fgb is absent if no Overpass scan has run yet.
         // Proceed with empty GPX — the sync still validates the pipeline.
       }
 
@@ -558,6 +596,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-between p-6 md:p-12 font-sans selection:bg-emerald-500/30 selection:text-emerald-300">
+
+      {isStorageDurable === false && (
+        <div className="w-full max-w-6xl mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between text-sm text-amber-400">
+          <div className="flex items-center gap-2.5">
+            <svg className="h-5 w-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <span>
+              <strong>Storage warning:</strong> Storage is not persistent. Your offline map data and route caches are at risk of being evicted silently if your device runs low on disk space.
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="w-full max-w-6xl flex items-center justify-between border-b border-slate-900 pb-6 mb-8">

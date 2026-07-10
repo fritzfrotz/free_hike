@@ -11,8 +11,13 @@
     "build:graph": "node scripts/build_test_graph.js"
   },
   "dependencies": {
+    "@capacitor-community/background-geolocation": "^1.2.26",
+    "@capacitor/android": "^8.4.1",
+    "@capacitor/core": "^8.4.1",
+    "@capacitor/ios": "^8.4.1",
     "@jansoft/mbujkanji-valhalla-wasm": "^0.1.2",
     "flatbush": "^4.6.2",
+    "flatgeobuf": "^4.4.0",
     "maplibre-contour": "^0.1.0",
     "maplibre-gl": "^5.24.0",
     "pmtiles": "^4.4.1",
@@ -20,6 +25,7 @@
     "react-dom": "^19.2.6"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.4.1",
     "@eslint/js": "^10.0.1",
     "@tailwindcss/vite": "^4.3.0",
     "@types/node": "^24.12.3",

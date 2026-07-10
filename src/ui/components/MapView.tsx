@@ -135,11 +135,11 @@ interface HikeLocation {
 }
 
 const HIKE_LOCATIONS: HikeLocation[] = [
-  { name: 'Southern Alps',   region: 'New Zealand',        coords: [170.154, -43.595], zoom: 3 },
-  { name: 'Yosemite Valley', region: 'California, USA',    coords: [-119.53,  37.74],  zoom: 3 },
-  { name: 'Milford Sound',   region: 'Fiordland, NZ',      coords: [167.897, -44.641], zoom: 3 },
-  { name: 'Mount Tongariro', region: 'North Island, NZ',   coords: [175.66,  -39.13],  zoom: 3 },
-  { name: 'Mont Blanc',      region: 'Alps, France/Italy', coords: [6.865,   45.832],  zoom: 3 },
+  // All three points are within the alps_basemap.pmtiles / alps_terrain.pmtiles
+  // boundary box (approx. z5-z14, Innsbruck/Alps region).
+  { name: 'Innsbruck Center', region: 'Tyrol, Austria', coords: [11.3908, 47.2757], zoom: 12 },
+  { name: 'Nordkette Range',  region: 'Alps, Austria',  coords: [11.3794, 47.3061], zoom: 13 },
+  { name: 'Patscherkofel',    region: 'Alps, Austria',  coords: [11.4619, 47.2086], zoom: 13 },
 ];
 
 // ---------------------------------------------------------------------------
@@ -317,7 +317,10 @@ export default function MapView({
             center: HIKE_LOCATIONS[0].coords,
             zoom: HIKE_LOCATIONS[0].zoom,
             maxZoom: 18,
-            minZoom: 0,
+            // Prevent zooming out past the tile extent of our offline
+            // alps_basemap.pmtiles / alps_terrain.pmtiles files (z5-z14).
+            // z4 gives just enough overview to orient without hitting empty space.
+            minZoom: 4,
             // GPU fill-rate guardrail: prevents horizon overdraw that exhausts
             // mobile GPU bandwidth at high pitch angles.
             maxPitch: 60,

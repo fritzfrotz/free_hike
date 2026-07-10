@@ -303,6 +303,7 @@ export default function MapView({
   // ---------------------------------------------------------------------------
 
   useEffect(() => {
+    let active = true;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setInitStatus('initializing');
     setStatusMessage('Spawning map data worker…');
@@ -345,6 +346,7 @@ export default function MapView({
       mapDataWorker.removeEventListener('message', handleInitMessage);
 
       if (response.type === 'MAP_INIT_SUCCESS') {
+        if (!active) return;
         const sizeBytes = response.payload.size as number;
         setFileSize(sizeBytes);
         setStatusMessage(`OPFS storage bound. Database: ${(sizeBytes / 1024 / 1024).toFixed(2)} MB`);
@@ -580,7 +582,30 @@ export default function MapView({
     } satisfies WorkerRequestMessage);
 
     return () => {
+      active = false;
+      try {
+        mapDataWorker.postMessage({
+          id:      'close-id',
+          type:    'MAP_CLOSE',
+          payload: null,
+        } satisfies WorkerRequestMessage);
+      } catch (err) {
+        // Ignored if worker is already terminated/unresponsive
+      }
+
+      // Clear the global protocol tiles registry to release any references/handles
+      // to offline files on map unmount
+      try {
+        getGlobalProtocol().tiles.clear();
+      } catch (err) {
+        console.warn('[MapView] Failed to clear global protocol cache:', err);
+      }
+
+      // Explicitly remove map instances to free map canvas/WebGL context
       map?.remove();
+      mapRef.current?.remove();
+      mapRef.current = null;
+
       mapDataWorker.terminate();
     };
   }, []);

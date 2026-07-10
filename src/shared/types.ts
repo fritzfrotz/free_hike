@@ -15,7 +15,8 @@ export type WorkerRequestType =
   // Phase 10: Dynamic OPFS download manager
   | 'DOWNLOAD_REGION_REQUEST'
   // Phase 11: Dynamic multi-file OPFS source routing
-  | 'LOAD_OFFLINE_REGION';
+  | 'LOAD_OFFLINE_REGION'
+  | 'MAP_CLOSE';
 
 export type WorkerResponseType =
   | 'PONG'

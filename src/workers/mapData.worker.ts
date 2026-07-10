@@ -61,6 +61,19 @@ async function openHandles(filenames: string[]): Promise<void> {
   await Promise.all(filenames.map(getHandle));
 }
 
+/** Close and release all active FileSystemSyncAccessHandle file locks. */
+function closeAllHandles(): void {
+  for (const [filename, handle] of handles.entries()) {
+    try {
+      handle.close();
+      console.log(`[mapData.worker] Closed SyncAccessHandle for "${filename}"`);
+    } catch (err) {
+      console.warn(`[mapData.worker] Failed to close handle for "${filename}":`, err);
+    }
+  }
+  handles.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Message dispatcher
 // ---------------------------------------------------------------------------
@@ -72,6 +85,10 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
 
     // ── MAP_INIT ────────────────────────────────────────────────────────────
     if (type === 'MAP_INIT') {
+      // Aggressively close any existing open handles first to release the locks
+      // on the OS files, preventing NoModificationAllowedError concurrency collision.
+      closeAllHandles();
+
       // Accept an optional filenames array from the caller.
       // Fall back to the legacy single-file path for backward compatibility.
       const filenames: string[] =
@@ -89,6 +106,18 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
         id,
         type: 'MAP_INIT_SUCCESS',
         payload: { size },
+      };
+      self.postMessage(response);
+      return;
+    }
+
+    // ── MAP_CLOSE ────────────────────────────────────────────────────────────
+    if (type === 'MAP_CLOSE') {
+      closeAllHandles();
+      const response: WorkerResponseMessage = {
+        id,
+        type: 'SUCCESS',
+        payload: null,
       };
       self.postMessage(response);
       return;

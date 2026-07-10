@@ -40,7 +40,7 @@
       "filter": ["==", ["get", "class"], "forest"],
       "paint": {
         "fill-color": "#1B4D3E",
-        "fill-opacity": 0.85
+        "fill-opacity": 1.0
       }
     },
     {
@@ -51,7 +51,7 @@
       "filter": ["match", ["get", "class"], ["scrub", "grass"], true, false],
       "paint": {
         "fill-color": "#A3B899",
-        "fill-opacity": 0.90
+        "fill-opacity": 1.0
       }
     },
     {
@@ -120,7 +120,7 @@
         "text-rotation-alignment": "viewport-glyph"
       },
       "paint": {
-        "text-color": "#333333",
+        "text-color": "#2B2D42",
         "text-halo-color": "#FFFFFF",
         "text-halo-width": 2.0,
         "text-halo-blur": 0.5
@@ -184,7 +184,7 @@
         "text-radial-offset": 0.8
       },
       "paint": {
-        "text-color": "#1A1A1A",
+        "text-color": "#2B2D42",
         "text-halo-color": "#FFFFFF",
         "text-halo-width": 2.5,
         "text-halo-blur": 0.5

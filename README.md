@@ -1,73 +1,60 @@
-# React + TypeScript + Vite
+# FreeHike
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A local-first, offline-capable hiking navigation app built with Vite + React, MapLibre GL, and Capacitor.
 
-Currently, two official plugins are available:
+## What it does
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Renders offline vector maps from `.pmtiles` archives stored in the browser's Origin Private File System (OPFS)
+- Tracks your position in real time using native background GPS on iOS/Android (via Capacitor) with a web API fallback for desktop
+- Calculates hiking routes using a Valhalla WASM routing engine running entirely on-device — no server required
+- Displays trail networks parsed from OpenStreetMap and stored locally as binary FlatGeobuf (`.fgb`) files
+- Exports recorded tracks as GPX files
 
-## React Compiler
+## Tech stack
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+| Layer | Technology |
+|---|---|
+| UI | React + Vite |
+| Maps | MapLibre GL JS + PMTiles |
+| Routing | Valhalla WASM (`@jansoft/mbujkanji-valhalla-wasm`) |
+| Storage | OPFS (Origin Private File System) |
+| Native wrapper | Capacitor (iOS + Android) |
+| Background GPS | `@capacitor-community/background-geolocation` |
+| Trail data format | FlatGeobuf (`.fgb`) |
 
-## Expanding the ESLint configuration
+## Getting started
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+```bash
+# Install dependencies
+npm install
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+# Run the dev server
+npm run dev
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# Production build
+npm run build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Mobile (iOS / Android)
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+```bash
+# Build the web app first
+npm run build
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# Sync into the native projects
+npx cap sync
+
+# Open in Xcode
+npx cap open ios
+
+# Open in Android Studio
+npx cap open android
 ```
+
+> **iOS note:** Add `NSLocationAlwaysAndWhenInUseUsageDescription` and `NSLocationWhenInUseUsageDescription` to `ios/App/App/Info.plist` before submitting to the App Store.
+
+## Architecture notes
+
+- All compute (routing, tile parsing, spatial indexing) runs in Web Workers to keep the main thread free.
+- OPFS is used for durable, high-performance binary storage. The app requests `navigator.storage.persist()` on startup to prevent OS eviction on low-disk devices.
+- The Valhalla WASM router is capped at 512 MB of linear memory with an OOM recovery loop — if a route exceeds the limit the worker resets cleanly and returns a user-friendly error.

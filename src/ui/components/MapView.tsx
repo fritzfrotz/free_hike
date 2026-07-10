@@ -40,19 +40,26 @@ type ScanStatus = 'idle' | 'scanning' | 'indexed' | 'error';
 // ---------------------------------------------------------------------------
 
 class WorkerPMTilesSource implements Source {
-  private key: string;
+  /**
+   * The OPFS filename this source reads from (e.g. 'alps_basemap.pmtiles').
+   * Sent with every MAP_READ_BYTES request so the worker can dispatch to the
+   * correct SyncAccessHandle — one handle per file, all kept open concurrently.
+   */
+  readonly filename: string;
+
   private worker: Worker;
   private onTelemetry?: (data: TelemetryData) => void;
   private activeRequests = 0;
   private totalBytes = 0;
 
-  constructor(key: string, worker: Worker, onTelemetry?: (data: TelemetryData) => void) {
-    this.key = key;
-    this.worker = worker;
+  constructor(filename: string, worker: Worker, onTelemetry?: (data: TelemetryData) => void) {
+    this.filename = filename;
+    this.worker   = worker;
     this.onTelemetry = onTelemetry;
   }
 
-  getKey() { return this.key; }
+  /** PMTiles protocol uses the key to de-duplicate sources in its registry. */
+  getKey() { return this.filename; }
 
   async getBytes(offset: number, length: number, signal?: AbortSignal): Promise<RangeResponse> {
     const startTime = performance.now();
@@ -91,10 +98,12 @@ class WorkerPMTilesSource implements Source {
         });
       }
 
+      // Include the target filename so the worker routes the read to the
+      // correct OPFS SyncAccessHandle rather than a single shared slot.
       const req: WorkerRequestMessage = {
-        id: requestId,
-        type: 'MAP_READ_BYTES',
-        payload: { offset, length },
+        id:      requestId,
+        type:    'MAP_READ_BYTES',
+        payload: { filename: this.filename, offset, length },
       };
       this.worker.postMessage(req);
     });
@@ -170,6 +179,26 @@ function makeThrottle(intervalMs: number) {
 // Component
 // ---------------------------------------------------------------------------
 
+/**
+ * Imperative handle for swapping the active offline region without unmounting
+ * the map.  Handed to the parent via onRegionSwitcherReady.
+ */
+export interface OfflineRegionSwitcher {
+  /**
+   * Swap both map tile sources to new OPFS files.
+   *
+   * @param basemapFile  Filename in OPFS for the new vector basemap (e.g. 'active_map.pmtiles').
+   * @param terrainFile  Filename in OPFS for the new terrain raster (e.g. 'alps_terrain.pmtiles').
+   *
+   * The method:
+   *  1. Sends LOAD_OFFLINE_REGION to the worker so it opens fresh SyncAccessHandles.
+   *  2. Creates new WorkerPMTilesSource + PMTiles instances for both files.
+   *  3. Registers them with the global Protocol so pmtiles:// URLs resolve.
+   *  4. Calls setUrl() on the live MapLibre sources — no full style reload.
+   */
+  loadOfflineRegion(basemapFile: string, terrainFile: string): Promise<void>;
+}
+
 export interface MapViewProps {
   routingWorker: Worker | null;
   calculatedRoute: {
@@ -189,6 +218,12 @@ export interface MapViewProps {
   downloadStatus?: 'idle' | 'fetching' | 'writing' | 'done' | 'error';
   /** Progress label to show inside the panel while fetching/writing. */
   downloadProgressLabel?: string;
+  /**
+   * Called once after the map finishes loading with an imperative switcher
+   * object.  The parent can store it in a ref and call
+   * switcher.loadOfflineRegion() whenever the user selects a new region.
+   */
+  onRegionSwitcherReady?: (switcher: OfflineRegionSwitcher) => void;
 }
 
 export default function MapView({
@@ -199,8 +234,9 @@ export default function MapView({
   onSpatialWorkerReady,
   onMapDataWorkerReady,
   onRegionDownload,
-  downloadStatus   = 'idle',
+  downloadStatus        = 'idle',
   downloadProgressLabel = '',
+  onRegionSwitcherReady,
 }: MapViewProps) {
   const mapContainerRef  = useRef<HTMLDivElement>(null);
   const mapRef           = useRef<maplibregl.Map | null>(null);
@@ -278,9 +314,28 @@ export default function MapView({
     mapDataWorkerRef.current = mapDataWorker;
     onMapDataWorkerReady?.(mapDataWorker);
 
-    const sourceKey = 'hike.pmtiles';
-    const protocol  = getGlobalProtocol();
+    // The two OPFS filenames that back the style's pmtiles:// sources.
+    // These names match the URL fragments in high_contrast_outdoor_style.json:
+    //   pmtiles://local/alps_basemap.pmtiles  → basemap-local MapLibre source
+    //   pmtiles://local/alps_terrain.pmtiles  → terrain-local MapLibre source
+    const DEFAULT_BASEMAP  = 'alps_basemap.pmtiles';
+    const DEFAULT_TERRAIN  = 'alps_terrain.pmtiles';
+
+    const protocol = getGlobalProtocol();
     let   map: maplibregl.Map | null = null;
+
+    // Helper: create a WorkerPMTilesSource + PMTiles pair and register it
+    // with the global protocol.  Safe to call multiple times for the same
+    // filename — PMTiles.getKey() de-duplicates within the protocol registry.
+    const registerSource = (
+      filename: string,
+      onTelemetry?: (d: TelemetryData) => void,
+    ): PMTiles => {
+      const src      = new WorkerPMTilesSource(filename, mapDataWorker, onTelemetry);
+      const instance = new PMTiles(src);
+      protocol.add(instance);
+      return instance;
+    };
 
     const initId = Math.random().toString(36).substring(2, 9);
 
@@ -294,15 +349,14 @@ export default function MapView({
         setFileSize(sizeBytes);
         setStatusMessage(`OPFS storage bound. Database: ${(sizeBytes / 1024 / 1024).toFixed(2)} MB`);
 
-        const customSource = new WorkerPMTilesSource(sourceKey, mapDataWorker, (tData) => {
+        // Register the two default sources (basemap + terrain) upfront.
+        registerSource(DEFAULT_BASEMAP, (tData) => {
           setTelemetry(prev => ({
             ...tData,
             totalBytes: tData.totalBytes > 0 ? tData.totalBytes : prev.totalBytes,
           }));
         });
-
-        const pmtilesInstance = new PMTiles(customSource);
-        protocol.add(pmtilesInstance);
+        registerSource(DEFAULT_TERRAIN);
 
         if (mapContainerRef.current) {
           setStatusMessage('Mounting map container canvas…');
@@ -336,6 +390,52 @@ export default function MapView({
             (activeMap as any).style?.sourceCaches?.['basemap-local']?.setMaxTiles(25);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (activeMap as any).style?.sourceCaches?.['terrain-local']?.setMaxTiles(25);
+
+            // ── Expose imperative region-switcher to the parent ───────────
+            // loadOfflineRegion() lets App (or a future download manager UI)
+            // hot-swap both tile sources without a full style reload.
+            if (onRegionSwitcherReady) {
+              const switcher: OfflineRegionSwitcher = {
+                async loadOfflineRegion(basemapFile: string, terrainFile: string) {
+                  const worker = mapDataWorkerRef.current;
+                  if (!worker) throw new Error('[loadOfflineRegion] mapData worker not ready.');
+
+                  // 1. Ask the worker to open SyncAccessHandles for both new files.
+                  const loadId  = Math.random().toString(36).substring(2, 9);
+                  await new Promise<void>((resolve, reject) => {
+                    const onMsg = (ev: MessageEvent<WorkerResponseMessage>) => {
+                      if (ev.data.id !== loadId) return;
+                      worker.removeEventListener('message', onMsg);
+                      if (ev.data.type === 'LOAD_OFFLINE_REGION_SUCCESS') resolve();
+                      else reject(new Error(ev.data.error ?? 'LOAD_OFFLINE_REGION failed'));
+                    };
+                    worker.addEventListener('message', onMsg);
+                    worker.postMessage({
+                      id:      loadId,
+                      type:    'LOAD_OFFLINE_REGION',
+                      payload: { filenames: [basemapFile, terrainFile] },
+                    } satisfies WorkerRequestMessage);
+                  });
+
+                  // 2. Register new WorkerPMTilesSource + PMTiles instances.
+                  registerSource(basemapFile);
+                  registerSource(terrainFile);
+
+                  // 3. Swap the live MapLibre sources to the new pmtiles:// URLs.
+                  //    setUrl() updates the source in-place — no layer teardown.
+                  const bSrc = activeMap.getSource('basemap-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
+                  const tSrc = activeMap.getSource('terrain-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
+
+                  if (bSrc?.setUrl) bSrc.setUrl(`pmtiles://local/${basemapFile}`);
+                  if (tSrc?.setUrl) tSrc.setUrl(`pmtiles://local/${terrainFile}`);
+
+                  console.log(
+                    `[MapView] Offline region swapped → basemap: ${basemapFile}, terrain: ${terrainFile}`,
+                  );
+                },
+              };
+              onRegionSwitcherReady(switcher);
+            }
 
             // Instantiate and setup demSource for dynamic contours
             const demSource = new mlcontour.DemSource({
@@ -470,7 +570,14 @@ export default function MapView({
 
     mapDataWorker.addEventListener('message', handleInitMessage);
     setStatusMessage('Syncing binary file buffers to OPFS…');
-    mapDataWorker.postMessage({ id: initId, type: 'MAP_INIT', payload: null } satisfies WorkerRequestMessage);
+    // Send the two default filenames so the worker opens SyncAccessHandles
+    // for both OPFS files during init.  Subsequent MAP_READ_BYTES requests
+    // will find the handles ready without an extra round-trip.
+    mapDataWorker.postMessage({
+      id:      initId,
+      type:    'MAP_INIT',
+      payload: { filenames: [DEFAULT_BASEMAP, DEFAULT_TERRAIN] },
+    } satisfies WorkerRequestMessage);
 
     return () => {
       map?.remove();

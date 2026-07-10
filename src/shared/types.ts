@@ -13,7 +13,9 @@ export type WorkerRequestType =
   | 'ROUTE_TILE_WRITE_REQUEST'
   | 'ELEVATION_PROFILE_REQUEST'
   // Phase 10: Dynamic OPFS download manager
-  | 'DOWNLOAD_REGION_REQUEST';
+  | 'DOWNLOAD_REGION_REQUEST'
+  // Phase 11: Dynamic multi-file OPFS source routing
+  | 'LOAD_OFFLINE_REGION';
 
 export type WorkerResponseType =
   | 'PONG'
@@ -28,7 +30,9 @@ export type WorkerResponseType =
   | 'ELEVATION_PROFILE_SUCCESS'
   // Phase 10: Dynamic OPFS download manager
   | 'DOWNLOAD_REGION_SUCCESS'
-  | 'DOWNLOAD_REGION_ERROR';
+  | 'DOWNLOAD_REGION_ERROR'
+  // Phase 11: Dynamic multi-file OPFS source routing
+  | 'LOAD_OFFLINE_REGION_SUCCESS';
 
 export interface WorkerRequestMessage {
   id: string;

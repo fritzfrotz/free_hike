@@ -2,20 +2,27 @@
  * mapData.worker.ts
  *
  * Responsibilities:
- *   MAP_INIT             – open / seed `hike.pmtiles` in OPFS via SyncAccessHandle
- *   MAP_READ_BYTES       – serve arbitrary byte ranges to WorkerPMTilesSource
- *   DOWNLOAD_REGION_REQUEST – receive zero-copy ArrayBuffer pair from main thread,
- *                             write them as `active_map.pmtiles` and
- *                             `active_routing.tar` inside OPFS entirely off-thread,
- *                             then swap the active SyncAccessHandle to the new file.
+ *   MAP_INIT             – open SyncAccessHandles for the initial OPFS file set
+ *                          (filenames supplied in the payload; falls back to
+ *                          'hike.pmtiles' for backward compatibility).
+ *   MAP_READ_BYTES       – serve arbitrary byte ranges to WorkerPMTilesSource.
+ *                          The request payload now includes a `filename` field
+ *                          so the correct SyncAccessHandle is selected from the
+ *                          per-file map \u2014 multiple files can be read concurrently.
+ *   LOAD_OFFLINE_REGION  – open SyncAccessHandles for newly chosen region files
+ *                          (called by MapView.loadOfflineRegion before swapping
+ *                          MapLibre source URLs).
+ *   DOWNLOAD_REGION_REQUEST \u2013 receive zero-copy ArrayBuffer pair from main thread,
+ *                          write them to OPFS entirely off-thread, then open
+ *                          the freshly written files so subsequent reads work.
  *
- * Storage strategy
- * ────────────────
- * Phase 1-9 used a single SyncAccessHandle bound to `hike.pmtiles`.
- * Phase 10 adds a second file slot (`active_map.pmtiles`) that represents
- * whatever region the user last downloaded.  After a successful write the
- * worker closes the old handle and opens the new file so subsequent
- * MAP_READ_BYTES requests are served from the freshly written region.
+ * Storage strategy (Phase 11)
+ * \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+ * Phase 1-10 kept a single SyncAccessHandle in a module-level variable.
+ * Phase 11 replaces that with a Map<filename, FileSystemSyncAccessHandle>.
+ * Every MAP_READ_BYTES request routes to the correct handle via payload.filename.
+ * All handles opened during MAP_INIT or LOAD_OFFLINE_REGION are kept open for
+ * the lifetime of the worker so repeated reads incur zero open/close overhead.
  */
 
 import type {
@@ -26,10 +33,33 @@ import type {
 } from '../shared/types';
 
 // ---------------------------------------------------------------------------
-// Module-level SyncAccessHandle (one active at a time)
+// Per-file SyncAccessHandle registry
 // ---------------------------------------------------------------------------
 
-let accessHandle: FileSystemSyncAccessHandle | null = null;
+/**
+ * All currently open OPFS handles, keyed by filename.
+ * Every file opened here stays open for the lifetime of the worker so repeated
+ * byte-range reads have zero open/close overhead.
+ */
+const handles = new Map<string, FileSystemSyncAccessHandle>();
+
+/** Open (or return the already-open) SyncAccessHandle for a given OPFS file. */
+async function getHandle(filename: string): Promise<FileSystemSyncAccessHandle> {
+  const cached = handles.get(filename);
+  if (cached) return cached;
+
+  const root       = await navigator.storage.getDirectory();
+  const fileHandle = await root.getFileHandle(filename, { create: true });
+  const handle     = await fileHandle.createSyncAccessHandle();
+  handles.set(filename, handle);
+  console.log(`[mapData.worker] Opened SyncAccessHandle for "${filename}" (${handle.getSize()} bytes)`);
+  return handle;
+}
+
+/** Open handles for every filename in the list, ignoring already-open ones. */
+async function openHandles(filenames: string[]): Promise<void> {
+  await Promise.all(filenames.map(getHandle));
+}
 
 // ---------------------------------------------------------------------------
 // Message dispatcher
@@ -39,25 +69,47 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
   const { id, type, payload } = event.data;
 
   try {
-    // ── MAP_INIT ─────────────────────────────────────────────────────────────
+
+    // ── MAP_INIT ────────────────────────────────────────────────────────────
     if (type === 'MAP_INIT') {
-      const result = await initMap();
+      // Accept an optional filenames array from the caller.
+      // Fall back to the legacy single-file path for backward compatibility.
+      const filenames: string[] =
+        Array.isArray(payload?.filenames) && payload.filenames.length > 0
+          ? payload.filenames
+          : ['hike.pmtiles'];
+
+      await initFiles(filenames);
+
+      // Report the size of the first file for the UI status bar.
+      const primaryHandle = handles.get(filenames[0]);
+      const size = primaryHandle ? primaryHandle.getSize() : 0;
+
       const response: WorkerResponseMessage = {
         id,
         type: 'MAP_INIT_SUCCESS',
-        payload: result,
+        payload: { size },
       };
       self.postMessage(response);
       return;
     }
 
-    // ── MAP_READ_BYTES ────────────────────────────────────────────────────────
+    // ── MAP_READ_BYTES ───────────────────────────────────────────────────────
     if (type === 'MAP_READ_BYTES') {
-      if (!accessHandle) {
-        throw new Error('Map storage handle is not initialized. Call MAP_INIT first.');
+      // payload.filename routes to the right handle; fall back to the first
+      // open handle for callers that predate the filename field.
+      const filename = (payload?.filename as string | undefined)
+        ?? handles.keys().next().value;
+
+      if (!filename) {
+        throw new Error('MAP_READ_BYTES: no filename supplied and no open handles.');
       }
-      const { offset, length } = payload as { offset: number; length: number };
-      const fileSize   = accessHandle.getSize();
+
+      const handle = handles.get(filename)
+        ?? await getHandle(filename); // lazy-open if not yet warmed
+
+      const { offset, length } = payload as { filename: string; offset: number; length: number };
+      const fileSize   = handle.getSize();
       const readLength = Math.min(length, fileSize - offset);
 
       if (readLength <= 0) {
@@ -72,7 +124,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       }
 
       const buffer    = new Uint8Array(readLength);
-      const bytesRead = accessHandle.read(buffer, { at: offset });
+      const bytesRead = handle.read(buffer, { at: offset });
 
       const finalBuffer: ArrayBuffer =
         bytesRead < readLength ? buffer.buffer.slice(0, bytesRead) : buffer.buffer;
@@ -86,7 +138,32 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       return;
     }
 
-    // ── DOWNLOAD_REGION_REQUEST ───────────────────────────────────────────────
+    // ── LOAD_OFFLINE_REGION ─────────────────────────────────────────────────
+    // Called by MapView.loadOfflineRegion() before swapping MapLibre source URLs.
+    // Opens SyncAccessHandles for the newly selected files so subsequent
+    // MAP_READ_BYTES requests are served without a lazy-open latency spike.
+    if (type === 'LOAD_OFFLINE_REGION') {
+      const filenames: string[] = Array.isArray(payload?.filenames)
+        ? payload.filenames
+        : [];
+
+      if (filenames.length === 0) {
+        throw new Error('LOAD_OFFLINE_REGION: payload.filenames must be a non-empty array.');
+      }
+
+      await openHandles(filenames);
+      console.log(`[mapData.worker] LOAD_OFFLINE_REGION: handles ready for [${filenames.join(', ')}]`);
+
+      const response: WorkerResponseMessage = {
+        id,
+        type: 'LOAD_OFFLINE_REGION_SUCCESS',
+        payload: { filenames },
+      };
+      self.postMessage(response);
+      return;
+    }
+
+    // ── DOWNLOAD_REGION_REQUEST ─────────────────────────────────────────────
     if (type === 'DOWNLOAD_REGION_REQUEST') {
       const { pmtilesBuffer, routingBuffer, regionLabel } =
         payload as DownloadRegionRequestPayload;
@@ -102,7 +179,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       return;
     }
 
-    // ── Unknown type ──────────────────────────────────────────────────────────
+    // ── Unknown type ─────────────────────────────────────────────────────────
     const response: WorkerResponseMessage = {
       id,
       type: 'ERROR',
@@ -124,55 +201,53 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
 });
 
 // ---------------------------------------------------------------------------
-// MAP_INIT — open hike.pmtiles, seed it on first run
-// ---------------------------------------------------------------------------
-
-async function initMap(): Promise<{ size: number }> {
-  if (accessHandle) {
-    return { size: accessHandle.getSize() };
-  }
-
-  const root       = await navigator.storage.getDirectory();
-  const fileHandle = await root.getFileHandle('hike.pmtiles', { create: true });
-  accessHandle     = await fileHandle.createSyncAccessHandle();
-
-  let size = accessHandle.getSize();
-  if (size === 0) {
-    console.log('[mapData.worker] hike.pmtiles is empty — seeding with sample dataset…');
-    try {
-      const res = await fetch('https://pmtiles.io/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles');
-      if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-      const buf = await res.arrayBuffer();
-      accessHandle.write(new Uint8Array(buf), { at: 0 });
-      accessHandle.flush();
-      size = accessHandle.getSize();
-      console.log(`[mapData.worker] Sample PMTiles written. Size: ${size} bytes`);
-    } catch (err) {
-      console.error('[mapData.worker] Seed fetch failed — writing stub header:', err);
-      // Minimal PMTiles v3 magic + version byte so the library doesn't crash.
-      const stub = new Uint8Array(127);
-      stub.set([0x50, 0x4D, 0x54, 0x69, 0x6C, 0x65, 0x73, 3]);   // "PMTiles" + v3
-      accessHandle.write(stub, { at: 0 });
-      accessHandle.flush();
-      size = accessHandle.getSize();
-    }
-  }
-
-  return { size };
-}
-
-// ---------------------------------------------------------------------------
-// DOWNLOAD_REGION_REQUEST — write both files to OPFS, swap active handle
+// MAP_INIT — open (and optionally seed) a set of OPFS files
 // ---------------------------------------------------------------------------
 
 /**
- * Writes `pmtilesBuffer` → `active_map.pmtiles` and
- *         `routingBuffer` → `active_routing.tar`
+ * Opens SyncAccessHandles for each filename in the list.
+ * For the primary file ('hike.pmtiles' legacy path) an empty file is seeded
+ * with a minimal PMTiles v3 stub header so the PMTiles library never reads
+ * zero bytes and crashes during the first parse attempt.
+ */
+async function initFiles(filenames: string[]): Promise<void> {
+  for (const filename of filenames) {
+    const handle = await getHandle(filename);
+
+    // Only seed the fallback legacy file when it is genuinely empty.
+    if (filename === 'hike.pmtiles' && handle.getSize() === 0) {
+      console.log('[mapData.worker] hike.pmtiles is empty \u2014 seeding with sample dataset\u2026');
+      try {
+        const res = await fetch('https://pmtiles.io/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles');
+        if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
+        const buf = await res.arrayBuffer();
+        handle.write(new Uint8Array(buf), { at: 0 });
+        handle.flush();
+        console.log(`[mapData.worker] Sample PMTiles written. Size: ${handle.getSize()} bytes`);
+      } catch (err) {
+        console.error('[mapData.worker] Seed fetch failed \u2014 writing stub header:', err);
+        // Minimal PMTiles v3 magic + version byte so the library does not crash.
+        const stub = new Uint8Array(127);
+        stub.set([0x50, 0x4D, 0x54, 0x69, 0x6C, 0x65, 0x73, 3]); // "PMTiles" + v3
+        handle.write(stub, { at: 0 });
+        handle.flush();
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DOWNLOAD_REGION_REQUEST — write both files to OPFS, open new handles
+// ---------------------------------------------------------------------------
+
+/**
+ * Writes `pmtilesBuffer` \u2192 `active_map.pmtiles` and
+ *         `routingBuffer` \u2192 `active_routing.tar`
  * using createSyncAccessHandle() for maximum off-thread throughput.
  *
- * After a successful PMTiles write the function closes the old SyncAccessHandle
- * and opens the newly written file, making subsequent MAP_READ_BYTES requests
- * serve from the freshly downloaded region.
+ * After writing, the function closes any stale handle for `active_map.pmtiles`
+ * and opens a fresh one so subsequent MAP_READ_BYTES requests serve the new
+ * region without an explicit LOAD_OFFLINE_REGION call.
  */
 async function writeRegionToOPFS(
   pmtilesBuffer: ArrayBuffer,
@@ -181,21 +256,20 @@ async function writeRegionToOPFS(
 ): Promise<DownloadRegionSuccessPayload> {
   const root = await navigator.storage.getDirectory();
 
-  // ── Write PMTiles ──────────────────────────────────────────────────────────
-  const pmHandle   = await root.getFileHandle('active_map.pmtiles', { create: true });
-  const pmAccess   = await pmHandle.createSyncAccessHandle();
-  // Truncate first to avoid stale trailing bytes from a prior smaller file.
+  // ── Write PMTiles ─────────────────────────────────────────────────────────
+  const pmHandle = await root.getFileHandle('active_map.pmtiles', { create: true });
+  const pmAccess = await pmHandle.createSyncAccessHandle();
   pmAccess.truncate(0);
   pmAccess.write(new Uint8Array(pmtilesBuffer), { at: 0 });
   pmAccess.flush();
   const pmtilesBytes = pmAccess.getSize();
   pmAccess.close();
 
-  // ── Write routing tar (may be empty) ──────────────────────────────────────
+  // ── Write routing tar (may be empty) ─────────────────────────────────────
   let routingBytes = 0;
   if (routingBuffer.byteLength > 0) {
-    const tarHandle  = await root.getFileHandle('active_routing.tar', { create: true });
-    const tarAccess  = await tarHandle.createSyncAccessHandle();
+    const tarHandle = await root.getFileHandle('active_routing.tar', { create: true });
+    const tarAccess = await tarHandle.createSyncAccessHandle();
     tarAccess.truncate(0);
     tarAccess.write(new Uint8Array(routingBuffer), { at: 0 });
     tarAccess.flush();
@@ -203,17 +277,18 @@ async function writeRegionToOPFS(
     tarAccess.close();
   }
 
-  // ── Swap the active read handle to the new PMTiles file ──────────────────
-  // Close the old handle (if open) so MAP_READ_BYTES now serves the new region.
-  if (accessHandle) {
-    accessHandle.close();
-    accessHandle = null;
+  // ── Swap the registry entry for active_map.pmtiles ───────────────────────
+  // Close any cached handle (it points at stale bytes after truncate+write)
+  // and open a fresh one so MAP_READ_BYTES is immediately consistent.
+  const stale = handles.get('active_map.pmtiles');
+  if (stale) {
+    try { stale.close(); } catch { /* ignore if already closed */ }
+    handles.delete('active_map.pmtiles');
   }
-  const newHandle  = await root.getFileHandle('active_map.pmtiles', { create: false });
-  accessHandle     = await newHandle.createSyncAccessHandle();
+  await getHandle('active_map.pmtiles');
 
   console.log(
-    `[mapData.worker] Region "${regionLabel}" committed to OPFS — ` +
+    `[mapData.worker] Region "${regionLabel}" committed to OPFS \u2014 ` +
     `PMTiles: ${pmtilesBytes} B, routing: ${routingBytes} B`,
   );
 

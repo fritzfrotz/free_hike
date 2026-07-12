@@ -50,6 +50,7 @@ offline_sandbox/raw_data/_cache/
 # Nested project target build outputs
 offline_sandbox/gdal/target/
 offline_sandbox/massif/target/
+freehike-core/target/
 
 # Expo & React Native Build Folders
 node_modules/

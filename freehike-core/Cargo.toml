@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["compiler", "pbf", "terrain", "tiles", "ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["FreeHike"]
+license = "MIT"
+
+[workspace.dependencies]
+uniffi = "0.29"
+compiler = { path = "compiler" }
+pbf = { path = "pbf" }
+terrain = { path = "terrain" }
+tiles = { path = "tiles" }
+
+# Release profile tuned for mobile distribution: maximum optimization with full
+# LTO so the iOS .a / Android .so ship lean and fast.
+#
+# `panic = "abort"` is deliberately NOT set: UniFFI converts Rust panics into
+# typed foreign-language errors by unwinding and catching at the FFI boundary
+# (operating manual, L4 rules). Aborting on panic would turn every internal bug
+# into an uncatchable native crash on the user's phone.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"

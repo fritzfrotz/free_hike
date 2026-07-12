@@ -1,0 +1,28 @@
+[package]
+name = "ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+# The library name determines the native artifact names the mobile shells
+# load: libfreehike_ffi.a (iOS, staticlib) and libfreehike_ffi.so (Android,
+# cdylib). Plain "lib" is kept so `cargo test` and future workspace consumers
+# can link it as a normal Rust crate.
+name = "freehike_ffi"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+uniffi = { workspace = true }
+compiler = { workspace = true }
+
+[features]
+# Enables the `uniffi-bindgen` CLI binary used in Phase 1 to generate the
+# Swift/Kotlin bindings (`cargo run -p ffi --features cli --bin uniffi-bindgen`).
+cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["cli"]

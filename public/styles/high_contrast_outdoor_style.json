@@ -89,48 +89,10 @@
       }
     },
     {
-      "id": "contours-line",
-      "type": "line",
-      "source": "basemap-local",
-      "source-layer": "contours",
-      "minzoom": 12.0,
-      "paint": {
-        "line-color": "#5C5C5C",
-        "line-width": 0.8,
-        "line-opacity": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          12.0, 0.0,
-          13.0, 0.6
-        ]
-      }
-    },
-    {
-      "id": "contours-labels",
-      "type": "symbol",
-      "source": "basemap-local",
-      "source-layer": "contours",
-      "minzoom": 13.5,
-      "layout": {
-        "symbol-placement": "line",
-        "text-field": ["concat", ["to-string", ["get", "ele"]], " m"],
-        "text-size": 9,
-        "text-keep-upright": true,
-        "text-rotation-alignment": "viewport-glyph"
-      },
-      "paint": {
-        "text-color": "#2B2D42",
-        "text-halo-color": "#FFFFFF",
-        "text-halo-width": 2.0,
-        "text-halo-blur": 0.5
-      }
-    },
-    {
       "id": "dynamic-hiking-trails",
       "type": "line",
       "source": "basemap-local",
-      "source-layer": "roads",
+      "source-layer": "transportation",
       "filter": ["has", "sac_scale"],
       "paint": {
         "line-width": [
@@ -169,7 +131,7 @@
       "id": "peak-labels",
       "type": "symbol",
       "source": "basemap-local",
-      "source-layer": "pois",
+      "source-layer": "poi",
       "filter": ["==", ["get", "class"], "peak"],
       "layout": {
         "text-field": ["get", "name"],

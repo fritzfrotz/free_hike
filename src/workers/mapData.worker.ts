@@ -30,6 +30,7 @@ import type {
   WorkerResponseMessage,
   DownloadRegionRequestPayload,
   DownloadRegionSuccessPayload,
+  MapInitSuccessPayload,
 } from '../shared/types';
 
 // ---------------------------------------------------------------------------
@@ -96,7 +97,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
           ? payload.filenames
           : ['hike.pmtiles'];
 
-      await initFiles(filenames);
+      const provisionFailures = await initFiles(filenames);
 
       // Report the size of the first file for the UI status bar.
       const primaryHandle = handles.get(filenames[0]);
@@ -105,7 +106,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       const response: WorkerResponseMessage = {
         id,
         type: 'MAP_INIT_SUCCESS',
-        payload: { size },
+        payload: { size, provisionFailures } satisfies MapInitSuccessPayload,
       };
       self.postMessage(response);
       return;
@@ -238,8 +239,14 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
  * For the primary file ('hike.pmtiles' legacy path) an empty file is seeded
  * with a minimal PMTiles v3 stub header so the PMTiles library never reads
  * zero bytes and crashes during the first parse attempt.
+ *
+ * @returns Filenames that could not be provisioned (left as empty/stub OPFS
+ *          files) so the caller can surface a user-facing error instead of
+ *          only logging to the console.
  */
-async function initFiles(filenames: string[]): Promise<void> {
+async function initFiles(filenames: string[]): Promise<string[]> {
+  const provisionFailures: string[] = [];
+
   for (const filename of filenames) {
     const handle = await getHandle(filename);
 
@@ -260,6 +267,7 @@ async function initFiles(filenames: string[]): Promise<void> {
           stub.set([0x50, 0x4D, 0x54, 0x69, 0x6C, 0x65, 0x73, 3]); // "PMTiles" + v3
           handle.write(stub, { at: 0 });
           handle.flush();
+          provisionFailures.push(filename);
         }
       } else {
         console.log(`[mapData.worker] "${filename}" is empty — provisioning from local assets /local/${filename}…`);
@@ -267,15 +275,29 @@ async function initFiles(filenames: string[]): Promise<void> {
           const res = await fetch(`/local/${filename}`);
           if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
           const buf = await res.arrayBuffer();
+
+          // Dev servers (and some static hosts) return HTTP 200 with an HTML
+          // fallback page for a missing asset instead of a real 404 — verify
+          // the "PMTiles" magic header so a bad fetch doesn't get silently
+          // treated as a successful provision.
+          const magic = new Uint8Array(buf.slice(0, 7));
+          const isPMTiles = String.fromCharCode(...magic) === 'PMTiles';
+          if (!isPMTiles) {
+            throw new Error(`"${filename}" did not resolve to a valid PMTiles archive (got ${buf.byteLength} bytes — likely a missing/404 asset)`);
+          }
+
           handle.write(new Uint8Array(buf), { at: 0 });
           handle.flush();
           console.log(`[mapData.worker] Provisioned "${filename}" from local assets. Size: ${handle.getSize()} bytes`);
         } catch (err) {
           console.error(`[mapData.worker] Failed to provision "${filename}" from local assets:`, err);
+          provisionFailures.push(filename);
         }
       }
     }
   }
+
+  return provisionFailures;
 }
 
 // ---------------------------------------------------------------------------

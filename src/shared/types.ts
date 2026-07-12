@@ -48,6 +48,17 @@ export interface WorkerResponseMessage {
   error?: string;
 }
 
+/** Payload returned by mapData.worker.ts on MAP_INIT_SUCCESS. */
+export interface MapInitSuccessPayload {
+  /** Byte size of the first (primary) file in the requested filename set. */
+  size: number;
+  /**
+   * Filenames that could not be provisioned from /local assets (e.g. a 404
+   * on the static asset) and were left as empty OPFS stubs.
+   */
+  provisionFailures: string[];
+}
+
 // ─── Phase 4: User Data Sovereignty & Sync ───────────────────────────────────
 
 /** Which cloud provider is currently configured. */

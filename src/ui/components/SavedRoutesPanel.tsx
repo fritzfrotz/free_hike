@@ -22,15 +22,29 @@ export default function SavedRoutesPanel({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (isOpen) {
-      setLoading(true);
-      getAllRoutes()
-        .then((data) => {
-          setRoutes(data.sort((a, b) => b.timestamp - a.timestamp));
-        })
-        .catch((err) => console.error('Failed to get saved routes:', err))
-        .finally(() => setLoading(false));
-    }
+    if (!isOpen) return;
+
+    let cancelled = false;
+
+    // Defer the initial setState out of the effect's synchronous body — calling
+    // setState directly inside an effect can trigger cascading renders.
+    queueMicrotask(() => {
+      if (!cancelled) setLoading(true);
+    });
+
+    getAllRoutes()
+      .then((data) => {
+        if (cancelled) return;
+        setRoutes(data.sort((a, b) => b.timestamp - a.timestamp));
+      })
+      .catch((err) => console.error('Failed to get saved routes:', err))
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [isOpen, refreshKey]);
 
   if (!isOpen) return null;

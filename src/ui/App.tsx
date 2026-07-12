@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
@@ -16,7 +16,6 @@ import type {
 import MapView from './components/MapView';
 import CloudSyncPanel from './components/CloudSyncPanel';
 import ElevationProfile from './components/ElevationProfile';
-import maplibregl from 'maplibre-gl';
 import { retrieveAndClearState } from './services/cryptoPKCE';
 import {
   buildGoogleAuthUrl,
@@ -43,9 +42,7 @@ import { requestPersistentStorage } from './services/storageGuard';
 
 
 export default function App() {
-  // ── Dummy worker state (existing Phase 1 scaffold) ──────────────────────────
-  const [messages, setMessages] = useState<Array<{ sender: 'client' | 'worker'; text: string; timestamp: Date }>>([]);
-  const [inputText, setInputText]   = useState('Explore the trails!');
+  // ── Background worker health (drives the header status pill) ────────────────
   const [workerReady, setWorkerReady] = useState(false);
   const workerRef = useRef<Worker | null>(null);
 
@@ -80,6 +77,10 @@ export default function App() {
   const [isSavedRoutesOpen, setIsSavedRoutesOpen] = useState(false);
   const [savedRoutesRefreshKey, setSavedRoutesRefreshKey] = useState(0);
   const [isStorageDurable, setIsStorageDurable] = useState<boolean | null>(null);
+
+  // ── User-facing error banners (surfaced instead of console-only logging) ────
+  const [locationPermissionDenied, setLocationPermissionDenied] = useState(false);
+  const [mapDataError, setMapDataError] = useState<string | null>(null);
 
   // ── Effect 1: OAuth callback interception + existing token restoration ───────
   //
@@ -194,7 +195,7 @@ export default function App() {
     })();
   }, []);
 
-  // ── Effect 2: Dummy background worker (Phase 1 scaffold) ────────────────────
+  // ── Effect 2: Background worker heartbeat (drives the header status pill) ───
   useEffect(() => {
     const worker = new Worker(
       new URL('../workers/dummy.worker.ts', import.meta.url),
@@ -203,22 +204,7 @@ export default function App() {
     workerRef.current = worker;
 
     const handleMessage = (event: MessageEvent<WorkerResponseMessage>) => {
-      const response = event.data;
-      console.log('%c[Main Thread] Worker response:', 'color:#0d9488;font-weight:bold;', response);
-
-      if (response.type === 'PONG') {
-        setMessages(prev => [...prev, {
-          sender:    'worker',
-          text:      response.payload.message as string,
-          timestamp: new Date(response.payload.timestamp as number),
-        }]);
-      } else if (response.type === 'ERROR') {
-        setMessages(prev => [...prev, {
-          sender:    'worker',
-          text:      `Error: ${response.error ?? 'Unknown error'}`,
-          timestamp: new Date(),
-        }]);
-      }
+      console.log('%c[Main Thread] Worker response:', 'color:#0d9488;font-weight:bold;', event.data);
     };
 
     worker.addEventListener('message', handleMessage);
@@ -286,6 +272,15 @@ export default function App() {
     setHoveredElevIndex(index);
   }, []);
 
+  // ── User-facing error banner callbacks (memoised) ─────────────────────────
+  const handleLocationPermissionDenied = useCallback(() => {
+    setLocationPermissionDenied(true);
+  }, []);
+
+  const handleMapDataError = useCallback((message: string) => {
+    setMapDataError(message);
+  }, []);
+
   // ── Phase 10: Region download orchestrator ────────────────────────────────
   //
   // Flow:
@@ -295,7 +290,7 @@ export default function App() {
   //   3. Transfer them zero-copy to mapData.worker via DOWNLOAD_REGION_REQUEST.
   //   4. Listen for DOWNLOAD_REGION_SUCCESS or DOWNLOAD_REGION_ERROR.
   //   5. Advance the download state machine accordingly.
-  const handleRegionDownload = useCallback(async (_bounds: maplibregl.LngLatBounds) => {
+  const handleRegionDownload = useCallback(async () => {
     const worker = mapDataWorkerRef.current;
     if (!worker) {
       console.error('[Download] mapData worker not available.');
@@ -441,20 +436,6 @@ export default function App() {
   );
 
 
-  // ── Ping handler (Phase 1 scaffold) ─────────────────────────────────────────
-  const sendPing = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!workerRef.current || !inputText.trim()) return;
-
-    const id: string = Math.random().toString(36).substring(2, 9);
-    const request: WorkerRequestMessage = { id, type: 'PING', payload: { message: inputText } };
-
-    console.log('%c[Main Thread] Sending ping:', 'color:#4f46e5;font-weight:bold;', request);
-    setMessages(prev => [...prev, { sender: 'client', text: inputText, timestamp: new Date() }]);
-    workerRef.current.postMessage(request);
-    setInputText('');
-  };
-
   // ── Cloud sync handlers ──────────────────────────────────────────────────────
 
   const handleConnectGoogle = async () => {
@@ -493,7 +474,7 @@ export default function App() {
 
     try {
       // 1. Read the spatial index feature cache from OPFS (FlatGeobuf format).
-      let features: CachedTrailFeature[] = [];
+      const features: CachedTrailFeature[] = [];
       try {
         const root       = await navigator.storage.getDirectory();
         const fileHandle = await root.getFileHandle('trails_features.fgb');
@@ -502,7 +483,7 @@ export default function App() {
         const uint8Array = new Uint8Array(buffer);
         const { geojson: fgbGeojson } = await import('flatgeobuf');
         for await (const feature of fgbGeojson.deserialize(uint8Array)) {
-          const properties = (feature.properties || {}) as Record<string, any>;
+          const properties = (feature.properties || {}) as Record<string, unknown>;
           const geometry = feature.geometry;
           if (geometry && geometry.type === 'LineString') {
             const coordsFlat: number[] = [];
@@ -610,6 +591,51 @@ export default function App() {
         </div>
       )}
 
+      {locationPermissionDenied && (
+        <div className="w-full max-w-6xl mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between text-sm text-amber-400">
+          <div className="flex items-center gap-2.5">
+            <svg className="h-5 w-5 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+            <span>
+              <strong>Location access denied:</strong> Your position won't be tracked on the map. Enable location permission for this site in your browser settings to re-center on your hike.
+            </span>
+          </div>
+          <button
+            onClick={() => setLocationPermissionDenied(false)}
+            className="ml-3 p-1 rounded text-amber-400 hover:text-amber-200 shrink-0 cursor-pointer"
+            title="Dismiss"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {mapDataError && (
+        <div className="w-full max-w-6xl mb-6 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-between text-sm text-rose-400">
+          <div className="flex items-center gap-2.5">
+            <svg className="h-5 w-5 text-rose-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <span>
+              <strong>Map data unavailable:</strong> {mapDataError}
+            </span>
+          </div>
+          <button
+            onClick={() => setMapDataError(null)}
+            className="ml-3 p-1 rounded text-rose-400 hover:text-rose-200 shrink-0 cursor-pointer"
+            title="Dismiss"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
+
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="w-full max-w-6xl flex items-center justify-between border-b border-slate-900 pb-6 mb-8">
         <div className="flex items-center space-x-3">
@@ -688,6 +714,8 @@ export default function App() {
           onMapDataWorkerReady={(worker) => {
             mapDataWorkerRef.current = worker;
           }}
+          onLocationPermissionDenied={handleLocationPermissionDenied}
+          onMapDataError={handleMapDataError}
           onRegionDownload={handleRegionDownload}
           downloadStatus={downloadStatus}
           downloadProgressLabel={downloadProgressLabel}
@@ -712,102 +740,6 @@ export default function App() {
         onDisconnect={handleDisconnect}
         onSyncNow={handleSyncNow}
       />
-
-      {/* ── Main Body ──────────────────────────────────────────────────────── */}
-      <main className="w-full max-w-6xl flex-grow flex flex-col md:flex-row gap-8 items-stretch justify-center my-4">
-
-        {/* Left: Architecture overview */}
-        <section className="flex-1 bg-slate-900/40 backdrop-blur-md border border-slate-900 rounded-2xl p-6 flex flex-col justify-between">
-          <div className="space-y-6">
-            <div>
-              <span className="px-2 py-1 rounded-md bg-emerald-500/10 text-emerald-400 text-xs font-mono border border-emerald-500/20">
-                Main Thread Isolation
-              </span>
-              <h2 className="text-xl font-semibold mt-3 text-slate-100">Zero-Overhead Processing</h2>
-              <p className="text-sm text-slate-400 mt-2 leading-relaxed">
-                Spatial index builders, DEM contourizers, and Valhalla routing queries run in isolated
-                Web Workers — keeping the UI fluid at 60 FPS while Phase 4 OAuth flows execute entirely
-                on the main DOM thread without any server involvement.
-              </p>
-            </div>
-
-            <div className="border-t border-slate-900 pt-6 space-y-4">
-              {[
-                { n: 1, title: 'Main Thread UI',            body: 'Renders the vector map, drives OAuth flows, and orchestrates the sync pipeline.' },
-                { n: 2, title: 'Shared Transferables',      body: 'Zero-copy ArrayBuffer transfers between threads; structured cloning avoided.' },
-                { n: 3, title: 'Geospatial Worker Pool',    body: 'Flatbush indexing, Overpass ingestion, DEM decoding — never blocking the UI.' },
-              ].map(({ n, title, body }) => (
-                <div key={n} className="flex items-start space-x-3">
-                  <div className="mt-1 h-5 w-5 rounded bg-slate-800 flex items-center justify-center text-xs font-mono text-slate-300">{n}</div>
-                  <div>
-                    <h4 className="text-sm font-semibold text-slate-200">{title}</h4>
-                    <p className="text-xs text-slate-400 mt-0.5">{body}</p>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="mt-8 p-4 rounded-xl bg-slate-950/50 border border-slate-900 flex items-center justify-between text-xs font-mono text-slate-400">
-            <span>TypeScript Targets:</span>
-            <span className="text-teal-400 font-semibold">WebWorker · DOM · isolated</span>
-          </div>
-        </section>
-
-        {/* Right: RPC Activity Stream */}
-        <section className="flex-1 bg-slate-900/60 border border-slate-900 rounded-2xl p-6 flex flex-col">
-          <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-4 flex items-center justify-between">
-            <span>Thread Activity Stream</span>
-            <span className="font-mono text-xs text-slate-500">RPC Layer</span>
-          </h3>
-
-          <div className="flex-grow bg-slate-950/80 border border-slate-900 rounded-xl p-4 overflow-y-auto font-mono text-xs min-h-[300px] max-h-[400px] space-y-4 shadow-inner">
-            {messages.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-slate-600 italic text-center p-4">
-                No active RPC transfers. Send a ping to dispatch a serialized message across the thread boundary.
-              </div>
-            ) : (
-              messages.map((msg, index) => (
-                <div
-                  key={index}
-                  className={`flex flex-col space-y-1 ${msg.sender === 'client' ? 'items-end' : 'items-start'}`}
-                >
-                  <div className="flex items-center space-x-2 text-[10px] text-slate-500">
-                    <span>{msg.sender === 'client' ? 'Main Thread ➔ Worker' : 'Worker ➔ Main Thread'}</span>
-                    <span>•</span>
-                    <span>{msg.timestamp.toLocaleTimeString()}</span>
-                  </div>
-                  <div className={`max-w-[85%] rounded-lg p-2.5 leading-normal ${
-                    msg.sender === 'client'
-                      ? 'bg-indigo-600/20 text-indigo-200 border border-indigo-500/30'
-                      : 'bg-emerald-600/20 text-emerald-200 border border-emerald-500/30'
-                  }`}>
-                    {msg.text}
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-
-          <form onSubmit={sendPing} className="mt-4 flex space-x-2">
-            <input
-              type="text"
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              placeholder="Enter message for background thread..."
-              className="flex-grow bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-teal-500 text-slate-200 transition-colors"
-            />
-            <button
-              type="submit"
-              disabled={!workerReady}
-              className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-slate-950 font-semibold text-sm hover:from-emerald-400 hover:to-teal-400 transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none shadow-md shadow-emerald-500/10 cursor-pointer"
-            >
-              Send
-            </button>
-          </form>
-        </section>
-
-      </main>
 
       {/* ── Footer ─────────────────────────────────────────────────────────── */}
       <footer className="w-full max-w-6xl text-center border-t border-slate-900 pt-6 mt-8 text-xs text-slate-600">

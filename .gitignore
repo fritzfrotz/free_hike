@@ -40,6 +40,13 @@ planetiler.jar
 data/
 valhalla_data/
 
+# Raw OSM extracts — large, regenerable via scripts/compile_sandbox_data.sh.
+# Never commit these: a previously-committed broken 9.6KB HTML-as-.pbf file
+# (from a silently-failed Geofabrik download) caused the Alps basemap to be
+# built from the wrong region's data. Source .pbf files belong on disk only.
+offline_sandbox/raw_data/*.osm.pbf
+offline_sandbox/raw_data/_cache/
+
 # Nested project target build outputs
 offline_sandbox/gdal/target/
 offline_sandbox/massif/target/

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import maplibregl from 'maplibre-gl';
 import { Protocol, PMTiles } from 'pmtiles';
 import type { Source, RangeResponse } from 'pmtiles';
-import type { WorkerRequestMessage, WorkerResponseMessage } from '../../shared/types';
+import type { WorkerRequestMessage, WorkerResponseMessage, MapInitSuccessPayload } from '../../shared/types';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import mlcontour from 'maplibre-contour';
 import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
@@ -212,6 +212,10 @@ export interface MapViewProps {
   onSpatialWorkerReady?: (worker: Worker) => void;
   /** Called once with the mapData Worker instance so App can send DOWNLOAD_REGION_REQUEST. */
   onMapDataWorkerReady?: (worker: Worker) => void;
+  /** Called when the GPS watcher reports the user denied location permission. */
+  onLocationPermissionDenied?: () => void;
+  /** Called with a human-readable message when offline map data fails to provision. */
+  onMapDataError?: (message: string) => void;
   /** Called when the user confirms a region download; receives the current bounds. */
   onRegionDownload?: (bounds: maplibregl.LngLatBounds) => void;
   /** Current state of an in-progress download (drives the confirm panel). */
@@ -233,6 +237,8 @@ export default function MapView({
   hoveredElevIndex = null,
   onSpatialWorkerReady,
   onMapDataWorkerReady,
+  onLocationPermissionDenied,
+  onMapDataError,
   onRegionDownload,
   downloadStatus        = 'idle',
   downloadProgressLabel = '',
@@ -347,9 +353,16 @@ export default function MapView({
 
       if (response.type === 'MAP_INIT_SUCCESS') {
         if (!active) return;
-        const sizeBytes = response.payload.size as number;
+        const { size: sizeBytes, provisionFailures } = response.payload as MapInitSuccessPayload;
         setFileSize(sizeBytes);
         setStatusMessage(`OPFS storage bound. Database: ${(sizeBytes / 1024 / 1024).toFixed(2)} MB`);
+
+        if (provisionFailures.length > 0) {
+          onMapDataError?.(
+            `Couldn't load offline map data for: ${provisionFailures.join(', ')}. ` +
+            'The map may be missing terrain, hillshading, or trail layers.',
+          );
+        }
 
         // Register the two default sources (basemap + terrain) upfront.
         registerSource(DEFAULT_BASEMAP, (tData) => {
@@ -358,7 +371,7 @@ export default function MapView({
             totalBytes: tData.totalBytes > 0 ? tData.totalBytes : prev.totalBytes,
           }));
         });
-        registerSource(DEFAULT_TERRAIN);
+        const terrainPMTiles = registerSource(DEFAULT_TERRAIN);
 
         if (mapContainerRef.current) {
           setStatusMessage('Mounting map container canvas…');
@@ -446,12 +459,30 @@ export default function MapView({
               onRegionSwitcherReady(switcher);
             }
 
-            // Instantiate and setup demSource for dynamic contours
+            // Instantiate demSource for dynamic contours, sourcing raw DEM
+            // tiles directly from the already-provisioned offline
+            // 'terrain-local' PMTiles instance instead of a remote network
+            // endpoint — contours must generate with zero connectivity, in
+            // line with the rest of the offline-first pipeline.
+            const LOCAL_TERRAIN_DEM_URL = 'local-terrain-dem://{z}/{x}/{y}';
             const demSource = new mlcontour.DemSource({
-              url: 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png',
-              encoding: 'terrarium',
-              maxzoom: 15,
-              worker: true,
+              url: LOCAL_TERRAIN_DEM_URL,
+              encoding: 'mapbox',
+              maxzoom: 12,
+              worker: false,
+            });
+            demSource.manager = new mlcontour.LocalDemManager({
+              demUrlPattern: LOCAL_TERRAIN_DEM_URL,
+              cacheSize: 100,
+              encoding: 'mapbox',
+              maxzoom: 12,
+              timeoutMs: 10_000,
+              getTile: async (url: string) => {
+                const [, z, x, y] = /\/\/(\d+)\/(\d+)\/(\d+)/.exec(url) || [];
+                const tile = await terrainPMTiles.getZxy(Number(z), Number(x), Number(y));
+                if (!tile) throw new Error(`[demSource] No offline terrain tile at ${url}`);
+                return { data: new Blob([tile.data]) };
+              },
             });
             demSource.setupMaplibre(maplibregl);
 
@@ -521,7 +552,7 @@ export default function MapView({
             // ── Phase 9: user-location source + layers ──────────────────────
             // Registered once on load; data is updated dynamically by the GPS
             // watcher via source.setData() — no layer teardown ever needed.
-            const emptyFC = { type: 'FeatureCollection' as const, features: [] as any[] };
+            const emptyFC = { type: 'FeatureCollection' as const, features: [] as GeoJSON.Feature[] };
             activeMap.addSource('user-location-source', {
               type: 'geojson',
               data: emptyFC,
@@ -596,7 +627,7 @@ export default function MapView({
           type:    'MAP_CLOSE',
           payload: null,
         } satisfies WorkerRequestMessage);
-      } catch (err) {
+      } catch {
         // Ignored if worker is already terminated/unresponsive
       }
 
@@ -615,7 +646,11 @@ export default function MapView({
 
       mapDataWorker.terminate();
     };
-  }, []);
+  // onMapDataWorkerReady, onRegionSwitcherReady, and onMapDataError are
+  // intentionally omitted: the mapData worker and MapLibre map are
+  // instantiated exactly once on mount; re-running on prop changes would
+  // spawn duplicate workers/map instances and re-trigger MAP_INIT.
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------------------------------------------------------------------------
   // Boot: spatial worker + its global message dispatcher
@@ -647,7 +682,7 @@ export default function MapView({
         // Inject the GeoJSON FeatureCollection into the MapLibre source.
         const map = mapRef.current;
         if (map && geojson) {
-          const parsed = JSON.parse(geojson) as { type: 'FeatureCollection'; features: any[] };
+          const parsed = JSON.parse(geojson) as { type: 'FeatureCollection'; features: GeoJSON.Feature[] };
 
           if (map.getSource(TRAIL_SOURCE_ID)) {
             // Source already exists from a previous scan — just update data.
@@ -1081,6 +1116,9 @@ export default function MapView({
       // onError
       (err) => {
         console.warn('[GPS] Tracker error:', err.message);
+        if (err.message.toLowerCase().includes('denied')) {
+          onLocationPermissionDenied?.();
+        }
       }
     ).then((handle) => {
       if (cancelled) {
@@ -1101,7 +1139,7 @@ export default function MapView({
   // isTrackingCamera is read via isTrackingCameraRef to avoid stale closures;
   // re-registering the watcher on every tracking toggle would create duplicate
   // watchers and drain battery.
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [onLocationPermissionDenied]);
 
   // Keep the ref in sync with state so the watcher closure stays current.
   useEffect(() => { isTrackingCameraRef.current = isTrackingCamera; }, [isTrackingCamera]);
@@ -1322,7 +1360,7 @@ export default function MapView({
             <div className="grid grid-cols-2 gap-2 text-xs font-mono">
               <div className="p-2 rounded-xl bg-slate-900/40 border border-slate-800">
                 <span className="text-[9px] text-slate-500 uppercase block leading-none">Database</span>
-                <span className="text-slate-300 font-bold block mt-1">hike.pmtiles</span>
+                <span className="text-slate-300 font-bold block mt-1">alps_basemap.pmtiles</span>
               </div>
               <div className="p-2 rounded-xl bg-slate-900/40 border border-slate-800">
                 <span className="text-[9px] text-slate-500 uppercase block leading-none">Local Size</span>

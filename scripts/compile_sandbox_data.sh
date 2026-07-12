@@ -101,13 +101,30 @@ else
 fi
 
 # 4. Compile Terrain PMTiles (Massif)
+#
+# Massif is vendored as Rust source under offline_sandbox/massif (no
+# .gitmodules / real submodule wiring, so `cargo build` must run from
+# source rather than assuming a globally-installed `massif` on PATH).
 DEM_TIF="offline_sandbox/raw_data/innsbruck_dem.tif"
 TERRAIN_PMTILES="offline_sandbox/output/alps_terrain.pmtiles"
+MASSIF_DIR="offline_sandbox/massif"
+MASSIF_BIN="${MASSIF_DIR}/target/release/massif"
 
-if command -v massif >/dev/null 2>&1; then
-  if [ -f "${DEM_TIF}" ]; then
+if [ -f "${DEM_TIF}" ]; then
+  if [ ! -x "${MASSIF_BIN}" ]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+      echo "WARNING: 'cargo' not found on PATH. Cannot build massif from source. Skipping terrain compilation."
+      echo "Install Rust (https://rustup.rs) to enable terrain generation."
+      MASSIF_BIN=""
+    else
+      echo "Building massif from vendored source (${MASSIF_DIR})..."
+      (cd "${MASSIF_DIR}" && cargo build --release)
+    fi
+  fi
+
+  if [ -n "${MASSIF_BIN}" ] && [ -x "${MASSIF_BIN}" ]; then
     echo "Compiling Terrain-RGB PMTiles with Massif..."
-    massif \
+    "${MASSIF_BIN}" \
       --encoding mapbox \
       --format webp \
       --compress 6 \
@@ -119,12 +136,10 @@ if command -v massif >/dev/null 2>&1; then
       "${DEM_TIF}" \
       "${TERRAIN_PMTILES}"
     echo "Terrain compilation completed: ${TERRAIN_PMTILES}"
-  else
-    echo "WARNING: ${DEM_TIF} not found. Skipping terrain compilation."
-    echo "Please place innsbruck_dem.tif in offline_sandbox/raw_data/ to compile terrain data."
   fi
 else
-  echo "WARNING: 'massif' CLI not found on PATH. Skipping terrain compilation."
+  echo "WARNING: ${DEM_TIF} not found. Skipping terrain compilation."
+  echo "Please place innsbruck_dem.tif in offline_sandbox/raw_data/ to compile terrain data."
 fi
 
 # 5. Move/Copy to Public

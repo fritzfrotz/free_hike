@@ -273,7 +273,7 @@ void uniffi_freehike_ffi_fn_init_callback_vtable_progresscallback(const UniffiVT
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_COMPILE_CHUNK
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_COMPILE_CHUNK
-RustBuffer uniffi_freehike_ffi_fn_func_compile_chunk(RustBuffer bbox, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_freehike_ffi_fn_func_compile_chunk(RustBuffer job, uint32_t budget_ms, uint64_t callback, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_EMIT_TEST_PROGRESS
@@ -285,6 +285,16 @@ uint32_t uniffi_freehike_ffi_fn_func_emit_test_progress(uint64_t callback, uint3
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_ENGINE_VERSION
 RustBuffer uniffi_freehike_ffi_fn_func_engine_version(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_PURGE_JOB
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_PURGE_JOB
+int8_t uniffi_freehike_ffi_fn_func_purge_job(RustBuffer job_id, RustBuffer output_dir, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_QUERY_CHECKPOINT
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_QUERY_CHECKPOINT
+RustBuffer uniffi_freehike_ffi_fn_func_query_checkpoint(RustBuffer job_id, RustBuffer output_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_FREEHIKE_FFI_RUSTBUFFER_ALLOC
@@ -582,6 +592,18 @@ uint16_t uniffi_freehike_ffi_checksum_func_emit_test_progress(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_ENGINE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_ENGINE_VERSION
 uint16_t uniffi_freehike_ffi_checksum_func_engine_version(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_PURGE_JOB
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_PURGE_JOB
+uint16_t uniffi_freehike_ffi_checksum_func_purge_job(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_CHECKPOINT
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_CHECKPOINT
+uint16_t uniffi_freehike_ffi_checksum_func_query_checkpoint(void
     
 );
 #endif

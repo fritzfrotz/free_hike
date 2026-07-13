@@ -738,6 +738,10 @@ internal open class UniffiVTableCallbackInterfaceProgressCallback(
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -758,6 +762,10 @@ internal interface IntegrityCheckingUniffiLib : Library {
 fun uniffi_freehike_ffi_checksum_func_emit_test_progress(
 ): Short
 fun uniffi_freehike_ffi_checksum_func_engine_version(
+): Short
+fun uniffi_freehike_ffi_checksum_func_purge_job(
+): Short
+fun uniffi_freehike_ffi_checksum_func_query_checkpoint(
 ): Short
 fun uniffi_freehike_ffi_checksum_method_progresscallback_on_progress(
 ): Short
@@ -809,11 +817,15 @@ internal interface UniffiLib : Library {
     // FFI functions
     fun uniffi_freehike_ffi_fn_init_callback_vtable_progresscallback(`vtable`: UniffiVTableCallbackInterfaceProgressCallback,
 ): Unit
-fun uniffi_freehike_ffi_fn_func_compile_chunk(`bbox`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+fun uniffi_freehike_ffi_fn_func_compile_chunk(`job`: RustBuffer.ByValue,`budgetMs`: Int,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_freehike_ffi_fn_func_emit_test_progress(`callback`: Long,`steps`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): Int
 fun uniffi_freehike_ffi_fn_func_engine_version(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freehike_ffi_fn_func_purge_job(`jobId`: RustBuffer.ByValue,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
+fun uniffi_freehike_ffi_fn_func_query_checkpoint(`jobId`: RustBuffer.ByValue,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_freehike_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -941,16 +953,22 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_freehike_ffi_checksum_func_compile_chunk() != 58841.toShort()) {
+    if (lib.uniffi_freehike_ffi_checksum_func_compile_chunk() != 52545.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_freehike_ffi_checksum_func_emit_test_progress() != 62392.toShort()) {
+    if (lib.uniffi_freehike_ffi_checksum_func_emit_test_progress() != 52095.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freehike_ffi_checksum_func_engine_version() != 51964.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_freehike_ffi_checksum_method_progresscallback_on_progress() != 23804.toShort()) {
+    if (lib.uniffi_freehike_ffi_checksum_func_purge_job() != 63403.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_func_query_checkpoint() != 56823.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_method_progresscallback_on_progress() != 34746.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1066,6 +1084,29 @@ public abstract class FfiConverterCallbackInterface<CallbackInterface: Any>: Ffi
 /**
  * @suppress
  */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterUInt: FfiConverter<UInt, Int> {
     override fun lift(value: Int): UInt {
         return value.toUInt()
@@ -1089,6 +1130,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterFloat: FfiConverter<Float, Float> {
     override fun lift(value: Float): Float {
         return value
@@ -1106,6 +1170,29 @@ public object FfiConverterFloat: FfiConverter<Float, Float> {
 
     override fun write(value: Float, buf: ByteBuffer) {
         buf.putFloat(value)
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
     }
 }
 
@@ -1168,18 +1255,333 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 
 
 
+/**
+ * Where a yielded job stopped. Informational: display it, log it, but never
+ * feed it back — the engine owns the durable copy.
+ */
+data class CheckpointState (
+    var `jobId`: kotlin.String, 
+    /**
+     * Processing phase the job will resume in.
+     */
+    var `phase`: CompilePhase, 
+    /**
+     * Next block index within the phase.
+     */
+    var `nextBlock`: kotlin.UInt, 
+    /**
+     * Byte offset into the source PBF (exact mmap re-entry point once the
+     * real Pass 1/2 land; simulated until then).
+     */
+    var `pbfByteOffset`: kotlin.ULong, 
+    /**
+     * Total bytes appended to output archives so far.
+     */
+    var `bytesWritten`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCheckpointState: FfiConverterRustBuffer<CheckpointState> {
+    override fun read(buf: ByteBuffer): CheckpointState {
+        return CheckpointState(
+            FfiConverterString.read(buf),
+            FfiConverterTypeCompilePhase.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CheckpointState) = (
+            FfiConverterString.allocationSize(value.`jobId`) +
+            FfiConverterTypeCompilePhase.allocationSize(value.`phase`) +
+            FfiConverterUInt.allocationSize(value.`nextBlock`) +
+            FfiConverterULong.allocationSize(value.`pbfByteOffset`) +
+            FfiConverterULong.allocationSize(value.`bytesWritten`)
+    )
+
+    override fun write(value: CheckpointState, buf: ByteBuffer) {
+            FfiConverterString.write(value.`jobId`, buf)
+            FfiConverterTypeCompilePhase.write(value.`phase`, buf)
+            FfiConverterUInt.write(value.`nextBlock`, buf)
+            FfiConverterULong.write(value.`pbfByteOffset`, buf)
+            FfiConverterULong.write(value.`bytesWritten`, buf)
+    }
+}
+
+
+
+/**
+ * Description of a compile job. Send the *same* record for every slice of
+ * the same job — `job_id` + `output_dir` are the resume identity.
+ */
+data class CompileJob (
+    /**
+     * Caller-chosen unique ID (e.g. a UUID). Checkpoints are keyed by it.
+     */
+    var `jobId`: kotlin.String, 
+    /**
+     * "west,south,east,north" in WGS84 degrees (validated on every call).
+     */
+    var `bbox`: kotlin.String, 
+    /**
+     * Minimum zoom level to generate (inclusive).
+     */
+    var `minZoom`: kotlin.UByte, 
+    /**
+     * Maximum zoom level to generate (inclusive).
+     */
+    var `maxZoom`: kotlin.UByte, 
+    /**
+     * Absolute path to the raw .osm.pbf extract on device storage.
+     */
+    var `pbfPath`: kotlin.String, 
+    /**
+     * Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
+     */
+    var `demPath`: kotlin.String?, 
+    /**
+     * Directory owning this job's checkpoints and output archives.
+     */
+    var `outputDir`: kotlin.String
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCompileJob: FfiConverterRustBuffer<CompileJob> {
+    override fun read(buf: ByteBuffer): CompileJob {
+        return CompileJob(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterUByte.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CompileJob) = (
+            FfiConverterString.allocationSize(value.`jobId`) +
+            FfiConverterString.allocationSize(value.`bbox`) +
+            FfiConverterUByte.allocationSize(value.`minZoom`) +
+            FfiConverterUByte.allocationSize(value.`maxZoom`) +
+            FfiConverterString.allocationSize(value.`pbfPath`) +
+            FfiConverterOptionalString.allocationSize(value.`demPath`) +
+            FfiConverterString.allocationSize(value.`outputDir`)
+    )
+
+    override fun write(value: CompileJob, buf: ByteBuffer) {
+            FfiConverterString.write(value.`jobId`, buf)
+            FfiConverterString.write(value.`bbox`, buf)
+            FfiConverterUByte.write(value.`minZoom`, buf)
+            FfiConverterUByte.write(value.`maxZoom`, buf)
+            FfiConverterString.write(value.`pbfPath`, buf)
+            FfiConverterOptionalString.write(value.`demPath`, buf)
+            FfiConverterString.write(value.`outputDir`, buf)
+    }
+}
+
+
+
+/**
+ * Completion report for a finished job.
+ */
+data class CompileSummary (
+    var `jobId`: kotlin.String, 
+    var `blocksTotal`: kotlin.UInt, 
+    var `bytesWritten`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCompileSummary: FfiConverterRustBuffer<CompileSummary> {
+    override fun read(buf: ByteBuffer): CompileSummary {
+        return CompileSummary(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: CompileSummary) = (
+            FfiConverterString.allocationSize(value.`jobId`) +
+            FfiConverterUInt.allocationSize(value.`blocksTotal`) +
+            FfiConverterULong.allocationSize(value.`bytesWritten`)
+    )
+
+    override fun write(value: CompileSummary, buf: ByteBuffer) {
+            FfiConverterString.write(value.`jobId`, buf)
+            FfiConverterUInt.write(value.`blocksTotal`, buf)
+            FfiConverterULong.write(value.`bytesWritten`, buf)
+    }
+}
+
+
+
+/**
+ * Result of one execution slice.
+ */
+sealed class CompilationStatus {
+    
+    /**
+     * Compilation for the region is 100% complete; temporary caches purged.
+     */
+    data class Finished(
+        val `summary`: CompileSummary) : CompilationStatus() {
+        companion object
+    }
+    
+    /**
+     * The time budget expired; durable checkpoint written. Re-invoke
+     * `compile_chunk` with the same CompileJob to resume.
+     */
+    data class Yielded(
+        val `checkpoint`: CheckpointState) : CompilationStatus() {
+        companion object
+    }
+    
+    /**
+     * A fatal error occurred (e.g. disk full, corrupted payload).
+     */
+    data class Failed(
+        val `reason`: kotlin.String) : CompilationStatus() {
+        companion object
+    }
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCompilationStatus : FfiConverterRustBuffer<CompilationStatus>{
+    override fun read(buf: ByteBuffer): CompilationStatus {
+        return when(buf.getInt()) {
+            1 -> CompilationStatus.Finished(
+                FfiConverterTypeCompileSummary.read(buf),
+                )
+            2 -> CompilationStatus.Yielded(
+                FfiConverterTypeCheckpointState.read(buf),
+                )
+            3 -> CompilationStatus.Failed(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: CompilationStatus) = when(value) {
+        is CompilationStatus.Finished -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeCompileSummary.allocationSize(value.`summary`)
+            )
+        }
+        is CompilationStatus.Yielded -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeCheckpointState.allocationSize(value.`checkpoint`)
+            )
+        }
+        is CompilationStatus.Failed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+    }
+
+    override fun write(value: CompilationStatus, buf: ByteBuffer) {
+        when(value) {
+            is CompilationStatus.Finished -> {
+                buf.putInt(1)
+                FfiConverterTypeCompileSummary.write(value.`summary`, buf)
+                Unit
+            }
+            is CompilationStatus.Yielded -> {
+                buf.putInt(2)
+                FfiConverterTypeCheckpointState.write(value.`checkpoint`, buf)
+                Unit
+            }
+            is CompilationStatus.Failed -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+/**
+ * Compilation phases, in execution order.
+ */
+
+enum class CompilePhase {
+    
+    PASS1_NODES,
+    PASS2_WAYS,
+    TERRAIN,
+    FINALIZE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeCompilePhase: FfiConverterRustBuffer<CompilePhase> {
+    override fun read(buf: ByteBuffer) = try {
+        CompilePhase.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: CompilePhase) = 4UL
+
+    override fun write(value: CompilePhase, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 
 
 /**
  * Progress events emitted from the Rust core to the native (Swift/Kotlin)
- * layer, which forwards them to the WebView as Capacitor
- * `compilationProgress` events. Implemented on the foreign side.
+ * layer, forwarded to the WebView as Capacitor `compilationProgress` events.
  */
 public interface ProgressCallback {
     
     /**
-     * `percentage` is 0.0-100.0; `status` is a human-readable phase label
-     * (e.g. "pass1: indexing nodes").
+     * `percentage` is 0.0-100.0 across the whole job (not the slice);
+     * `status` is a human-readable phase label, e.g.
+     * "pass1: indexing nodes (12/62)".
      */
     fun `onProgress`(`percentage`: kotlin.Float, `status`: kotlin.String)
     
@@ -1228,29 +1630,87 @@ internal object uniffiCallbackInterfaceProgressCallback {
  * @suppress
  */
 public object FfiConverterTypeProgressCallback: FfiConverterCallbackInterface<ProgressCallback>()
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeCheckpointState: FfiConverterRustBuffer<CheckpointState?> {
+    override fun read(buf: ByteBuffer): CheckpointState? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeCheckpointState.read(buf)
+    }
+
+    override fun allocationSize(value: CheckpointState?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeCheckpointState.allocationSize(value)
+        }
+    }
+
+    override fun write(value: CheckpointState?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeCheckpointState.write(value, buf)
+        }
+    }
+}
         /**
-         * Walking-skeleton compile entry point.
-         *
-         * Accepts a `"west,south,east,north"` WGS84 bbox string and returns a JSON
-         * status envelope. Phase 7 replaces the body with the real chunked,
-         * checkpointed state machine (`compile_chunk(budget) -> Finished | Yielded`);
-         * the signature here is deliberately primitive (String -> String) so the
-         * bridge plumbing can be proven end-to-end before the real surface is
-         * designed and HITL-reviewed.
-         */ fun `compileChunk`(`bbox`: kotlin.String): kotlin.String {
-            return FfiConverterString.lift(
+         * Runs one budget-bounded slice of `job`. See module docs for the
+         * Finished / Yielded / Failed contract. Never throws: all failures are
+         * values, so foreign call sites need no try/catch ceremony.
+         */ fun `compileChunk`(`job`: CompileJob, `budgetMs`: kotlin.UInt, `callback`: ProgressCallback): CompilationStatus {
+            return FfiConverterTypeCompilationStatus.lift(
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_compile_chunk(
-        FfiConverterString.lower(`bbox`),_status)
+        FfiConverterTypeCompileJob.lower(`job`),FfiConverterUInt.lower(`budgetMs`),FfiConverterTypeProgressCallback.lower(`callback`),_status)
 }
     )
     }
     
 
         /**
-         * Proves the foreign-callback path crosses the bridge: emits `steps`
-         * synthetic progress ticks through the callback and returns how many were
-         * sent. Wired to a hidden debug button in the WebView during Phase 1.
+         * Debug walking-skeleton retained from Phase 1: emits `steps` synthetic
+         * progress ticks through the callback and returns how many were sent.
          */ fun `emitTestProgress`(`callback`: ProgressCallback, `steps`: kotlin.UInt): kotlin.UInt {
             return FfiConverterUInt.lift(
     uniffiRustCall() { _status ->
@@ -1268,6 +1728,35 @@ public object FfiConverterTypeProgressCallback: FfiConverterCallbackInterface<Pr
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_engine_version(
         _status)
+}
+    )
+    }
+    
+
+        /**
+         * Cancels a job between slices by deleting its durable state. Returns true
+         * if state existed and was removed. (In-slice cancellation is not needed:
+         * slices are budget-bounded, so the runner simply stops re-invoking.)
+         */ fun `purgeJob`(`jobId`: kotlin.String, `outputDir`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_purge_job(
+        FfiConverterString.lower(`jobId`),FfiConverterString.lower(`outputDir`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Cold-start resume detection: returns the durable checkpoint for a job if
+         * one exists (e.g. after the OS killed the process mid-compilation), None
+         * if the job has no saved state, or Failed-equivalent None on unreadable
+         * state (the next compile_chunk call surfaces the precise error).
+         */ fun `queryCheckpoint`(`jobId`: kotlin.String, `outputDir`: kotlin.String): CheckpointState? {
+            return FfiConverterOptionalTypeCheckpointState.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_query_checkpoint(
+        FfiConverterString.lower(`jobId`),FfiConverterString.lower(`outputDir`),_status)
 }
     )
     }

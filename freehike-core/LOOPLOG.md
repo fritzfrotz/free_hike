@@ -297,6 +297,32 @@ resolves pending startJob with status "cancelled". query_checkpoint exposure thr
 plugins deferred (logged) — not needed for this chunk's proof.
 
 **Attempts:**
+- A1: P2.C0 committed as `3753347` (operator-instructed).
+- A2: bindings copied to both shells; MapCompilerPlugin.kt + .swift rewritten with the
+  budget-yield loop + cancel; MapCompiler.ts v1 interface; App.tsx debug handler updated
+  (budgetMs=25, per-slice status listener).
+- A3: gates first try: tsc CLEAN, eslint CLEAN, swiftc -parse ×2 CLEAN. .so rebuilt for
+  v1 (checksums now match embedded binding), npm build + cap sync, gradle installDebug
+  BUILD SUCCESSFUL, plugin load line OK on emulator.
+- A4: tap targeting: two misses (WebView re-render resets scroll between screenshot and
+  tap — the map-init spinner re-render is the culprit; filed as UI nit). PIVOT →
+  uiautomator bounds lookup + atomic tap; one shell-arithmetic bug in bounds parsing
+  fixed ("][ " collapsed by tr).
+- A5: EVIDENCE (one tap, budgetMs=25): logcat — 62 compilationProgress events (= exactly
+  blocks_total), 16 compilationStatus events (15 yielded + 1 finished);
+  `slice 1 yielded: phase=PASS1_NODES block=6` → `slice 2 ... block=11` (durable
+  checkpoint resume between invocations, on device); terminal
+  `job debug-compile finished in 16 slices: 62 blocks, 253952 bytes`.
+  UI accessibility dump — "◌ slice 15: yielded", "◌ slice 16: finished",
+  "← finished in 16 slices — 62 blocks, 253952 bytes" rendered in the React panel.
+
+**Outcome:** CLOSED. Pivots: 1 (tap targeting). Steps ~30/40.
+Downstream break from P2.C0 fully resolved: all three shells consume Surface v1; the
+budget-yield loop and Yielded-state handling verified end-to-end on the emulator.
+Deferred: iOS full build (needs Xcode machine), query_checkpoint plugin exposure,
+scroll-reset UI nit during map init. Uncommitted (P2.C1 diff) — awaiting operator.
+
+**Attempts:**
 - A1: `src/plugins/MapCompiler.ts` + App.tsx listener effect / debug button / footer panel
   authored. `tsc -b` PASS.
 - A2: `eslint .` LINT_FAIL — ESLint swept Capacitor-generated artifacts in `android/app/build/`

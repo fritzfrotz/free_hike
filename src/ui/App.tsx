@@ -360,29 +360,40 @@ export default function App() {
     setNativeDebugLines((prev) => [...prev.slice(-7), line]);
   }, []);
 
-  // Attach the 'compilationProgress' listener once. On the web (no native
-  // shell) addListener rejects with "not implemented" — swallowed here, since
-  // the whole panel is a native-bridge debug aid.
+  // Attach the progress (per-block) and status (per-slice) listeners once.
+  // On the web (no native shell) addListener rejects with "not implemented" —
+  // swallowed here, since the whole panel is a native-bridge debug aid.
   useEffect(() => {
-    const handlePromise = MapCompiler.addListener('compilationProgress', (event) => {
+    const progressPromise = MapCompiler.addListener('compilationProgress', (event) => {
       appendNativeDebugLine(`◈ ${event.percentage.toFixed(0)}% — ${event.status}`);
     }).catch(() => null);
 
+    const statusPromise = MapCompiler.addListener('compilationStatus', (event) => {
+      appendNativeDebugLine(`◌ slice ${event.slices}: ${event.state}`);
+    }).catch(() => null);
+
     return () => {
-      handlePromise.then((handle) => handle?.remove());
+      progressPromise.then((handle) => handle?.remove());
+      statusPromise.then((handle) => handle?.remove());
     };
   }, [appendNativeDebugLine]);
 
-  // Debug button: proves the full tri-layer round-trip. startJob exercises the
-  // request/response path; emitTestProgress exercises the Rust → JS event path.
+  // Debug button: proves the full Surface v1 loop — a deliberately tiny
+  // per-slice budget forces the Rust engine to Yield repeatedly, so one tap
+  // exercises checkpoint-write → re-invoke → resume several times before
+  // the terminal Finished envelope resolves.
   const handleDebugNativeCompile = useCallback(async () => {
     const bbox = '11.1,47.1,11.6,47.45';
-    appendNativeDebugLine(`→ startJob(${bbox})`);
+    appendNativeDebugLine(`→ startJob(${bbox}, budgetMs=25)`);
     try {
-      const { result } = await MapCompiler.startJob({ bbox });
-      appendNativeDebugLine(`← ${result}`);
-      const { sent } = await MapCompiler.emitTestProgress({ steps: 5 });
-      appendNativeDebugLine(`← emitTestProgress: ${sent} ticks dispatched`);
+      const result = await MapCompiler.startJob({ bbox, jobId: 'debug-compile', budgetMs: 25 });
+      if (result.status === 'finished') {
+        appendNativeDebugLine(
+          `← finished in ${result.slices} slices — ${result.blocksTotal} blocks, ${result.bytesWritten} bytes`,
+        );
+      } else {
+        appendNativeDebugLine(`← ${result.status}${result.reason ? `: ${result.reason}` : ''} (${result.slices} slices)`);
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       appendNativeDebugLine(`✕ ${message} — native shell required (web has no Rust core)`);

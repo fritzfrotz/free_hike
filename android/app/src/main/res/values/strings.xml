@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">FreeHike</string>
+    <string name="title_activity_main">FreeHike</string>
+    <string name="package_name">com.freehike.app</string>
+    <string name="custom_url_scheme">com.freehike.app</string>
+</resources>

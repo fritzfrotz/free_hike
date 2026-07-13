@@ -548,3 +548,135 @@ build -p pbf` — redb is pure Rust, memmap2/libc fine on aarch64-android).
 **Outcome:** CLOSED. Pivots: 0. The out-of-core substrate is in place; next
 chunk wires real PBF PrimitiveBlock decoding (Pass 1) through `PbfMmap` into
 the Coordinates index under the same budget.
+
+---
+
+## P3.C2 — PBF block decoder + Pass 1 node extraction (suspendable)
+
+**Status:** CLOSED
+**Date:** 2026-07-13
+**Goal:** decode `.osm.pbf` directly from `PbfMmap` and run Pass 1: block
+scanning, zlib blob decompression, DenseNodes delta-decoding, Web Mercator
+projection, batched redb insertion — suspendable at block boundaries for the
+Phase 2 FFI budget loop.
+
+**Files declared:** pbf/src/proto.rs (new), pbf/src/scan.rs (new),
+pbf/src/lib.rs (module wiring), pbf/Cargo.toml, workspace Cargo.toml + lock,
+LOOPLOG.
+
+**Dependencies (named in directive):** prost 0.14 + miniz_oxide 0.9. Design
+decision: prost message structs are HAND-DERIVED (proto.rs) rather than
+prost-build-generated — no protoc binary or build.rs in the aarch64 cross-
+compile path, for a wire format frozen since 2011. Declared subset only
+(BlobHeader/Blob/PrimitiiveBlock/PrimitiveGroup/Node/DenseNodes); prost skips
+undeclared tags (ways, relations, denseinfo, keys_vals) for free.
+
+**Design:**
+- `BlockScanner`: cursor over `[u32 BE len][BlobHeader][Blob]` framing. Every
+  length field bounds-checked against the map (checked adds; hostile lengths
+  → typed `corrupted PBF at byte N` errors, never a panic/OOB). Caps:
+  BlobHeader < 64KiB (spec MUST), blob + decompressed payload ≤ 16MiB (spec
+  SHOULD, enforced because the inflate buffer is Pass 1's largest transient
+  allocation and must fit in the ceiling headroom). zlib-bomb-proof:
+  `decompress_to_vec_zlib_with_limit(raw_size)` + exact-size verification.
+  raw + zlib_data encodings supported; lzma/bzip2/lz4/zstd rejected loudly;
+  unknown blob TYPES skipped per spec (Header/Data/Skipped enum).
+- Delta decoding: DenseNodes parallel arrays (id/lat/lon each sint64
+  delta-coded, first relative to 0); running accumulators; parallel-array
+  length mismatch and negative node IDs are hard errors. Plain (non-dense)
+  Node messages also handled (silent drop would surface as Pass-2 lookup
+  failures far from the cause). Full spec formula incl. granularity (default
+  100) and lat/lon offsets → degrees → `web_mercator` → redb.
+- `run_pass1_slice(pbf, db, resume_offset, should_yield)`: the suspend
+  contract. Yield checked at block boundaries after ≥1 block (engine's
+  min-progress rule); nodes buffered and flushed through
+  `insert_coords_batched` at DEFAULT_BATCH_SIZE, with a final flush BEFORE
+  the offset is reported — the checkpointed offset never runs ahead of
+  durable data; crash between commit and checkpoint is harmless (upserts).
+
+**Proof tests (7 new L1 + 1 ignored L2):** full-run over synthetic 2-block
+file (backward ID deltas, southern/western hemisphere, antimeridian,
+pole-clamp) with exact coordinate read-back; yield-every-block slicing (4
+slices, per-slice sums == distinct count → no re-scan duplication, offsets
+monotonic, last-block flush proven); plain nodes + granularity=1000 +
+offsets formula; unknown block type skipped; hostile framing table
+(HTML-as-PBF, truncated prefix/blob, zero header len) all rejected with
+nothing committed; unsupported encoding + raw_size lie rejected; mismatched
+dense arrays rejected; resume-past-EOF rejected / resume-at-EOF = finished.
+
+**L2 EVIDENCE (real data):** `pass1_real_innsbruck_extract` (ignored, like
+fetcher's live test) over the real 19.5MB innsbruck.osm.pbf fixture:
+**1,900,652 nodes / 265 blocks / 67 forced-yield slices in ~1.9s (release,
+host)**, per-slice sums == final coord_count (zero duplication), final
+offset == file length. `/usr/bin/time -l`: 75MB max RSS TOTAL for the test
+process — upper bound including the 19.5MB mmap'd clean pages (evictable;
+counted in RSS while resident) + test harness; heap-side budget holds.
+Precise on-device RSS measurement belongs to the Phase 3 torture chunk.
+
+**Verification:** fmt clean; clippy --workspace --all-targets -D warnings
+clean (2 iterations: EOF-slice min-progress assertion refined, double-
+comparison lint); workspace 56/56 green (2 ignored L2s); Android
+cross-compile clean (`cargo ndk -t arm64-v8a build -p pbf`).
+
+**Outcome:** CLOSED. Pivots: 0. Pass 1 is real end-to-end: mmap → framing →
+inflate → delta-decode → project → bounded-cache redb, suspendable at block
+boundaries under the Phase 2 contract. Next: wire into
+`compiler::engine::Phase::Pass1Nodes` (replace simulated `process_block`),
+then Pass 2 (ways).
+
+---
+
+## P3.C2b — Alignment audit vs /research architecture specs
+
+**Status:** CLOSED
+**Date:** 2026-07-13
+**Trigger:** operator instruction to verify the P3.C2 implementation against
+research/ (md master plan + Blueprint/Feasibility PDFs) — audit ran post-hoc
+since P3.C2 was already implemented when the instruction arrived.
+
+**Alignment matrix (Blueprint "Two-Pass Parsing" + md Phase 3):**
+- mmap read-only, clean pages invisible to Jetsam → PbfMmap, and the md's
+  "dirty RSS:anon < 50MB" phrasing CONFIRMS the ceiling is dirty-anon heap,
+  matching P3.C2's RSS-accounting rationale. ✓
+- `[u32 BE][BlobHeader][Blob]` framing, zlib payloads → BlockScanner. ✓
+  (Blueprint mentions lz4 as possible encoding; we reject non-raw/zlib with a
+  typed error — acceptable-loud posture, revisit only if a real mirror ships
+  lz4.)
+- ZigZag delta decoding of DenseNodes → extract_node_coords. ✓
+- NodeID → coords in redb, "coarse batched commits, never per node" (R2) →
+  insert_coords_batched @ 10k/commit (coarser than one PBF block). ✓
+- redb keyed by 64-bit Node ID storing **WebMercator(x,y)** per the md
+  diagram + P3.C1 directive. (Blueprint prose says "Longitude and Latitude";
+  md supersedes — projecting once in Pass 1 beats projecting per way-vertex
+  in Pass 2. Discrepancy noted, resolved in favor of md/directive.)
+- Parser library: Blueprint suggests osmpbf/rosm_pbf_reader ("such as");
+  operator directive specified prost + hand framing → hand-derived proto.rs,
+  no protoc in cross-compile path. Directive supersedes suggestion. ✓
+- Two-pass architecture, Pass 2 redb lookups, materialize-then-drop → shape
+  already anticipated (get_coord, scanner re-walk). Pass 2 is Phase 4 work. ✓
+- Desktop-first guiding rule → real innsbruck.osm.pbf integration test. ✓
+
+**Gap found & closed: StringTable semantic pre-filter** (Blueprint "Semantic
+Filtering"; md Phase 3 line). Implemented `RELEVANT_TAG_KEYS`
+(highway/sac_scale/waterway/natural/ele) + `stringtable_has_relevant_keys()`
+with exact-match (not substring) semantics + unit test (3 cases).
+**SPEC BUG flagged, not implemented:** the Blueprint states the filter lets
+Pass 1 skip non-relevant blocks entirely. Applied literally to node indexing
+this is a correctness bug: way vertices are overwhelmingly UNTAGGED dense
+nodes, so node blocks rarely contain highway/sac_scale in their StringTable —
+gating Pass 1 on it would skip ~all node blocks, hollow out the coordinate
+index, and break Pass-2 reconstruction. The filter is therefore implemented
+as a **Pass-2 gate** (way/relation blocks), with the rationale documented on
+the function and at the Pass-1 call site. Pass 1 achieves the Blueprint's
+intended CPU saving structurally: prost skips undeclared way/relation/tag
+fields at the wire level without deserializing them.
+
+**Still open from md Phase 3 (future chunks, unchanged):** RSS:anon
+instrumentation as a CI gate; Austria-scale (767MB) on-device index run; iOS
+increased-memory entitlements.
+
+**Verification:** fmt + clippy -D warnings clean; pbf 20/20 (+1 ignored L2);
+real-extract test re-run green post-change.
+
+**Outcome:** CLOSED. Implementation aligned with research/ specs; one spec
+correctness bug documented and routed to Pass 2 instead of blindly applied.

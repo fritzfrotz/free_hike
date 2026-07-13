@@ -7,4 +7,6 @@ license.workspace = true
 
 [dependencies]
 memmap2 = { workspace = true }
+miniz_oxide = { workspace = true }
+prost = { workspace = true }
 redb = { workspace = true }

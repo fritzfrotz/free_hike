@@ -21,6 +21,18 @@
 //! across thousands of rows while keeping the uncommitted working set small
 //! and the job resumable at chunk granularity (same yield philosophy as
 //! `compiler::engine`).
+//!
+//! Decoding lives in [`proto`] (hand-derived prost messages for the frozen
+//! OSM PBF wire format) and [`scan`] (block scanner + the suspendable Pass-1
+//! driver [`scan::run_pass1_slice`]).
+
+pub mod proto;
+pub mod scan;
+
+pub use scan::{
+    run_pass1_slice, stringtable_has_relevant_keys, BlockKind, BlockScanner, Pass1Slice,
+    RELEVANT_TAG_KEYS,
+};
 
 use std::fmt;
 use std::fs::File;

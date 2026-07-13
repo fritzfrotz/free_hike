@@ -10,6 +10,10 @@ license = "MIT"
 
 [workspace.dependencies]
 uniffi = "0.29"
+# Out-of-core storage pair (Phase 3+): zero-copy reads of multi-GB inputs and
+# a disk-backed index with a bounded cache, per the 50MB RAM ceiling.
+redb = "4"
+memmap2 = "0.9"
 compiler = { path = "compiler" }
 pbf = { path = "pbf" }
 terrain = { path = "terrain" }

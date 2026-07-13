@@ -487,3 +487,64 @@ live-network test); clippy 0 warnings after the manifest change.
 **Outcome:** CLOSED. Pivots: 0. Foundation verified flawless for Phase 3. Commit also
 carries the previously-uncommitted P2.C2 shell diff (queryJob) and P2.C3 fetcher crate
 per operator instruction to stage all changes.
+
+---
+
+## P3.C1 — Out-of-core indexing engine (mmap reader + bounded-cache redb index)
+
+**Status:** CLOSED
+**Date:** 2026-07-13
+**Goal:** Phase 3 opener in the `pbf` crate: zero-copy mmap PBF reader + redb
+coordinate index with a hard-capped page cache (50MB RAM ceiling), chunked batch
+insertion, unit-tested create/batch/read.
+
+**Files declared:** pbf/src/lib.rs (rewritten from Phase-0 stub), pbf/Cargo.toml,
+freehike-core/Cargo.toml (workspace deps), Cargo.lock, LOOPLOG.
+
+**Dependencies (named in the Phase 3 directive, satisfies §1.5 in-band):**
+memmap2 0.9 (zero-copy read-only maps) + redb 4.1 (pure-Rust embedded B-tree,
+`Builder::set_cache_size` is the ceiling enforcement point). redb 4.x API drift
+from 2.x handled: `begin_read` now lives on the `ReadableDatabase` trait.
+
+**Design:**
+- `PbfMmap`: read-only `memmap2::Mmap` wrapper. One documented `unsafe` block
+  (map creation) with the file-immutability invariant stated (fetcher validates
+  then never mutates). Empty files rejected pre-map. `slice(offset,len)` is
+  overflow- and bounds-checked for hostile BlobHeader length fields. Mapped pages
+  are clean/file-backed → OS-evictable cache, NOT heap; they don't count against
+  the ceiling (rationale in module docs).
+- RAM budget: `RAM_CEILING_BYTES=50MB` (project constant) with
+  `REDB_CACHE_BYTES=32MB` — deliberately less than the ceiling; the remainder is
+  headroom for decode buffers, in-flight batch, FFI/shell overhead. Both
+  invariants enforced at COMPILE TIME via `const _: () = assert!(...)` (a budget
+  violation is now a build failure, stronger than the unit test it replaced
+  after clippy's assertions-on-constants lint flagged the runtime version).
+- Table: `TableDefinition<u64,(f64,f64)>` named "Coordinates" — node ID →
+  Web Mercator meters. `web_mercator(lon,lat)` helper clamps lat to ±85.0511°
+  so polar garbage can never inject ±inf into the index.
+- `insert_coords_batched(&Database, iter, batch_size)`: one write txn (one
+  fsync) per chunk, default 10,000 rows. `&Database` is Sync; redb serializes
+  writers → thread-safe by construction, callers interleave at chunk
+  boundaries. Committed chunks survive an error; only the in-flight chunk rolls
+  back (checkpoint-style resume semantics). Trailing empty txn aborts (no
+  phantom table creation on empty input).
+
+**Proof tests (11):** mmap zero-copy equality vs file bytes, bounds-checked
+slice (past-EOF / offset-overflow / hostile-length → None), empty-file
+rejected, missing-file → Io; 25k-node batch insert at default chunk (2 full +
+1 short commit) with spot-reads across chunk boundaries + absent-key None;
+short-final-chunk and exact-multiple chunking; empty iterator no-op (no table
+side effect); zero batch_size rejected; reopen persistence; two-thread
+concurrent batched inserts (disjoint ranges, 20k rows, all readable);
+Web Mercator known values (origin, antimeridian x=20037508.34, Innsbruck band,
+pole clamp finite).
+
+**Verification:** `cargo test -p pbf` 11/11 → workspace 48/48 green; fmt clean;
+`clippy --workspace --all-targets -D warnings` clean (one iteration: const
+assertions replaced the constant-value test); `cargo check --workspace
+--all-targets` clean; **Android cross-compile clean** (`cargo ndk -t arm64-v8a
+build -p pbf` — redb is pure Rust, memmap2/libc fine on aarch64-android).
+
+**Outcome:** CLOSED. Pivots: 0. The out-of-core substrate is in place; next
+chunk wires real PBF PrimitiveBlock decoding (Pass 1) through `PbfMmap` into
+the Coordinates index under the same budget.

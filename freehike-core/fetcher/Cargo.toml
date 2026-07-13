@@ -1,0 +1,20 @@
+[package]
+name = "fetcher"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# rustls-tls ONLY — never native-tls. Pure-Rust TLS cross-compiles cleanly to
+# aarch64-linux-android / aarch64-apple-ios without an OpenSSL toolchain, which
+# is the whole point of this dependency choice (per the Phase 2 directive).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# The library only does async fs/io — it never owns a runtime; the caller
+# (FFI layer or tests) provides one.
+tokio = { version = "1", features = ["fs", "io-util"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+# Runtime + #[tokio::test] macro for the test harness only.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

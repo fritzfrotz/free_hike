@@ -320,7 +320,116 @@ plugins deferred (logged) — not needed for this chunk's proof.
 Downstream break from P2.C0 fully resolved: all three shells consume Surface v1; the
 budget-yield loop and Yielded-state handling verified end-to-end on the emulator.
 Deferred: iOS full build (needs Xcode machine), query_checkpoint plugin exposure,
-scroll-reset UI nit during map init. Uncommitted (P2.C1 diff) — awaiting operator.
+scroll-reset UI nit during map init. Committed as `7de3bb7` on operator instruction.
+
+---
+
+## P2.C2 — Kill-resume torture test (process-death invariant)
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-13
+**Goal:** prove the design invariant: SIGKILL mid-job loses nothing. Sequence: start
+multi-slice job → `am force-stop` mid-run → relaunch → queryJob via JS bridge shows the
+durable checkpoint → startJob same jobId resumes from it → Finished summary shows 62
+blocks / 253,952 bytes with run-2 progress events < 62 (no duplication).
+
+**Files declared:** MapCompilerPlugin.kt/.swift (queryJob method + logcat evidence line),
+src/plugins/MapCompiler.ts (queryJob), src/ui/App.tsx (handler queries before start),
+LOOPLOG. No FFI change (query_checkpoint already in Surface v1 → no .so rebuild).
+
+**Proof:** logcat chain across two process lifetimes + UI panel dump.
+
+**Attempts:**
+- A1: queryJob exposed on Kotlin + Swift (+ TS interface + App.tsx cold-start query
+  before startJob). tsc/eslint/swiftc/gradle all clean; .so unchanged (query_checkpoint
+  already in Surface v1).
+- A2-A4: repeated UI-tap attempts to trigger + kill mid-job FAILED. Two compounding
+  problems diagnosed: (a) the map-mount re-render resets WebView scroll to top (the nit
+  flagged in P2.C1), so coordinate taps landed on empty space; (b) the simulated job at
+  BLOCK_WORK=2ms finishes in <0.5s — faster than a shell-timed `am force-stop` can land,
+  so every kill hit an already-Finished-and-purged job ("No such file" = correct purge).
+- A5 PIVOT (tap targeting → CDP): abandoned coordinate taps. Enabled via the debug
+  build's WebView devtools socket (`webview_devtools_remote_<pid>`), `adb forward`, and a
+  hand-rolled CDP websocket driver (scratchpad/cdp.py) to call
+  `Capacitor.Plugins.MapCompiler.*` directly in the page context — deterministic, no taps.
+- A6 PIVOT (job too fast → instrumentation): bumped BLOCK_WORK 2ms→200ms (≈12s job) to
+  open a wide, reliable kill window. Rebuilt .so. **Reverted to 2ms + rebuilt + retested
+  after the proof; engine.rs diff vs commit is empty.**
+
+**EVIDENCE (deterministic, two process lifetimes):**
+- RUN 1: pre-start `queryJob` → {found:false}. Fired startJob(jobId=torture-1). After 2s,
+  `am force-stop` (PID confirmed DEAD). Last slice logged:
+  `slice 4 yielded: phase=PASS1_NODES block=8`. **Surviving on-disk checkpoint**
+  (`run-as cat files/map_jobs/torture-1.checkpoint`): version=1 / pass1_nodes /
+  next_block=8 / pbf_byte_offset=65536 / bytes_written=32768 — byte-exact match to the
+  last slice, i.e. the fsync+atomic-rename write survived SIGKILL.
+- RUN 2 (brand-new PID 5438): `queryJob` via JS bridge →
+  {found:true, phase:PASS1_NODES, nextBlock:8, bytesWritten:32768}. Resume startJob(same
+  jobId) → status:finished, blocksTotal:62, bytesWritten:253952 (identical to a clean
+  run), **progressEvents:54**, first="pass1: indexing nodes (9/62)", last="finalizing
+  archive (62/62)". **54 (run 2) + 8 (run 1 pre-kill) = 62, zero duplication; resume began
+  at block 9, never re-ran 0-7.**
+
+**Outcome:** CLOSED. Pivots: 2 (tap→CDP, speed→instrumentation). Invariant PROVEN on
+device: SIGKILL mid-compile loses nothing; resume is exact and non-duplicating.
+Instrumentation reverted. Emulator down. Uncommitted (P2.C2 diff): 4 shell/UI files +
+this log. New UI nit corroborated (scroll-reset on map mount) — worth fixing, tracked.
+
+---
+
+## P2.C3 — Hostile-mirror native fetcher (Phase 2 scaffolding)
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-13
+**Goal:** new `fetcher` crate: reqwest+rustls resumable Range downloads +
+magic-byte validation, encoding the Geofabrik-HTML-redirect lesson into Rust. Clean
+workspace compile + L1 tests. Wiring into the compile pipeline is a later chunk.
+
+**Files declared:** freehike-core/fetcher/Cargo.toml (new), fetcher/src/lib.rs (new),
+freehike-core/Cargo.toml (add member + workspace dep), LOOPLOG.
+
+**Dependencies (directive-approved, satisfies §1.5 in-band):** reqwest (default-features
+off, features: rustls-tls, stream) — NO native-tls, per directive's OpenSSL-avoidance
+requirement. Plus tokio (rt + macros for the async client), futures-util (stream). All
+pure-Rust TLS → clean aarch64-android/ios cross-compile.
+
+**Proof tests (named up front, no network in L1):**
+- magic-byte unit tests: `pbf_osmheader_accepted`, `pbf_html_redirect_rejected`,
+  `tiff_little_endian_accepted`, `tiff_big_endian_accepted`, `tiff_garbage_rejected`,
+  `empty_payload_rejected`, `truncated_header_rejected`.
+- Range/resume logic tested via a `ResumePlan` pure helper (existing-bytes → Range header
+  + whether to append): `fresh_download_no_range`, `partial_resumes_from_offset`,
+  `complete_file_skips_download`.
+- Full network download is an integration test gated behind `--ignored` (no live
+  Geofabrik hit in CI); L1 covers the validation + resume math deterministically.
+
+**Design:** `Validator` enum (OsmPbf | Tiff) with `validate(&[u8]) -> Result<(),FetchError>`
+reading only the leading bytes. PBF check: parse the 4-byte BE BlobHeader length, bounds-
+check it, then confirm the HeaderBlock blobtype string is "OSMHeader" (the exact anti-
+HTML-redirect assertion). TIFF: first 4 bytes ∈ {II*\0, MM\0*}. Download flow: stat local
+partial → HTTP Range: bytes=N- → validate first bytes of the assembled head before
+trusting → stream to disk with append. FetchError is a plain enum (UniFFI-ready later).
+
+**Attempts:**
+- A1: grounded validators on the REAL fixtures (xxd): innsbruck.osm.pbf head =
+  `00 00 00 0d 0a 09 "OSMHeader"`; innsbruck_dem.tif head = `49 49 2a 00` (II*\0). PBF
+  test vector is byte-for-byte from the fixture.
+- A2: fetcher/Cargo.toml (reqwest default-features=off + rustls-tls,stream; tokio;
+  futures-util) + workspace member/dep. `cargo build -p fetcher` clean first try.
+- A3: `cargo test -p fetcher` → 13/13 unit tests pass, live_download correctly `ignored`.
+- A4: green-lock ×2 (workspace tests + clippy -D warnings + fmt) — all clean.
+- A5 (cross-compile, the point of rustls): `cargo ndk -t arm64-v8a build -p fetcher`
+  → CLEAN (libfetcher.rlib built). `cargo tree` confirms **zero openssl / native-tls**;
+  pure rustls 0.23 + ring 0.17. iOS (`aarch64-apple-ios`) FAILED — but the error is
+  `ring` build script: `xcrun: SDK "iphoneos" cannot be located`, i.e. the SAME
+  no-full-Xcode env limitation blocking the rest of the iOS story, NOT an OpenSSL/rustls
+  problem. Resolves on any Xcode machine; the dependency choice is validated by the clean
+  Android build + openssl-free tree.
+
+**Outcome:** CLOSED. Pivots: 0. Fetcher scaffolded, compiles clean (host + Android),
+13 L1 tests green, hostile-mirror + resume invariants covered deterministically. Not yet
+wired into the compile pipeline (later chunk). iOS cross-build deferred to Xcode machine.
+Uncommitted (P2.C3): new fetcher crate + workspace manifest + LOOPLOG.
 
 **Attempts:**
 - A1: `src/plugins/MapCompiler.ts` + App.tsx listener effect / debug button / footer panel
@@ -340,3 +449,41 @@ The literal exit criterion — "tap in WebView → Rust round-trip → progress 
 JS" on a physical device — remains blocked on two known items: Android `.so` build
 (NDK/cargo-ndk, deferred by operator to next session) and an Xcode machine for iOS. The full
 path is wired and each segment is independently verified.
+
+---
+
+## P2.C4 — Phase 2 hygiene sweep (pre-Phase-3 foundation check)
+
+**Status:** CLOSED
+**Date:** 2026-07-13
+**Goal:** strict workspace hygiene before Phase 3 (out-of-core indexing): fmt, clippy,
+debug-instrumentation audit, dependency audit, clean `cargo check`, commit.
+
+**Findings & actions:**
+- `cargo fmt --all`: zero diffs — tree already normalized.
+- `cargo clippy --workspace --all-targets` (fresh, after `cargo clean -p` of all six
+  members, and again with `-D warnings`): **zero warnings**. Nothing to fix.
+- Debug-instrumentation audit of engine.rs + fetcher: the P2.C2 torture-test bump
+  (BLOCK_WORK 2ms→200ms) was already reverted in-session (see P2.C2 A6); engine.rs
+  carries only the canonical 2ms simulated-work constant, which is the documented
+  simulation model, not instrumentation. fetcher has no sleeps/mocks; its live network
+  test stays `#[ignore]`d. No mock budgets anywhere (grep-verified across all crates
+  and the three shells).
+- Dependency audit: fetcher's `[dev-dependencies]` tokio was dangling (duplicated the
+  main dep + an unused `test-util` feature). Split correctly: lib deps = `fs`,`io-util`
+  only (the lib never owns a runtime); dev deps = `rt-multi-thread`,`macros` for
+  `#[tokio::test]`. All other manifests clean; workspace.dependencies entries for
+  pbf/terrain/tiles/fetcher retained as inert version pins for Phases 3-6.
+- Bonus catch: root `.gitignore` had two entries fused into one line
+  (`android/app/build/offline_sandbox/gdal/`), so the vendored 15MB
+  `offline_sandbox/gdal/` checkout was NOT ignored despite commit `aad9f0d`'s intent.
+  Split into `android/app/build/` + `offline_sandbox/gdal/`; `git check-ignore` now
+  confirms both.
+
+**Verification:** `cargo check --workspace --all-targets` clean;
+`cargo test --workspace` 37/37 pass (17 compiler + 13 fetcher + 7 ffi, 1 ignored
+live-network test); clippy 0 warnings after the manifest change.
+
+**Outcome:** CLOSED. Pivots: 0. Foundation verified flawless for Phase 3. Commit also
+carries the previously-uncommitted P2.C2 shell diff (queryJob) and P2.C3 fetcher crate
+per operator instruction to stage all changes.

@@ -384,8 +384,19 @@ export default function App() {
   // the terminal Finished envelope resolves.
   const handleDebugNativeCompile = useCallback(async () => {
     const bbox = '11.1,47.1,11.6,47.45';
-    appendNativeDebugLine(`→ startJob(${bbox}, budgetMs=25)`);
     try {
+      // Cold-start resume detection: if a durable checkpoint survives (e.g.
+      // the OS killed the app mid-compile), surface it before resuming.
+      const existing = await MapCompiler.queryJob({ jobId: 'debug-compile' });
+      if (existing.found) {
+        appendNativeDebugLine(
+          `↻ checkpoint found: ${existing.phase} block ${existing.nextBlock} (${existing.bytesWritten} bytes done) — resuming`,
+        );
+      } else {
+        appendNativeDebugLine('∅ no checkpoint — fresh start');
+      }
+
+      appendNativeDebugLine(`→ startJob(${bbox}, budgetMs=25)`);
       const result = await MapCompiler.startJob({ bbox, jobId: 'debug-compile', budgetMs: 25 });
       if (result.status === 'finished') {
         appendNativeDebugLine(

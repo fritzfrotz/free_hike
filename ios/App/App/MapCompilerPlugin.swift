@@ -17,6 +17,7 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "startJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "cancelJob", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "queryJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getEngineVersion", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "emitTestProgress", returnType: CAPPluginReturnPromise),
     ]
@@ -131,6 +132,32 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func cancelJob(_ call: CAPPluginCall) {
         setCancel(true)
         call.resolve(["requested": true])
+    }
+
+    /// Cold-start resume detection: returns the engine's durable checkpoint
+    /// for a job if one survives on disk (e.g. after iOS killed the process).
+    @objc func queryJob(_ call: CAPPluginCall) {
+        guard let jobId = call.getString("jobId"), !jobId.isEmpty else {
+            call.reject("Missing required parameter: jobId")
+            return
+        }
+        let jobsDir = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("map_jobs").path
+
+        ffiQueue.async {
+            guard let cp = queryCheckpoint(jobId: jobId, outputDir: jobsDir) else {
+                call.resolve(["found": false])
+                return
+            }
+            call.resolve([
+                "found": true,
+                "phase": String(describing: cp.phase),
+                "nextBlock": Int(cp.nextBlock),
+                "pbfByteOffset": Int(cp.pbfByteOffset),
+                "bytesWritten": Int(cp.bytesWritten),
+            ])
+        }
     }
 
     /// Debug: proves the Rust -> Swift -> WebView progress event path.

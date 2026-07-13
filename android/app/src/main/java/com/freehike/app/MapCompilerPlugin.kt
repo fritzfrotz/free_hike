@@ -13,6 +13,7 @@ import uniffi.freehike.compileChunk
 import uniffi.freehike.emitTestProgress
 import uniffi.freehike.engineVersion
 import uniffi.freehike.purgeJob
+import uniffi.freehike.queryCheckpoint
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -166,6 +167,46 @@ class MapCompilerPlugin : Plugin() {
     fun cancelJob(call: PluginCall) {
         cancelRequested.set(true)
         call.resolve(JSObject().put("requested", true))
+    }
+
+    /**
+     * Cold-start resume detection: returns the engine's durable checkpoint
+     * for a job if one survives on disk (e.g. after the OS killed the
+     * process mid-compilation).
+     */
+    @PluginMethod
+    fun queryJob(call: PluginCall) {
+        val jobId = call.getString("jobId")
+        if (jobId.isNullOrBlank()) {
+            call.reject("Missing required parameter: jobId")
+            return
+        }
+        val jobsDir = context.filesDir.absolutePath + "/map_jobs"
+        executor.execute {
+            try {
+                val cp = queryCheckpoint(jobId, jobsDir)
+                if (cp == null) {
+                    Log.i(TAG, "checkpoint query for $jobId: none (fresh start)")
+                    call.resolve(JSObject().put("found", false))
+                } else {
+                    Log.i(
+                        TAG,
+                        "checkpoint query for $jobId: FOUND phase=${cp.phase} block=${cp.nextBlock} " +
+                            "pbfOffset=${cp.pbfByteOffset} bytesWritten=${cp.bytesWritten}"
+                    )
+                    call.resolve(
+                        JSObject()
+                            .put("found", true)
+                            .put("phase", cp.phase.name)
+                            .put("nextBlock", cp.nextBlock.toInt())
+                            .put("pbfByteOffset", cp.pbfByteOffset.toLong())
+                            .put("bytesWritten", cp.bytesWritten.toLong())
+                    )
+                }
+            } catch (t: Throwable) {
+                call.reject("FFI queryCheckpoint failed: ${t.message}", t as? Exception)
+            }
+        }
     }
 
     /** Debug: proves the Rust -> Kotlin -> WebView progress event path. */

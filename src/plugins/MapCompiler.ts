@@ -72,6 +72,19 @@ export interface MapCompilerPlugin {
   /** Requests cancellation of the active job (honored between slices). */
   cancelJob(): Promise<{ requested: boolean }>;
 
+  /**
+   * Cold-start resume detection: returns the engine's durable checkpoint for
+   * a job if one survives on disk (e.g. after the OS killed the process
+   * mid-compilation). Pair with startJob({ jobId }) to resume it.
+   */
+  queryJob(options: { jobId: string }): Promise<{
+    found: boolean;
+    phase?: string;
+    nextBlock?: number;
+    pbfByteOffset?: number;
+    bytesWritten?: number;
+  }>;
+
   /** Smoke test: proves the Rust core is linked and callable. */
   getEngineVersion(): Promise<{ version: string }>;
 

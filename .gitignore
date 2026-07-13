@@ -60,5 +60,8 @@ android/app/src/main/jniLibs/
 node_modules/
 .expo/
 ios/Pods/
-android/app/build/offline_sandbox/gdal/
+android/app/build/
+
+# Nested sandbox repositories (vendored checkouts, never part of this repo)
+offline_sandbox/gdal/
 offline_sandbox/massif/

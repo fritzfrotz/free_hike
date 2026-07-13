@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["compiler", "pbf", "terrain", "tiles", "ffi"]
+members = ["compiler", "pbf", "terrain", "tiles", "ffi", "fetcher"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ uniffi = "0.29"
 compiler = { path = "compiler" }
 pbf = { path = "pbf" }
 terrain = { path = "terrain" }
+fetcher = { path = "fetcher" }
 tiles = { path = "tiles" }
 
 # Release profile tuned for mobile distribution: maximum optimization with full

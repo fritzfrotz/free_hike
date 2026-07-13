@@ -14,11 +14,13 @@
 //!   one block even if the budget is already exhausted, so a runner passing
 //!   a too-small budget degrades to slow progress instead of livelocking.
 //!
-//! **Pass1Nodes is REAL** (P3.C3): it drives `pbf::run_pass1_slice` over the
-//! mmap'd input, resuming from the checkpoint's `pbf_byte_offset` and writing
-//! the node index into the per-job redb database (`index_db_path`). The
-//! remaining phases (Pass2Ways / Terrain / Finalize) are still simulated
-//! block loops — placeholders for Phases 4-6 behind this same contract.
+//! **Pass1Nodes and Pass2Ways are REAL** (P3.C3/C4): they drive
+//! `pbf::run_pass1_slice` / `pbf::run_pass2_slice` over the mmap'd input,
+//! each resuming from its own durable byte offset (`pbf_byte_offset` /
+//! `pass2_byte_offset`) and writing into the per-job redb index
+//! (`index_db_path`: Coordinates + Ways tables). The remaining phases
+//! (Terrain / Finalize) are still simulated block loops — placeholders for
+//! Phases 5-6 behind this same contract.
 
 use std::fmt;
 use std::fs;
@@ -94,18 +96,22 @@ pub struct JobSpec {
     pub output_dir: String,
 }
 
-/// Durable resume state (checkpoint format v2).
+/// Durable resume state (checkpoint format v3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub job_id: String,
     pub phase: Phase,
-    /// Blocks completed *within* `phase` (Pass 1: PBF blocks scanned;
+    /// Blocks completed *within* `phase` (real passes: PBF blocks scanned;
     /// simulated phases: block index).
     pub next_block: u32,
     /// Absolute byte offset into the source PBF — the exact mmap re-entry
     /// point for the real Pass 1 (`pbf::run_pass1_slice` resume contract).
     pub pbf_byte_offset: u64,
-    /// Total logical bytes written (node-index bytes + simulated output).
+    /// Pass 2's own cursor over the same file (it re-walks the framing
+    /// through the way-bearing view, starting from 0) — independent of
+    /// Pass 1's offset so each pass resumes exactly where IT stopped.
+    pub pass2_byte_offset: u64,
+    /// Total logical bytes written (node/way-index bytes + simulated output).
     pub bytes_written: u64,
     /// Blocks completed across ALL phases — feeds `RunSummary::blocks_total`
     /// (per-phase counters reset at phase boundaries; this one never does).
@@ -136,9 +142,8 @@ pub enum SliceOutcome {
 // Phase plan
 // ---------------------------------------------------------------------------
 
-// Simulated block counts for the not-yet-real phases (Phases 4-6 replace
-// these loops with the way/terrain/archive pipelines).
-const PASS2_BLOCKS: u32 = 24;
+// Simulated block counts for the not-yet-real phases (Phases 5-6 replace
+// these loops with the terrain/archive pipelines).
 const TERRAIN_BLOCKS: u32 = 12;
 const FINALIZE_BLOCKS: u32 = 2;
 /// Simulated cost of one block; stands in for real CPU work.
@@ -148,6 +153,10 @@ const BLOCK_OUTPUT_BYTES: u64 = 4_096;
 /// Logical bytes accounted per indexed node (u64 key + 2×f64 coordinate),
 /// so `bytes_written` stays meaningful and deterministic for the real Pass 1.
 const NODE_INDEX_BYTES: u64 = 24;
+/// Logical bytes accounted per indexed way (key + amortized ref bytes) —
+/// deterministic accounting for the real Pass 2, same role as
+/// [`NODE_INDEX_BYTES`].
+const WAY_INDEX_BYTES: u64 = 32;
 
 /// Phase order for a job.
 fn phase_plan(job: &JobSpec) -> Vec<Phase> {
@@ -159,11 +168,10 @@ fn phase_plan(job: &JobSpec) -> Vec<Phase> {
     plan
 }
 
-/// Simulated block count for a phase (Pass 1 is real and dynamic → 0).
+/// Simulated block count for a phase (Passes 1/2 are real and dynamic → 0).
 fn sim_blocks(phase: Phase) -> u32 {
     match phase {
-        Phase::Pass1Nodes => 0,
-        Phase::Pass2Ways => PASS2_BLOCKS,
+        Phase::Pass1Nodes | Phase::Pass2Ways => 0,
         Phase::Terrain => TERRAIN_BLOCKS,
         Phase::Finalize => FINALIZE_BLOCKS,
     }
@@ -187,7 +195,10 @@ pub fn index_db_path(output_dir: &str, job_id: &str) -> PathBuf {
 // Durable checkpoint persistence (std-only; becomes a redb table in Phase 7)
 // ---------------------------------------------------------------------------
 
-const CHECKPOINT_VERSION: u32 = 2;
+// v3: added pass2_byte_offset (P3.C4). Any format change bumps the version —
+// that discipline is what keeps kill-resume honest; older versions are
+// rejected as corrupt rather than guessed at (no shipped users yet).
+const CHECKPOINT_VERSION: u32 = 3;
 
 fn checkpoint_path(output_dir: &str, job_id: &str) -> PathBuf {
     Path::new(output_dir).join(format!("{job_id}.checkpoint"))
@@ -200,8 +211,14 @@ fn save_checkpoint(output_dir: &str, cp: &Checkpoint) -> Result<(), String> {
     let tmp_path = final_path.with_extension("checkpoint.tmp");
 
     let body = format!(
-        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\nbytes_written={}\nblocks_done={}\n",
-        cp.job_id, cp.phase, cp.next_block, cp.pbf_byte_offset, cp.bytes_written, cp.blocks_done,
+        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\npass2_byte_offset={}\nbytes_written={}\nblocks_done={}\n",
+        cp.job_id,
+        cp.phase,
+        cp.next_block,
+        cp.pbf_byte_offset,
+        cp.pass2_byte_offset,
+        cp.bytes_written,
+        cp.blocks_done,
     );
 
     let mut f = fs::File::create(&tmp_path)
@@ -232,6 +249,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
     let mut phase = None;
     let mut next_block = None;
     let mut pbf_byte_offset = None;
+    let mut pass2_byte_offset = None;
     let mut bytes_written = None;
     let mut blocks_done = None;
 
@@ -245,6 +263,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             "phase" => phase = Phase::from_str(v),
             "next_block" => next_block = v.parse::<u32>().ok(),
             "pbf_byte_offset" => pbf_byte_offset = v.parse::<u64>().ok(),
+            "pass2_byte_offset" => pass2_byte_offset = v.parse::<u64>().ok(),
             "bytes_written" => bytes_written = v.parse::<u64>().ok(),
             "blocks_done" => blocks_done = v.parse::<u32>().ok(),
             other => return Err(format!("corrupted checkpoint: unknown key '{other}'")),
@@ -257,6 +276,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
         phase,
         next_block,
         pbf_byte_offset,
+        pass2_byte_offset,
         bytes_written,
         blocks_done,
     ) {
@@ -266,6 +286,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             Some(phase),
             Some(nb),
             Some(po),
+            Some(p2o),
             Some(bw),
             Some(bd),
         ) => {
@@ -279,6 +300,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
                 phase,
                 next_block: nb,
                 pbf_byte_offset: po,
+                pass2_byte_offset: p2o,
                 bytes_written: bw,
                 blocks_done: bd,
             }))
@@ -339,6 +361,7 @@ pub fn run_slice(
             phase: plan[0],
             next_block: 0,
             pbf_byte_offset: 0,
+            pass2_byte_offset: 0,
             bytes_written: 0,
             blocks_done: 0,
         },
@@ -407,7 +430,59 @@ pub fn run_slice(
                 }
                 cp.next_block = 0; // phase complete; next phase starts fresh
             }
-            // ---- Simulated phases (Phases 4-6 placeholders) --------------
+            // ---- REAL Pass 2: re-walk framing → filter → ways → redb -----
+            Phase::Pass2Ways => {
+                let pbf = match pbf::PbfMmap::open(Path::new(&job.pbf_path)) {
+                    Ok(m) => m,
+                    Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
+                };
+                let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
+                    Ok(db) => db,
+                    Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
+                };
+                let resume_offset = match usize::try_from(cp.pass2_byte_offset) {
+                    Ok(o) => o,
+                    Err(_) => {
+                        return SliceOutcome::Failed(format!(
+                            "corrupted checkpoint: pass2_byte_offset {} exceeds address space",
+                            cp.pass2_byte_offset
+                        ));
+                    }
+                };
+
+                let sub = match pbf::run_pass2_slice(&pbf, &db, resume_offset, &mut || {
+                    started.elapsed() >= budget
+                }) {
+                    Ok(s) => s,
+                    Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
+                };
+
+                cp.pass2_byte_offset = sub.next_offset as u64;
+                cp.next_block += sub.blocks_scanned;
+                cp.blocks_done += sub.blocks_scanned;
+                cp.bytes_written += sub.ways_indexed * WAY_INDEX_BYTES;
+                slice_blocks += sub.blocks_scanned;
+
+                let frac = if pbf.is_empty() {
+                    1.0
+                } else {
+                    sub.next_offset as f32 / pbf.len() as f32
+                };
+                let pct = ((idx as f32 + frac) / n_phases) * 100.0;
+                on_progress(
+                    pct,
+                    format!("{} ({} blocks scanned)", phase.label(), cp.next_block),
+                );
+
+                if !sub.finished {
+                    return match save_checkpoint(&job.output_dir, &cp) {
+                        Ok(()) => SliceOutcome::Yielded(cp),
+                        Err(e) => SliceOutcome::Failed(e),
+                    };
+                }
+                cp.next_block = 0;
+            }
+            // ---- Simulated phases (Phases 5-6 placeholders) --------------
             _ => {
                 let blocks = sim_blocks(phase);
                 while cp.next_block < blocks {
@@ -450,27 +525,48 @@ pub fn run_slice(
 mod tests {
     use super::*;
 
-    // Two dense-node groups → fixture layout: 1 OSMHeader + 2 OSMData blocks.
+    use pbf::fixtures::FixtureWay;
+
+    // Fixture layout: 1 OSMHeader + 2 dense-node OSMData + 2 way OSMData = 5
+    // blocks, walked once by each real pass.
     const G1: &[(i64, i64, i64)] = &[
         (1_000, 472_700_000, 113_900_000),
         (1_005, 472_700_100, 113_900_050),
         (900, -338_650_000, -703_450_000),
     ];
     const G2: &[(i64, i64, i64)] = &[(2_000_000_000, 0, 0), (2_000_000_007, 100, 100)];
-    const FIXTURE_PASS1_BLOCKS: u32 = 3;
+    /// Relevant block: way 500 kept (highway); 501 tag-filtered (building).
+    const W1: &[FixtureWay<'static>] = &[
+        (500, b"highway", &[1_000, 1_005, 900]),
+        (501, b"building", &[1_000, 900]),
+    ];
+    /// Irrelevant block: rejected whole by the StringTable pre-filter.
+    const W2: &[FixtureWay<'static>] = &[(600, b"created_by", &[1_000, 900])];
+    const FIXTURE_BLOCKS: u32 = 5; // scanned once per real pass
     const FIXTURE_NODES: u64 = 5;
+    const FIXTURE_WAYS: u64 = 1;
 
     fn sim_total(dem: bool) -> u32 {
-        PASS2_BLOCKS + if dem { TERRAIN_BLOCKS } else { 0 } + FINALIZE_BLOCKS
+        (if dem { TERRAIN_BLOCKS } else { 0 }) + FINALIZE_BLOCKS
+    }
+
+    fn expected_blocks(dem: bool) -> u32 {
+        FIXTURE_BLOCKS * 2 + sim_total(dem)
     }
 
     fn expected_bytes(dem: bool) -> u64 {
-        FIXTURE_NODES * NODE_INDEX_BYTES + u64::from(sim_total(dem)) * BLOCK_OUTPUT_BYTES
+        FIXTURE_NODES * NODE_INDEX_BYTES
+            + FIXTURE_WAYS * WAY_INDEX_BYTES
+            + u64::from(sim_total(dem)) * BLOCK_OUTPUT_BYTES
     }
 
     fn test_job(dir: &Path, dem: bool) -> JobSpec {
         let pbf_path = dir.join("fixture.osm.pbf");
-        fs::write(&pbf_path, pbf::fixtures::synthetic_pbf(&[G1, G2])).unwrap();
+        fs::write(
+            &pbf_path,
+            pbf::fixtures::synthetic_pbf_with_ways(&[G1, G2], &[W1, W2]),
+        )
+        .unwrap();
         JobSpec {
             job_id: "job-alps-1".into(),
             bbox: BBox::parse("11.15,47.05,11.65,47.45").unwrap(),
@@ -501,13 +597,13 @@ mod tests {
         let out = run_slice(&job, BIG, &mut |_, _| ticks += 1);
         match out {
             SliceOutcome::Finished(s) => {
-                assert_eq!(s.blocks_total, FIXTURE_PASS1_BLOCKS + sim_total(true));
+                assert_eq!(s.blocks_total, expected_blocks(true));
                 assert_eq!(s.bytes_written, expected_bytes(true));
             }
             other => panic!("expected Finished, got {other:?}"),
         }
-        // 1 pass1 event (whole file in one sub-slice) + 1 per simulated block.
-        assert_eq!(ticks, 1 + sim_total(true));
+        // 1 event per real-pass sub-slice (whole file each) + 1 per sim block.
+        assert_eq!(ticks, 2 + sim_total(true));
         assert!(
             load_checkpoint(&job.output_dir, &job.job_id)
                 .unwrap()
@@ -561,6 +657,49 @@ mod tests {
             fs::metadata(&job.pbf_path).unwrap().len(),
             "pass1 must have consumed the whole file"
         );
+    }
+
+    #[test]
+    fn pass2_indexes_ways_and_geometry_assembles_mid_job() {
+        let dir = tmp_dir("pass2");
+        let job = test_job(&dir, true);
+        // Zero-budget slices: drive block-by-block until Pass 2 completes
+        // (checkpoint phase advances past Pass2Ways).
+        let cp = loop {
+            match run_slice(&job, Duration::ZERO, &mut |_, _| {}) {
+                SliceOutcome::Yielded(cp) => {
+                    if !matches!(cp.phase, Phase::Pass1Nodes | Phase::Pass2Ways) {
+                        break cp;
+                    }
+                }
+                other => panic!("job should still be yielding, got {other:?}"),
+            }
+        };
+        assert_eq!(cp.phase, Phase::Terrain);
+        assert_eq!(
+            cp.pass2_byte_offset,
+            fs::metadata(&job.pbf_path).unwrap().len(),
+            "pass2 must have consumed the whole file through its own cursor"
+        );
+
+        // The join across both tables, mid-job, from durable state alone.
+        let db = pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)).unwrap();
+        assert_eq!(
+            pbf::get_way_refs(&db, 500).unwrap(),
+            Some(vec![1_000, 1_005, 900])
+        );
+        assert_eq!(pbf::get_way_refs(&db, 501).unwrap(), None, "tag-filtered");
+        assert_eq!(pbf::get_way_refs(&db, 600).unwrap(), None, "prefiltered");
+
+        let line = pbf::assemble_way_geometry(&db, 500).unwrap().unwrap();
+        let want: Vec<(f64, f64)> = [1_000i64, 1_005, 900]
+            .iter()
+            .map(|id| {
+                let &(_, lat, lon) = G1.iter().find(|(nid, _, _)| nid == id).unwrap();
+                pbf::web_mercator(1e-9 * (100 * lon) as f64, 1e-9 * (100 * lat) as f64)
+            })
+            .collect();
+        assert_eq!(line, want, "geometry join must survive the engine path");
     }
 
     #[test]
@@ -722,7 +861,7 @@ mod tests {
         });
         match out {
             SliceOutcome::Finished(s) => {
-                assert_eq!(s.blocks_total, FIXTURE_PASS1_BLOCKS + sim_total(false));
+                assert_eq!(s.blocks_total, expected_blocks(false));
             }
             other => panic!("expected Finished, got {other:?}"),
         }
@@ -779,15 +918,20 @@ mod tests {
             assert!(slices < 10_000, "runaway");
         };
 
-        // 265 real PBF blocks + the simulated placeholder phases.
-        assert_eq!(summary.blocks_total, 265 + sim_total(true));
-        // 1,900,652 nodes × 24 logical bytes + simulated output bytes.
-        assert_eq!(
-            summary.bytes_written,
-            1_900_652 * NODE_INDEX_BYTES + u64::from(sim_total(true)) * BLOCK_OUTPUT_BYTES
+        // 265 real PBF blocks walked by EACH pass + simulated placeholders.
+        assert_eq!(summary.blocks_total, 265 * 2 + sim_total(true));
+        // Node bytes are exactly known; way count comes out of the summary.
+        let known = 1_900_652 * NODE_INDEX_BYTES + u64::from(sim_total(true)) * BLOCK_OUTPUT_BYTES;
+        let ways = (summary.bytes_written - known) / WAY_INDEX_BYTES;
+        // The Innsbruck fixture holds 29,558 highway paths alone (research
+        // md); our filter adds waterway/natural/ele ways on top.
+        assert!(
+            ways > 29_000,
+            "implausibly few renderable ways: {ways} (bytes {})",
+            summary.bytes_written
         );
         println!(
-            "real end-to-end: {} blocks / {slices} yields",
+            "real end-to-end: {} blocks / {ways} ways / {slices} yields",
             summary.blocks_total
         );
     }

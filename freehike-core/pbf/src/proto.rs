@@ -99,3 +99,52 @@ pub struct DenseNodes {
     #[prost(sint64, repeated, tag = "9")]
     pub lon: Vec<i64>,
 }
+
+// ---------------------------------------------------------------------------
+// Pass-2 views of the SAME PrimitiveBlock wire bytes.
+//
+// prost decodes only declared tags, so each pass gets a purpose-built view
+// of one payload: Pass 1's `PrimitiveBlock` never deserializes ways, and the
+// Pass-2 types below never deserialize the (large) dense-node arrays. The
+// `StringTableProbe` exists so the Blueprint's semantic pre-filter can
+// reject a block after decoding ONLY tag 1 — ways in a rejected block are
+// wire-skipped, never materialized.
+// ---------------------------------------------------------------------------
+
+/// Minimal relevance-probe view: just the StringTable.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StringTableProbe {
+    #[prost(message, optional, tag = "1")]
+    pub stringtable: Option<StringTable>,
+}
+
+/// Way-bearing view of a PrimitiveBlock (granularity fields are irrelevant:
+/// way refs are node IDs, not coordinates).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WayBlock {
+    #[prost(message, optional, tag = "1")]
+    pub stringtable: Option<StringTable>,
+    #[prost(message, repeated, tag = "2")]
+    pub primitivegroup: Vec<WayGroup>,
+}
+
+/// Group view declaring only ways (tag 3); nodes/dense/relations wire-skipped.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WayGroup {
+    #[prost(message, repeated, tag = "3")]
+    pub ways: Vec<Way>,
+}
+
+/// A way: tag-key indices into the block's StringTable plus **delta-coded**
+/// node refs (same sint64 delta scheme as DenseNodes). NOTE: `id` is plain
+/// int64 on the wire (not zigzag), unlike node IDs. `vals` (tag 3) and
+/// `info` (tag 4) are skipped — the current filter needs key presence only.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Way {
+    #[prost(int64, required, tag = "1")]
+    pub id: i64,
+    #[prost(uint32, repeated, tag = "2")]
+    pub keys: Vec<u32>,
+    #[prost(sint64, repeated, tag = "8")]
+    pub refs: Vec<i64>,
+}

@@ -7,7 +7,10 @@
 
 use prost::Message;
 
-use crate::proto::{Blob, BlobHeader, DenseNodes, PrimitiveBlock, PrimitiveGroup, StringTable};
+use crate::proto::{
+    Blob, BlobHeader, DenseNodes, PrimitiveBlock, PrimitiveGroup, StringTable, Way, WayBlock,
+    WayGroup,
+};
 
 /// Frames one `[u32 BE len][BlobHeader][Blob]` record.
 pub fn frame(blob_type: &str, blob: &Blob) -> Vec<u8> {
@@ -61,6 +64,61 @@ pub fn dense_block(nodes: &[(i64, i64, i64)], granularity: Option<i32>) -> Primi
 /// A complete synthetic PBF byte stream: one OSMHeader blob followed by one
 /// zlib OSMData blob per node group.
 pub fn synthetic_pbf(groups: &[&[(i64, i64, i64)]]) -> Vec<u8> {
+    synthetic_pbf_with_ways(groups, &[])
+}
+
+/// One way for [`way_block`] / [`synthetic_pbf_with_ways`]:
+/// `(way_id, tag_key, absolute node refs)`.
+pub type FixtureWay<'a> = (i64, &'a [u8], &'a [i64]);
+
+/// Builds a way-bearing OSMData block: a StringTable holding each distinct
+/// tag key (index 0 reserved empty, per OSM convention), and one Way per
+/// entry with delta-encoded refs — the inverse of Pass 2's decoding.
+pub fn way_block(ways: &[FixtureWay<'_>]) -> Vec<u8> {
+    let mut strings: Vec<Vec<u8>> = vec![Vec::new()]; // index 0: empty
+    let mut way_msgs = Vec::with_capacity(ways.len());
+    for &(id, key, refs) in ways {
+        let key_idx = match strings.iter().position(|s| s == key) {
+            Some(i) => i,
+            None => {
+                strings.push(key.to_vec());
+                strings.len() - 1
+            }
+        };
+        let mut deltas = Vec::with_capacity(refs.len());
+        let mut prev = 0i64;
+        for &r in refs {
+            deltas.push(r - prev);
+            prev = r;
+        }
+        way_msgs.push(Way {
+            id,
+            keys: vec![key_idx as u32],
+            refs: deltas,
+        });
+    }
+    let block = WayBlock {
+        stringtable: Some(StringTable { s: strings }),
+        primitivegroup: vec![WayGroup { ways: way_msgs }],
+    };
+    // WayBlock encodes to the same wire tags as a way-bearing PrimitiveBlock.
+    let payload = block.encode_to_vec();
+    frame(
+        "OSMData",
+        &Blob {
+            raw: None,
+            raw_size: Some(payload.len() as i32),
+            zlib_data: Some(miniz_oxide::deflate::compress_to_vec_zlib(&payload, 6)),
+        },
+    )
+}
+
+/// Full fixture: OSMHeader, then node blocks, then way blocks — the same
+/// nodes-before-ways ordering real planet extracts use.
+pub fn synthetic_pbf_with_ways(
+    node_groups: &[&[(i64, i64, i64)]],
+    way_groups: &[&[FixtureWay<'_>]],
+) -> Vec<u8> {
     let mut bytes = frame(
         "OSMHeader",
         &Blob {
@@ -69,8 +127,11 @@ pub fn synthetic_pbf(groups: &[&[(i64, i64, i64)]]) -> Vec<u8> {
             zlib_data: None,
         },
     );
-    for group in groups {
+    for group in node_groups {
         bytes.extend_from_slice(&frame("OSMData", &data_blob(&dense_block(group, None))));
+    }
+    for ways in way_groups {
+        bytes.extend_from_slice(&way_block(ways));
     }
     bytes
 }

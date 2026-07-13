@@ -33,7 +33,8 @@ pub mod scan;
 pub mod fixtures;
 
 pub use scan::{
-    run_pass1_slice, stringtable_has_relevant_keys, BlockKind, BlockScanner, Pass1Slice,
+    extract_relevant_ways, run_pass1_slice, run_pass2_slice, stringtable_has_relevant_keys,
+    stringtable_is_relevant, BlockKind, BlockScanner, Pass1Slice, Pass2Slice, WayScan,
     RELEVANT_TAG_KEYS,
 };
 
@@ -398,6 +399,35 @@ pub fn get_way_refs(db: &Database, way_id: u64) -> Result<Option<Vec<u64>>, Inde
         Some(guard) => Ok(Some(decode_way_refs(guard.value())?)),
         None => Ok(None),
     }
+}
+
+/// Reconstructs a way's projected geometry by joining [`WAYS`] against
+/// [`COORDINATES`]: decode the ref sequence, then look up each node's Web
+/// Mercator coordinate. This is the Blueprint's materialize-one-way-at-a-time
+/// join — the returned linestring is the ONLY per-way allocation, meant to be
+/// encoded and dropped immediately by the caller (50MB-ceiling posture).
+///
+/// Missing nodes are **skipped, not fatal**: clipped extracts legitimately
+/// contain ways whose tail refs fall outside the extract bbox (the node was
+/// never in the file). A way that resolves fewer than 2 vertices — or does
+/// not exist — returns `Ok(None)`: it cannot form renderable geometry.
+pub fn assemble_way_geometry(
+    db: &Database,
+    way_id: u64,
+) -> Result<Option<Vec<(f64, f64)>>, IndexError> {
+    let Some(refs) = get_way_refs(db, way_id)? else {
+        return Ok(None);
+    };
+    let mut line = Vec::with_capacity(refs.len());
+    for node_id in refs {
+        if let Some(xy) = get_coord(db, node_id)? {
+            line.push(xy);
+        }
+    }
+    if line.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(line))
 }
 
 // ---------------------------------------------------------------------------

@@ -750,3 +750,72 @@ feature), ffi/src/lib.rs (tests + doc), ffi/Cargo.toml, LOOPLOG.
 the Phase-2 budget-yield contract; Pass 2 storage schema ready. Next: Pass 2
 way extraction (StringTable-filtered) into `Ways`, then geometry
 reconstruction via `get_coord` joins.
+
+---
+
+## P3.C4 — Pass 2 driver (way extraction) + geometry assembly + engine wiring
+
+**Status:** CLOSED
+**Date:** 2026-07-13
+**Goal:** suspendable Pass 2 scanner with the StringTable pre-filter live on
+its own cursor, tag-filtered way extraction into `Ways`, a two-table geometry
+join (`assemble_way_geometry`), and real Pass2Ways in the engine with an
+independent `pass2_byte_offset` checkpoint field.
+
+**Files declared:** pbf/src/proto.rs (Way/WayBlock/WayGroup/StringTableProbe),
+pbf/src/scan.rs (next_raw refactor + run_pass2_slice + extract_relevant_ways),
+pbf/src/lib.rs (assemble_way_geometry + re-exports), pbf/src/fixtures.rs
+(way_block / synthetic_pbf_with_ways), compiler/src/engine.rs (Pass2 arm +
+checkpoint v3), ffi tests, LOOPLOG.
+
+**Design:**
+- **Per-pass prost views of the same wire bytes** — the load-bearing idea:
+  scanner refactored to a raw framing step (`next_raw`) + typed decode per
+  pass. Pass 1's PrimitiveBlock still never deserializes ways; Pass 2's
+  `next_way_block` decodes a `StringTableProbe` (tag 1 ONLY) first and, when
+  the pre-filter rejects, returns `Irrelevant` WITHOUT ever materializing Way
+  messages — the Blueprint's "skip without deserializing entities", exactly.
+  Only surviving blocks get the `WayBlock` decode (which itself wire-skips
+  the dense-node arrays).
+- Way extraction: keep iff any tag key resolves (StringTable) to
+  RELEVANT_TAG_KEYS; refs delta-decoded (sint64 accumulator, checked);
+  degenerate ways (<2 refs) dropped; corrupt inputs (key idx OOB, negative
+  way id/ref, delta overflow) are typed errors. `Way.id` is plain int64 on
+  the wire (NOT zigzag, unlike node ids) — encoded in proto.rs comments.
+- `run_pass2_slice`: identical yield/min-progress/flush-before-offset
+  contract as Pass 1; own cursor from 0; `blocks_prefiltered` exposed for
+  telemetry. Ways batched through `insert_ways_batched` (LEB128 values).
+- `assemble_way_geometry(db, way_id)`: WAYS→refs→COORDINATES join producing
+  one transient Web-Mercator linestring (materialize-one-way-at-a-time, per
+  Blueprint). Missing nodes are SKIPPED, not fatal — clipped extracts
+  legitimately reference nodes outside the bbox; <2 resolved vertices → None.
+- Engine: real Pass2Ways arm mirrors Pass 1; checkpoint **v3** adds
+  `pass2_byte_offset` (independent cursor). Version bumped 2→3 (any format
+  change bumps — the discipline that keeps kill-resume honest); FFI
+  CheckpointState again UNCHANGED (internal field only, no Surface v1 gate).
+  bytes_written accounting: +32 logical bytes/way (WAY_INDEX_BYTES).
+
+**Proof:**
+- pbf 28/28: pass2 filter matrix (kept/tag-filtered/block-prefiltered, with
+  the node block itself counted prefiltered via its empty stringtable),
+  yield-every-block resume with zero duplication, geometry join order+
+  projection exactness, missing-node trio (mid-way skip / all-missing → None
+  / single-vertex → None), corrupt-way rejection trio.
+- compiler 21/21: new mid-job engine test drives zero-budget slices through
+  BOTH real passes, then proves `get_way_refs`/`assemble_way_geometry` from
+  durable state alone; checkpoint v3 roundtrip; determinism (sliced==single)
+  now covers two real passes.
+- ffi 7/7 (yield-phase assertion generalized — real passes finish fast).
+- **L2 real-data:** integrated engine over the real 19.5MB Innsbruck extract,
+  250ms budget: **544 blocks (265×2 passes + 14 sim) / 81,395 renderable
+  ways / 8 yields / ~2.3s** — vs the fixture's known 29,558 highway paths,
+  81k is plausible with waterway/natural/ele included.
+- fmt + clippy -D warnings clean; `cargo check --workspace --all-targets`
+  clean; workspace 69/69 (3 ignored L2s); `cargo ndk -t arm64-v8a build -p
+  ffi` CLEAN.
+
+**Outcome:** CLOSED. Pivots: 0 (one transient tool outage mid-chunk, no
+impact). Both passes of the two-pass architecture are now real end-to-end
+under the budget-yield contract; geometry reconstruction works from durable
+state. Next (Phase 4 proper): RDP simplification + Sutherland-Hodgman
+clipping over assembled linestrings, then tile binning.

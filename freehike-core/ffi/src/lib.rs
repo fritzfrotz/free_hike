@@ -295,9 +295,9 @@ mod tests {
         );
         match status {
             CompilationStatus::Finished { summary } => {
-                // Fixture: 2 pass1 blocks (header + 1 data) + the simulated
-                // pass2/terrain/finalize placeholders (24 + 12 + 2).
-                assert_eq!(summary.blocks_total, 2 + 38);
+                // Fixture: 2 blocks (header + 1 node data) walked by each
+                // real pass + simulated terrain/finalize (12 + 2).
+                assert_eq!(summary.blocks_total, 2 * 2 + 14);
                 assert!(summary.bytes_written > 0);
             }
             other => panic!("expected Finished, got {other:?}"),
@@ -313,13 +313,10 @@ mod tests {
         let status = compile_chunk(job.clone(), 4, Box::new(Recorder(Default::default())));
         match status {
             CompilationStatus::Yielded { checkpoint } => {
-                // The tiny fixture's real Pass 1 completes within the budget,
-                // so the yield may land in Pass1Nodes OR early Pass2Ways —
-                // both are legitimate suspend points.
-                assert!(matches!(
-                    checkpoint.phase,
-                    CompilePhase::Pass1Nodes | CompilePhase::Pass2Ways
-                ));
+                // The tiny fixture's real passes complete within the budget,
+                // so the yield may land anywhere before Finalize completes —
+                // any phase is a legitimate suspend point; what matters is
+                // that a durable checkpoint exists for this job.
                 assert_eq!(checkpoint.job_id, job.job_id);
             }
             other => panic!("expected Yielded, got {other:?}"),

@@ -406,11 +406,43 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
         return try lift(readInt(&buf))
     }
 
@@ -432,6 +464,30 @@ fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
 
     public static func write(_ value: Float, into buf: inout [UInt8]) {
         writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -477,18 +533,565 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
+/**
+ * Where a yielded job stopped. Informational: display it, log it, but never
+ * feed it back — the engine owns the durable copy.
+ */
+public struct CheckpointState {
+    public var jobId: String
+    /**
+     * Processing phase the job will resume in.
+     */
+    public var phase: CompilePhase
+    /**
+     * Next block index within the phase.
+     */
+    public var nextBlock: UInt32
+    /**
+     * Byte offset into the source PBF (exact mmap re-entry point once the
+     * real Pass 1/2 land; simulated until then).
+     */
+    public var pbfByteOffset: UInt64
+    /**
+     * Total bytes appended to output archives so far.
+     */
+    public var bytesWritten: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(jobId: String, 
+        /**
+         * Processing phase the job will resume in.
+         */phase: CompilePhase, 
+        /**
+         * Next block index within the phase.
+         */nextBlock: UInt32, 
+        /**
+         * Byte offset into the source PBF (exact mmap re-entry point once the
+         * real Pass 1/2 land; simulated until then).
+         */pbfByteOffset: UInt64, 
+        /**
+         * Total bytes appended to output archives so far.
+         */bytesWritten: UInt64) {
+        self.jobId = jobId
+        self.phase = phase
+        self.nextBlock = nextBlock
+        self.pbfByteOffset = pbfByteOffset
+        self.bytesWritten = bytesWritten
+    }
+}
+
+#if compiler(>=6)
+extension CheckpointState: Sendable {}
+#endif
+
+
+extension CheckpointState: Equatable, Hashable {
+    public static func ==(lhs: CheckpointState, rhs: CheckpointState) -> Bool {
+        if lhs.jobId != rhs.jobId {
+            return false
+        }
+        if lhs.phase != rhs.phase {
+            return false
+        }
+        if lhs.nextBlock != rhs.nextBlock {
+            return false
+        }
+        if lhs.pbfByteOffset != rhs.pbfByteOffset {
+            return false
+        }
+        if lhs.bytesWritten != rhs.bytesWritten {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(jobId)
+        hasher.combine(phase)
+        hasher.combine(nextBlock)
+        hasher.combine(pbfByteOffset)
+        hasher.combine(bytesWritten)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCheckpointState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CheckpointState {
+        return
+            try CheckpointState(
+                jobId: FfiConverterString.read(from: &buf), 
+                phase: FfiConverterTypeCompilePhase.read(from: &buf), 
+                nextBlock: FfiConverterUInt32.read(from: &buf), 
+                pbfByteOffset: FfiConverterUInt64.read(from: &buf), 
+                bytesWritten: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CheckpointState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.jobId, into: &buf)
+        FfiConverterTypeCompilePhase.write(value.phase, into: &buf)
+        FfiConverterUInt32.write(value.nextBlock, into: &buf)
+        FfiConverterUInt64.write(value.pbfByteOffset, into: &buf)
+        FfiConverterUInt64.write(value.bytesWritten, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCheckpointState_lift(_ buf: RustBuffer) throws -> CheckpointState {
+    return try FfiConverterTypeCheckpointState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCheckpointState_lower(_ value: CheckpointState) -> RustBuffer {
+    return FfiConverterTypeCheckpointState.lower(value)
+}
+
+
+/**
+ * Description of a compile job. Send the *same* record for every slice of
+ * the same job — `job_id` + `output_dir` are the resume identity.
+ */
+public struct CompileJob {
+    /**
+     * Caller-chosen unique ID (e.g. a UUID). Checkpoints are keyed by it.
+     */
+    public var jobId: String
+    /**
+     * "west,south,east,north" in WGS84 degrees (validated on every call).
+     */
+    public var bbox: String
+    /**
+     * Minimum zoom level to generate (inclusive).
+     */
+    public var minZoom: UInt8
+    /**
+     * Maximum zoom level to generate (inclusive).
+     */
+    public var maxZoom: UInt8
+    /**
+     * Absolute path to the raw .osm.pbf extract on device storage.
+     */
+    public var pbfPath: String
+    /**
+     * Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
+     */
+    public var demPath: String?
+    /**
+     * Directory owning this job's checkpoints and output archives.
+     */
+    public var outputDir: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Caller-chosen unique ID (e.g. a UUID). Checkpoints are keyed by it.
+         */jobId: String, 
+        /**
+         * "west,south,east,north" in WGS84 degrees (validated on every call).
+         */bbox: String, 
+        /**
+         * Minimum zoom level to generate (inclusive).
+         */minZoom: UInt8, 
+        /**
+         * Maximum zoom level to generate (inclusive).
+         */maxZoom: UInt8, 
+        /**
+         * Absolute path to the raw .osm.pbf extract on device storage.
+         */pbfPath: String, 
+        /**
+         * Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
+         */demPath: String?, 
+        /**
+         * Directory owning this job's checkpoints and output archives.
+         */outputDir: String) {
+        self.jobId = jobId
+        self.bbox = bbox
+        self.minZoom = minZoom
+        self.maxZoom = maxZoom
+        self.pbfPath = pbfPath
+        self.demPath = demPath
+        self.outputDir = outputDir
+    }
+}
+
+#if compiler(>=6)
+extension CompileJob: Sendable {}
+#endif
+
+
+extension CompileJob: Equatable, Hashable {
+    public static func ==(lhs: CompileJob, rhs: CompileJob) -> Bool {
+        if lhs.jobId != rhs.jobId {
+            return false
+        }
+        if lhs.bbox != rhs.bbox {
+            return false
+        }
+        if lhs.minZoom != rhs.minZoom {
+            return false
+        }
+        if lhs.maxZoom != rhs.maxZoom {
+            return false
+        }
+        if lhs.pbfPath != rhs.pbfPath {
+            return false
+        }
+        if lhs.demPath != rhs.demPath {
+            return false
+        }
+        if lhs.outputDir != rhs.outputDir {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(jobId)
+        hasher.combine(bbox)
+        hasher.combine(minZoom)
+        hasher.combine(maxZoom)
+        hasher.combine(pbfPath)
+        hasher.combine(demPath)
+        hasher.combine(outputDir)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompileJob: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompileJob {
+        return
+            try CompileJob(
+                jobId: FfiConverterString.read(from: &buf), 
+                bbox: FfiConverterString.read(from: &buf), 
+                minZoom: FfiConverterUInt8.read(from: &buf), 
+                maxZoom: FfiConverterUInt8.read(from: &buf), 
+                pbfPath: FfiConverterString.read(from: &buf), 
+                demPath: FfiConverterOptionString.read(from: &buf), 
+                outputDir: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CompileJob, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.jobId, into: &buf)
+        FfiConverterString.write(value.bbox, into: &buf)
+        FfiConverterUInt8.write(value.minZoom, into: &buf)
+        FfiConverterUInt8.write(value.maxZoom, into: &buf)
+        FfiConverterString.write(value.pbfPath, into: &buf)
+        FfiConverterOptionString.write(value.demPath, into: &buf)
+        FfiConverterString.write(value.outputDir, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompileJob_lift(_ buf: RustBuffer) throws -> CompileJob {
+    return try FfiConverterTypeCompileJob.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompileJob_lower(_ value: CompileJob) -> RustBuffer {
+    return FfiConverterTypeCompileJob.lower(value)
+}
+
+
+/**
+ * Completion report for a finished job.
+ */
+public struct CompileSummary {
+    public var jobId: String
+    public var blocksTotal: UInt32
+    public var bytesWritten: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(jobId: String, blocksTotal: UInt32, bytesWritten: UInt64) {
+        self.jobId = jobId
+        self.blocksTotal = blocksTotal
+        self.bytesWritten = bytesWritten
+    }
+}
+
+#if compiler(>=6)
+extension CompileSummary: Sendable {}
+#endif
+
+
+extension CompileSummary: Equatable, Hashable {
+    public static func ==(lhs: CompileSummary, rhs: CompileSummary) -> Bool {
+        if lhs.jobId != rhs.jobId {
+            return false
+        }
+        if lhs.blocksTotal != rhs.blocksTotal {
+            return false
+        }
+        if lhs.bytesWritten != rhs.bytesWritten {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(jobId)
+        hasher.combine(blocksTotal)
+        hasher.combine(bytesWritten)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompileSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompileSummary {
+        return
+            try CompileSummary(
+                jobId: FfiConverterString.read(from: &buf), 
+                blocksTotal: FfiConverterUInt32.read(from: &buf), 
+                bytesWritten: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CompileSummary, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.jobId, into: &buf)
+        FfiConverterUInt32.write(value.blocksTotal, into: &buf)
+        FfiConverterUInt64.write(value.bytesWritten, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompileSummary_lift(_ buf: RustBuffer) throws -> CompileSummary {
+    return try FfiConverterTypeCompileSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompileSummary_lower(_ value: CompileSummary) -> RustBuffer {
+    return FfiConverterTypeCompileSummary.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Result of one execution slice.
+ */
+
+public enum CompilationStatus {
+    
+    /**
+     * Compilation for the region is 100% complete; temporary caches purged.
+     */
+    case finished(summary: CompileSummary
+    )
+    /**
+     * The time budget expired; durable checkpoint written. Re-invoke
+     * `compile_chunk` with the same CompileJob to resume.
+     */
+    case yielded(checkpoint: CheckpointState
+    )
+    /**
+     * A fatal error occurred (e.g. disk full, corrupted payload).
+     */
+    case failed(reason: String
+    )
+}
+
+
+#if compiler(>=6)
+extension CompilationStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompilationStatus: FfiConverterRustBuffer {
+    typealias SwiftType = CompilationStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompilationStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .finished(summary: try FfiConverterTypeCompileSummary.read(from: &buf)
+        )
+        
+        case 2: return .yielded(checkpoint: try FfiConverterTypeCheckpointState.read(from: &buf)
+        )
+        
+        case 3: return .failed(reason: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CompilationStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .finished(summary):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeCompileSummary.write(summary, into: &buf)
+            
+        
+        case let .yielded(checkpoint):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeCheckpointState.write(checkpoint, into: &buf)
+            
+        
+        case let .failed(reason):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompilationStatus_lift(_ buf: RustBuffer) throws -> CompilationStatus {
+    return try FfiConverterTypeCompilationStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompilationStatus_lower(_ value: CompilationStatus) -> RustBuffer {
+    return FfiConverterTypeCompilationStatus.lower(value)
+}
+
+
+extension CompilationStatus: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Compilation phases, in execution order.
+ */
+
+public enum CompilePhase {
+    
+    case pass1Nodes
+    case pass2Ways
+    case terrain
+    case finalize
+}
+
+
+#if compiler(>=6)
+extension CompilePhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCompilePhase: FfiConverterRustBuffer {
+    typealias SwiftType = CompilePhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CompilePhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .pass1Nodes
+        
+        case 2: return .pass2Ways
+        
+        case 3: return .terrain
+        
+        case 4: return .finalize
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CompilePhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .pass1Nodes:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .pass2Ways:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .terrain:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .finalize:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompilePhase_lift(_ buf: RustBuffer) throws -> CompilePhase {
+    return try FfiConverterTypeCompilePhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCompilePhase_lower(_ value: CompilePhase) -> RustBuffer {
+    return FfiConverterTypeCompilePhase.lower(value)
+}
+
+
+extension CompilePhase: Equatable, Hashable {}
+
+
+
+
+
+
+
 
 
 /**
  * Progress events emitted from the Rust core to the native (Swift/Kotlin)
- * layer, which forwards them to the WebView as Capacitor
- * `compilationProgress` events. Implemented on the foreign side.
+ * layer, forwarded to the WebView as Capacitor `compilationProgress` events.
  */
 public protocol ProgressCallback: AnyObject, Sendable {
     
     /**
-     * `percentage` is 0.0-100.0; `status` is a human-readable phase label
-     * (e.g. "pass1: indexing nodes").
+     * `percentage` is 0.0-100.0 across the whole job (not the slice);
+     * `status` is a human-readable phase label, e.g.
+     * "pass1: indexing nodes (12/62)".
      */
     func onProgress(percentage: Float, status: String) 
     
@@ -602,27 +1205,71 @@ public func FfiConverterCallbackInterfaceProgressCallback_lift(_ handle: UInt64)
 public func FfiConverterCallbackInterfaceProgressCallback_lower(_ v: ProgressCallback) -> UInt64 {
     return FfiConverterCallbackInterfaceProgressCallback.lower(v)
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCheckpointState: FfiConverterRustBuffer {
+    typealias SwiftType = CheckpointState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCheckpointState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCheckpointState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
 /**
- * Walking-skeleton compile entry point.
- *
- * Accepts a `"west,south,east,north"` WGS84 bbox string and returns a JSON
- * status envelope. Phase 7 replaces the body with the real chunked,
- * checkpointed state machine (`compile_chunk(budget) -> Finished | Yielded`);
- * the signature here is deliberately primitive (String -> String) so the
- * bridge plumbing can be proven end-to-end before the real surface is
- * designed and HITL-reviewed.
+ * Runs one budget-bounded slice of `job`. See module docs for the
+ * Finished / Yielded / Failed contract. Never throws: all failures are
+ * values, so foreign call sites need no try/catch ceremony.
  */
-public func compileChunk(bbox: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
+public func compileChunk(job: CompileJob, budgetMs: UInt32, callback: ProgressCallback) -> CompilationStatus  {
+    return try!  FfiConverterTypeCompilationStatus_lift(try! rustCall() {
     uniffi_freehike_ffi_fn_func_compile_chunk(
-        FfiConverterString.lower(bbox),$0
+        FfiConverterTypeCompileJob_lower(job),
+        FfiConverterUInt32.lower(budgetMs),
+        FfiConverterCallbackInterfaceProgressCallback_lower(callback),$0
     )
 })
 }
 /**
- * Proves the foreign-callback path crosses the bridge: emits `steps`
- * synthetic progress ticks through the callback and returns how many were
- * sent. Wired to a hidden debug button in the WebView during Phase 1.
+ * Debug walking-skeleton retained from Phase 1: emits `steps` synthetic
+ * progress ticks through the callback and returns how many were sent.
  */
 public func emitTestProgress(callback: ProgressCallback, steps: UInt32) -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -638,6 +1285,33 @@ public func emitTestProgress(callback: ProgressCallback, steps: UInt32) -> UInt3
 public func engineVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_freehike_ffi_fn_func_engine_version($0
+    )
+})
+}
+/**
+ * Cancels a job between slices by deleting its durable state. Returns true
+ * if state existed and was removed. (In-slice cancellation is not needed:
+ * slices are budget-bounded, so the runner simply stops re-invoking.)
+ */
+public func purgeJob(jobId: String, outputDir: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_purge_job(
+        FfiConverterString.lower(jobId),
+        FfiConverterString.lower(outputDir),$0
+    )
+})
+}
+/**
+ * Cold-start resume detection: returns the durable checkpoint for a job if
+ * one exists (e.g. after the OS killed the process mid-compilation), None
+ * if the job has no saved state, or Failed-equivalent None on unreadable
+ * state (the next compile_chunk call surfaces the precise error).
+ */
+public func queryCheckpoint(jobId: String, outputDir: String) -> CheckpointState?  {
+    return try!  FfiConverterOptionTypeCheckpointState.lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_query_checkpoint(
+        FfiConverterString.lower(jobId),
+        FfiConverterString.lower(outputDir),$0
     )
 })
 }
@@ -657,16 +1331,22 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_freehike_ffi_checksum_func_compile_chunk() != 58841) {
+    if (uniffi_freehike_ffi_checksum_func_compile_chunk() != 52545) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_freehike_ffi_checksum_func_emit_test_progress() != 62392) {
+    if (uniffi_freehike_ffi_checksum_func_emit_test_progress() != 52095) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freehike_ffi_checksum_func_engine_version() != 51964) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_freehike_ffi_checksum_method_progresscallback_on_progress() != 23804) {
+    if (uniffi_freehike_ffi_checksum_func_purge_job() != 63403) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_func_query_checkpoint() != 56823) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_method_progresscallback_on_progress() != 34746) {
         return InitializationResult.apiChecksumMismatch
     }
 

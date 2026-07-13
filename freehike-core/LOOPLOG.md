@@ -143,6 +143,159 @@ Rust JSON envelope, and typing it away would hide the round-trip proof. `cancelJ
 declared as requested but documented as not-yet-implemented natively (rejects until the
 Phase 7 surface lands).
 
+**Outcome:** CLOSED. tsc/eslint clean; web-fallback path verified live in browser
+(startJob line + graceful UNIMPLEMENTED error rendered in the debug panel). Committed as
+`62a4eff` (native) + `29388d7` (ui/docs) on operator instruction.
+
+---
+
+## P1.C3 — Android .so + end-to-end emulator verification
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-13
+**Goal:** Phase 1 exit criterion made literal on Android: libfreehike_ffi.so built for
+arm64-v8a into jniLibs, app boots on an emulator, Debug Native Compile tap produces a
+Rust round-trip + progress events observable in logcat/UI.
+
+**Files declared:** `android/app/src/main/jniLibs/arm64-v8a/libfreehike_ffi.so` (build
+artifact — gitignore decision at close), `dist/` (vite rebuild), LOOPLOG.
+
+**Toolchain installs authorized by directive:** cargo-ndk, Android NDK (via sdkmanager —
+not present at ~/Library/Android/sdk/ndk despite directive's assumption), rustup android
+targets ×4, emulator package + arm64-v8a system image + AVD (none exist on this machine).
+
+**Proof:**
+1. `file`/`llvm-nm` on the .so: ELF aarch64 with uniffi_* exports.
+2. Logcat at app boot: MapCompilerPlugin load() logs "libfreehike_ffi.so loaded
+   (freehike-core 0.1.0)" — native-layer FFI round-trip proof.
+3. adb input tap on Debug Native Compile → UI log panel shows Rust JSON envelope +
+   5 progress ticks; logcat shows Capacitor plugin calls + notifyListeners events.
+
+**Plan:** rustup targets → cargo install cargo-ndk → sdkmanager ndk/emulator/system-image
+→ avdmanager create → cargo ndk build into jniLibs → npm run build → cap sync android →
+boot emulator (background) → install+launch → logcat/screenshot/tap verification.
+
+**Attempts:**
+- A1: rustup android targets ×4 — OK. cargo-ndk 4.1.2 installed — OK.
+- A2: NDK 27.2.12479018 via sdkmanager — OK (directive assumed NDK present; it was not).
+- A3: `cargo ndk -t arm64-v8a … -p ffi` → jniLibs/arm64-v8a/libfreehike_ffi.so (527KB ELF
+  aarch64; llvm-nm confirms uniffi_* exports) — OK, first try.
+- A4: avdmanager (brew path) → "Package path is not valid" — PIVOT: installed
+  `cmdline-tools;latest` INTO the sdk root; its avdmanager created the AVD cleanly
+  (pixel_7, android-36 google_apis arm64-v8a).
+- A5: npm run build (dist was stale — predated debug button) + cap sync — OK.
+  Emulator booted in ~25s. gradle installDebug — OK.
+- A6: BOOT PROOF in logcat: `nativeloader: Load …libfreehike_ffi.so… : ok` then
+  `MapCompilerPlugin: libfreehike_ffi.so loaded (freehike-core 0.1.0)` — the version
+  string is a live JNA→Rust engineVersion() round-trip at plugin load.
+- A7: first button tap missed (page settled between screenshot and tap; landed on a link
+  that opened Chrome) — PIVOT: re-front app, screenshot immediately before tap, no
+  intervening gestures.
+- A8: TAP PROOF: logcat shows `To native: MapCompiler.startJob {"bbox":"11.1,47.1,11.6,47.45"}`
+  → then `emitTestProgress {"steps":5}` (only reachable in JS after startJob resolved) →
+  5× `Notifying listeners for event compilationProgress`. UI screenshot shows the panel:
+  startJob line, Rust envelope `{"status":"accepted","engine":"freehike-core 0.1.0",…`,
+  and ticks 20/40/60/80% (100% below fold; logcat shows all 5).
+
+**Outcome:** CLOSED. Pivots: 2. **Phase 1 exit criterion met literally on Android:**
+tap in WebView → Rust round-trip → progress events rendered in JS.
+jniLibs/ gitignored (regenerable build artifact; command documented in .gitignore).
+Emulator shut down cleanly. iOS device-side demo still pending a full-Xcode machine.
+Uncommitted: .gitignore line + dist rebuild + this log — awaiting operator.
+
+---
+
+## P2.C0 — Production FFI contract (suspendable state machine surface, v1)
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-13
+**HITL gate:** FFI public surface redesign — **operator-initiated and specified in the
+directive**, satisfying §1.5 in-band. Surface v1 = CompileJob / CompilationStatus /
+CheckpointState / CompilePhase / compile_chunk(job, budget_ms, callback).
+
+**Goal:** the Phase 7-shaped contract, implemented today over a simulated-but-real slice
+engine: budget-bounded execution, durable atomic checkpoints, resume-by-job-identity,
+minimum-forward-progress guarantee. Real PBF/terrain pipelines (Phases 3-6) later replace
+the simulated block work behind the same contract.
+
+**Files declared:** `freehike-core/compiler/src/lib.rs` (module split),
+`freehike-core/compiler/src/engine.rs` (new — slice engine + checkpoint persistence),
+`freehike-core/ffi/src/lib.rs` (new surface), `freehike-core/ffi/bindings/*` (regen),
+LOOPLOG. No new dependencies (checkpoint file is std-only; redb replaces it in Phase 3/7
+behind the same engine API).
+
+**Proof tests (named up front):**
+- compiler::engine: `large_budget_finishes_and_purges_checkpoint`,
+  `tiny_budget_yields_with_checkpoint_file`, `resume_continues_not_restarts`,
+  `sliced_run_matches_single_run` (determinism), `zero_budget_still_makes_progress`
+  (livelock guard), `corrupted_checkpoint_fails`, `invalid_output_dir_fails`,
+  `phase_transitions_in_order`, `progress_is_monotonic_across_slices`,
+  `dem_none_skips_terrain_phase`.
+- ffi: `compile_chunk_finishes_with_large_budget`, `compile_chunk_yields_with_tiny_budget`,
+  `yielded_checkpoint_round_trips_via_query`, `failed_on_garbage_bbox`,
+  `callback_receives_phase_labels`.
+- Ladder: L1 ×2 (green-lock) + bindings regen compiles (uniffi-bindgen runs clean).
+
+**Design decisions to flag to operator (deviations/extensions):**
+1. `Finished` carries a `CompileSummary` record (blocks, bytes, duration) — spec said bare
+   Finished; the summary feeds the completion UI + L2 assertions. Vetoable.
+2. Resume is by job identity: the runner calls compile_chunk again with the same
+   CompileJob; the engine reloads its own durable checkpoint. CheckpointState returned in
+   `Yielded` is informational (UI/telemetry), never fed back — the foreign layer cannot
+   corrupt resume state, and iOS may kill the process between slices anyway, so disk is
+   the only trustworthy carrier.
+3. Added `query_checkpoint(job_id, output_dir)` + `purge_job(job_id, output_dir)` — the
+   runner needs cold-start resume detection and the JS surface already declares cancelJob.
+4. `emit_test_progress` + `engine_version` retained (device smoke path).
+5. Known downstream break (next chunk, not this one): Kotlin/Swift plugins + TS interface
+   still target the walking-skeleton surface. Repo stays runtime-consistent because
+   jniLibs/.so + embedded Kotlin binding are the OLD pair; regenerated bindings land in
+   ffi/bindings/ only. P2.C1 adapts the three shells + re-verifies on emulator.
+
+**Attempts:**
+- A1: engine.rs (slice engine + atomic checkpoint persistence + 10 tests) + module split
+  + new ffi/src/lib.rs (5 records/enums, 4 exports, 7 tests). One self-caught test bug
+  fixed pre-compile (phase-label extraction assumed a colon in every label).
+- A2: `cargo test --workspace` → 24/24 PASS first compile. `cargo fmt` applied.
+- A3: green-lock ×2: tests + clippy -D warnings + fmt all clean, twice.
+- A4: bindings regenerated from new dylib — Swift: `CompileJob` struct /
+  `CompilationStatus` enum / `compileChunk(job:budgetMs:callback:)` /
+  `queryCheckpoint` / `purgeJob`; Kotlin: data class / sealed class / same functions.
+  (ktlint-not-installed warning is cosmetic, as in P1.C1.)
+
+**Outcome:** CLOSED. Steps ~11/25. Pivots: 0.
+Ladder: L1 ✅✅ (green-locked) · bindings-regen ✅ · full L4 cross-targets deferred to
+P2.C1 (shell adaptation chunk, where the .so is rebuilt anyway).
+Surface v1 + deviations APPROVED by operator 2026-07-13.
+
+---
+
+## P2.C1 — Shell realignment to Surface v1 + emulator re-verification
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-13
+**Budget:** 40 (declared up front: three shells + device verification)
+**Goal:** Kotlin/Swift/TS plugins consume the v1 bindings; native layers run the
+budget-yield loop (re-invoke compile_chunk while Yielded, honor cancel between slices);
+end-to-end emulator proof shows multi-slice yield → resume → Finished.
+
+**Files declared:** android/.../uniffi/freehike/freehike.kt (binding copy),
+android/.../MapCompilerPlugin.kt, ios/App/App/FreeHikeFFI/* (binding copies),
+ios/App/App/MapCompilerPlugin.swift, src/plugins/MapCompiler.ts, src/ui/App.tsx (debug
+handler), jniLibs .so rebuild (gitignored), LOOPLOG.
+
+**Proof:**
+1. tsc -b + eslint clean; swiftc -parse clean; gradle assembleDebug clean.
+2. Emulator logcat: N>1 "slice yielded" lines for one startJob call (budget-yield loop
+   working), full progress stream, final Finished envelope resolved to JS.
+3. UI screenshot: debug panel shows slice yields + finished summary.
+
+**Design notes:** startJob(bbox, budgetMs?) drives the loop natively on the plugin's
+single-thread lane; JS debug button passes budgetMs=25 to force multiple yields of the
+~124ms simulated job. cancelJob sets an atomic flag checked between slices → purge_job →
+resolves pending startJob with status "cancelled". query_checkpoint exposure through the
+plugins deferred (logged) — not needed for this chunk's proof.
+
 **Attempts:**
 - A1: `src/plugins/MapCompiler.ts` + App.tsx listener effect / debug button / footer panel
   authored. `tsc -b` PASS.

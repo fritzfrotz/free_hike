@@ -1,10 +1,13 @@
 //! `compiler` — orchestration core for the FreeHike on-device map compiler.
 //!
-//! Phase 0 walking skeleton: bounding-box parsing/validation and a stub
-//! `compile_chunk` entry point. Later phases replace the stub with the real
-//! two-pass PBF pipeline and the idempotent checkpoint state machine (see
-//! `research/On-Device Map Compilation - Feasibility, Architecture, and
-//! Implementation Plan.md`, Phases 3-7).
+//! `engine` holds the suspendable slice state machine (the Phase 7-shaped
+//! contract: budget-bounded slices, durable checkpoints, resume by job
+//! identity). The block work inside it is simulated until the real two-pass
+//! PBF pipeline and terrain encoder land (see `research/On-Device Map
+//! Compilation - Feasibility, Architecture, and Implementation Plan.md`,
+//! Phases 3-7).
+
+pub mod engine;
 
 use std::fmt;
 

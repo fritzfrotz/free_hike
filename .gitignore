@@ -60,4 +60,5 @@ android/app/src/main/jniLibs/
 node_modules/
 .expo/
 ios/Pods/
-android/app/build/
+android/app/build/offline_sandbox/gdal/
+offline_sandbox/massif/

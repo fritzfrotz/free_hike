@@ -71,3 +71,93 @@ Ladder: L1 ✅✅ (green-locked). L2/L3/L4: n/a for this chunk type per matrix.
 **Note for P1:** the walking-skeleton FFI surface (`compile_chunk`, `emit_test_progress`,
 `engine_version`, `ProgressCallback`) is explicitly provisional; the real surface design is a
 HITL review before bindings are generated into the mobile shells.
+
+---
+
+## P1.C1 — Bindings, native shells, MapCompilerPlugin wiring
+
+**Status:** CLOSED
+**Date:** 2026-07-12
+**Process deviation (logged):** this plan entry was written at chunk close, not before
+execution — a §1.1 violation. TaskCreate was done up front; the LOOPLOG plan step was missed
+in the multi-part directive. Corrective: session bootstrap checklist now explicitly pairs
+TaskCreate+LOOPLOG as one atomic step.
+
+**Operator authorizations consumed (HITL gates):** P0 commit; `cap add ios/android`;
+Kotlin/JNA dependency additions; provisional FFI surface wired into shells (surface itself
+still flagged provisional). One operator rejection mid-chunk (iOS cross-compile) was
+clarified as accidental and re-run on instruction.
+
+**What was done:**
+1. Committed P0 baseline as `1d5c4a6` (freehike-core + .gitignore only).
+2. `uniffi-bindgen` (library mode, from libfreehike_ffi.dylib) → `ffi/bindings/`
+   {freehike.swift, freehikeFFI.h, freehikeFFI.modulemap, uniffi/freehike/freehike.kt}.
+3. `npx cap add ios` + `npx cap add android` (Capacitor 8.4.1; iOS shell is SPM-based).
+4. iOS: `MapCompilerPlugin.swift` (CAPPlugin+CAPBridgedPlugin; startJob/getEngineVersion/
+   emitTestProgress; BridgeForwardingProgress → notifyListeners), `MainViewController.swift`
+   (registerPluginInstance), storyboard repointed, bindings copied to App/FreeHikeFFI/,
+   pbxproj hand-edited (3 sources, group, bridging header, per-SDK LIBRARY_SEARCH_PATHS,
+   -lfreehike_ffi). iOS device+sim staticlibs cross-compiled (SDK-lookup warning only —
+   CLT-only machine, archive outputs valid).
+5. Android: Kotlin 2.1.20 gradle plugin + JNA 5.17.0@aar deps; binding copied into
+   app/src/main/java/uniffi/freehike/; `MapCompilerPlugin.kt` (same 3 methods, single-thread
+   executor, System.loadLibrary belt-and-braces in load()); MainActivity registerPlugin.
+6. Toolchain bootstrap for validation: openjdk@21 + android-commandlinetools via brew,
+   SDK platform-36/build-tools 36 via sdkmanager, local.properties.
+
+**Verification:**
+- `plutil -lint` pbxproj: OK. `swiftc -parse` × 3 Swift files: clean (full Xcode build
+  deferred — no Xcode on machine, per operator instruction).
+- `./gradlew assembleDebug` (JDK 21): **BUILD SUCCESSFUL** (127 tasks). dexdump confirms
+  `Lcom/freehike/app/MapCompilerPlugin` + `Luniffi/freehike/*` classes in app-debug.apk.
+
+**Known gaps (deliberate, tracked):**
+- No `libfreehike_ffi.so` in jniLibs yet (no NDK/cargo-ndk installed) — runtime FFI calls on
+  Android will hit the graceful UnsatisfiedLinkError log path until P1.C2 builds it.
+- iOS full compile+link unverified locally (needs full Xcode).
+- No JS-side `registerPlugin('MapCompiler')` wiring yet (WebView debug button = next chunk).
+- Green-lock (×2) applied to Gradle? Single run only — build determinism for a first
+  full-download build is dominated by dependency fetch; second run deferred to next chunk's
+  entry check. Logged as a partial green-lock.
+
+---
+
+## P1.C2 — WebView wiring: MapCompiler plugin interface + debug UI
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-12
+**Goal:** Phase 1 exit criterion plumbing complete on the JS side: typed
+`registerPlugin('MapCompiler')` wrapper, `compilationProgress` listener, discrete debug
+button firing `startJob` + `emitTestProgress`.
+
+**Files declared:** `src/plugins/MapCompiler.ts` (new), `src/ui/App.tsx` (footer debug UI +
+listener effect). No new dependencies.
+
+**Proof:** `tsc -b` clean, `eslint .` clean, live browser check: button renders, click on
+web produces the graceful "native shell required" fallback line (full native round-trip
+requires the .so — deferred to next session per operator).
+
+**Planned deviation from directive (flagged for operator):** `startJob` typed as
+`Promise<{ result: string }>` rather than `Promise<void>` — the native layer resolves the
+Rust JSON envelope, and typing it away would hide the round-trip proof. `cancelJob()` is
+declared as requested but documented as not-yet-implemented natively (rejects until the
+Phase 7 surface lands).
+
+**Attempts:**
+- A1: `src/plugins/MapCompiler.ts` + App.tsx listener effect / debug button / footer panel
+  authored. `tsc -b` PASS.
+- A2: `eslint .` LINT_FAIL — ESLint swept Capacitor-generated artifacts in `android/app/build/`
+  (freshly added native shells). Fix: `globalIgnores(['dist','android','ios','freehike-core'])`
+  in eslint.config.js (shells have their own toolchains). → PASS.
+- A3: live browser check: debug button renders in footer; click → log panel shows
+  `→ startJob(11.1,47.1,11.6,47.45)` then `✕ "MapCompiler" plugin is not implemented on web —
+  native shell required (web has no Rust core)`. Graceful web fallback confirmed; listener
+  attach does not crash on web.
+
+**Outcome:** CLOSED. Steps: 8/25 mutating. Pivots: 0.
+**Phase 1 status: code-complete on all three layers** (Rust core ✅ committed · native
+plugins ✅ Gradle-verified/swiftc-parsed · JS wiring ✅ tsc/eslint/browser-verified).
+The literal exit criterion — "tap in WebView → Rust round-trip → progress event rendered in
+JS" on a physical device — remains blocked on two known items: Android `.so` build
+(NDK/cargo-ndk, deferred by operator to next session) and an Xcode machine for iOS. The full
+path is wired and each segment is independently verified.

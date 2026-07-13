@@ -6,7 +6,9 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // android/ and ios/ are Capacitor-generated native shells (with their own
+  // toolchains: Gradle/Kotlin, Xcode/Swift) — not web code for ESLint to scan.
+  globalIgnores(['dist', 'android', 'ios', 'freehike-core']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

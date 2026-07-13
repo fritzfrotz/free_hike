@@ -133,6 +133,31 @@ function getGlobalProtocol(): Protocol {
 }
 
 // ---------------------------------------------------------------------------
+// Blank DEM tile placeholder (for contour-generation neighbors that fall
+// outside our clipped terrain coverage — see demSource.manager.getTile below)
+// ---------------------------------------------------------------------------
+
+let blankDemTileBlob: Blob | null = null;
+/**
+ * A flat 0m-elevation tile encoded in Mapbox terrain-RGB (base=-10000,
+ * interval=0.1 → R=1,G=134,B=160). maplibre-contour fetches a 3x3 neighbor
+ * grid around every tile it generates contours for; at the edge of our small
+ * clipped region several of those neighbors don't exist in the archive.
+ * Returning a flat placeholder (instead of throwing) lets contour generation
+ * for the in-bounds tiles proceed instead of the whole neighbor fetch
+ * rejecting on one missing edge tile.
+ */
+async function getBlankDemTile(): Promise<Blob> {
+  if (blankDemTileBlob) return blankDemTileBlob;
+  const canvas = new OffscreenCanvas(2, 2);
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = 'rgb(1,134,160)';
+  ctx.fillRect(0, 0, 2, 2);
+  blankDemTileBlob = await canvas.convertToBlob({ type: 'image/png' });
+  return blankDemTileBlob;
+}
+
+// ---------------------------------------------------------------------------
 // Static hiking location presets
 // ---------------------------------------------------------------------------
 
@@ -216,6 +241,8 @@ export interface MapViewProps {
   onLocationPermissionDenied?: () => void;
   /** Called with a human-readable message when offline map data fails to provision. */
   onMapDataError?: (message: string) => void;
+  /** Called with every live GPS fix — drives the Active Trip HUD's distance tracking. */
+  onPositionUpdate?: (pos: { lng: number; lat: number; accuracy: number }) => void;
   /** Called when the user confirms a region download; receives the current bounds. */
   onRegionDownload?: (bounds: maplibregl.LngLatBounds) => void;
   /** Current state of an in-progress download (drives the confirm panel). */
@@ -239,6 +266,7 @@ export default function MapView({
   onMapDataWorkerReady,
   onLocationPermissionDenied,
   onMapDataError,
+  onPositionUpdate,
   onRegionDownload,
   downloadStatus        = 'idle',
   downloadProgressLabel = '',
@@ -480,7 +508,11 @@ export default function MapView({
               getTile: async (url: string) => {
                 const [, z, x, y] = /\/\/(\d+)\/(\d+)\/(\d+)/.exec(url) || [];
                 const tile = await terrainPMTiles.getZxy(Number(z), Number(x), Number(y));
-                if (!tile) throw new Error(`[demSource] No offline terrain tile at ${url}`);
+                if (!tile) {
+                  // Outside our clipped terrain coverage — return a flat
+                  // placeholder rather than throwing (see getBlankDemTile).
+                  return { data: await getBlankDemTile() };
+                }
                 return { data: new Blob([tile.data]) };
               },
             });
@@ -600,7 +632,9 @@ export default function MapView({
 
             setInitStatus('ready');
           });
-          activeMap.on('error', (e) => console.error('[MapLibre]', e));
+          // Surface the underlying Error message/stack — logging the raw event
+          // object prints "[object Object]" and hides the actual failure.
+          activeMap.on('error', (e) => console.error('[MapLibre]', e.error?.message ?? e.error ?? e));
         }
       } else {
         setInitStatus('error');
@@ -1082,6 +1116,7 @@ export default function MapView({
         if (cancelled) return;
 
         userLocationRef.current = { lng, lat, accuracy };
+        onPositionUpdate?.({ lng, lat, accuracy });
 
         const map = mapRef.current;
         if (!map) return;
@@ -1139,7 +1174,7 @@ export default function MapView({
   // isTrackingCamera is read via isTrackingCameraRef to avoid stale closures;
   // re-registering the watcher on every tracking toggle would create duplicate
   // watchers and drain battery.
-  }, [onLocationPermissionDenied]);
+  }, [onLocationPermissionDenied, onPositionUpdate]);
 
   // Keep the ref in sync with state so the watcher closure stays current.
   useEffect(() => { isTrackingCameraRef.current = isTrackingCamera; }, [isTrackingCamera]);

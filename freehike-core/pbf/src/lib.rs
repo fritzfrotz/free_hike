@@ -29,6 +29,9 @@
 pub mod proto;
 pub mod scan;
 
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+
 pub use scan::{
     run_pass1_slice, stringtable_has_relevant_keys, BlockKind, BlockScanner, Pass1Slice,
     RELEVANT_TAG_KEYS,
@@ -66,6 +69,13 @@ pub const DEFAULT_BATCH_SIZE: usize = 10_000;
 
 /// Pass-1 node index: OSM node ID → Web Mercator `(x, y)` in meters.
 pub const COORDINATES: TableDefinition<u64, (f64, f64)> = TableDefinition::new("Coordinates");
+
+/// Pass-2 way index: OSM way ID → compact byte encoding of the way's ordered
+/// node-ID sequence (see [`encode_way_refs`]). Values are opaque byte arrays,
+/// NOT in-memory coordinate vectors — under the 50MB ceiling a way's geometry
+/// is only ever materialized transiently, one way at a time, by joining these
+/// refs against [`COORDINATES`] at encode time.
+pub const WAYS: TableDefinition<u64, &[u8]> = TableDefinition::new("Ways");
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -255,6 +265,139 @@ pub fn coord_count(db: &Database) -> Result<u64, IndexError> {
         Err(e) => return Err(db_err(e)),
     };
     table.len().map_err(db_err)
+}
+
+// ---------------------------------------------------------------------------
+// Way index (Pass 2 schema): compact node-ref sequences
+// ---------------------------------------------------------------------------
+//
+// A way's node refs are stored as delta + zigzag + LEB128-varint bytes — the
+// same integer coding the PBF wire format itself uses for way refs, so the
+// value stays a few bytes per node instead of 8, and no in-memory coordinate
+// vectors ever exist on the write path (50MB-ceiling posture).
+
+fn push_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_varint(bytes: &[u8], pos: &mut usize) -> Result<u64, IndexError> {
+    let mut value: u64 = 0;
+    for shift in (0..64).step_by(7) {
+        let &byte = bytes.get(*pos).ok_or_else(|| {
+            IndexError::InvalidInput("corrupted way refs: truncated varint".to_string())
+        })?;
+        *pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(IndexError::InvalidInput(
+        "corrupted way refs: varint exceeds 64 bits".to_string(),
+    ))
+}
+
+fn zigzag_encode(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+fn zigzag_decode(v: u64) -> i64 {
+    ((v >> 1) as i64) ^ -((v & 1) as i64)
+}
+
+/// Encodes an ordered node-ID sequence into the compact [`WAYS`] value form.
+/// IDs above `i64::MAX` are rejected (OSM IDs are positive sint64 on the
+/// wire, so a larger value can only be corruption).
+pub fn encode_way_refs(node_ids: &[u64]) -> Result<Vec<u8>, IndexError> {
+    let mut out = Vec::with_capacity(node_ids.len() * 2 + 4);
+    let mut prev: i64 = 0;
+    for &id in node_ids {
+        let id = i64::try_from(id).map_err(|_| {
+            IndexError::InvalidInput(format!("node id {id} exceeds the OSM sint64 domain"))
+        })?;
+        push_varint(&mut out, zigzag_encode(id - prev));
+        prev = id;
+    }
+    Ok(out)
+}
+
+/// Decodes a [`WAYS`] value back into the ordered node-ID sequence.
+pub fn decode_way_refs(bytes: &[u8]) -> Result<Vec<u64>, IndexError> {
+    let mut ids = Vec::new();
+    let mut pos = 0usize;
+    let mut prev: i64 = 0;
+    while pos < bytes.len() {
+        let delta = zigzag_decode(read_varint(bytes, &mut pos)?);
+        prev = prev.checked_add(delta).ok_or_else(|| {
+            IndexError::InvalidInput("corrupted way refs: delta overflow".to_string())
+        })?;
+        let id = u64::try_from(prev).map_err(|_| {
+            IndexError::InvalidInput(format!("corrupted way refs: negative node id {prev}"))
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Inserts `(way_id, ordered node refs)` pairs into [`WAYS`] in chunked write
+/// transactions — same commit/thread-safety contract as
+/// [`insert_coords_batched`]. Returns the number of ways inserted.
+pub fn insert_ways_batched<I>(db: &Database, ways: I, batch_size: usize) -> Result<u64, IndexError>
+where
+    I: IntoIterator<Item = (u64, Vec<u64>)>,
+{
+    if batch_size == 0 {
+        return Err(IndexError::InvalidInput(
+            "batch_size must be at least 1".to_string(),
+        ));
+    }
+    let mut ways = ways.into_iter();
+    let mut total: u64 = 0;
+    loop {
+        let tx = db.begin_write().map_err(db_err)?;
+        let mut in_chunk: usize = 0;
+        {
+            let mut table = tx.open_table(WAYS).map_err(db_err)?;
+            for (way_id, refs) in ways.by_ref().take(batch_size) {
+                let encoded = encode_way_refs(&refs)?;
+                table.insert(way_id, encoded.as_slice()).map_err(db_err)?;
+                in_chunk += 1;
+            }
+        }
+        if in_chunk == 0 {
+            tx.abort().map_err(db_err)?;
+            break;
+        }
+        tx.commit().map_err(db_err)?;
+        total += in_chunk as u64;
+        if in_chunk < batch_size {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Point lookup of a way's ordered node refs. `Ok(None)` for an absent way
+/// or a not-yet-created table.
+pub fn get_way_refs(db: &Database, way_id: u64) -> Result<Option<Vec<u64>>, IndexError> {
+    let tx = db.begin_read().map_err(db_err)?;
+    let table = match tx.open_table(WAYS) {
+        Ok(t) => t,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(db_err(e)),
+    };
+    match table.get(way_id).map_err(db_err)? {
+        Some(guard) => Ok(Some(decode_way_refs(guard.value())?)),
+        None => Ok(None),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +600,80 @@ mod tests {
         for id in [0, 9_999, 10_000, 19_999] {
             assert_eq!(get_coord(&db, id).unwrap(), Some(coord_for(id)), "id {id}");
         }
+    }
+
+    // -- Way index -------------------------------------------------------
+
+    #[test]
+    fn way_refs_roundtrip() {
+        let cases: &[&[u64]] = &[
+            &[],
+            &[42],
+            &[100, 101, 102, 103],        // ascending (typical)
+            &[5_000, 4_990, 5_010, 1],    // non-monotonic (negative deltas)
+            &[0, u64::MAX / 3, 7],        // large jumps both ways
+            &[9_223_372_036_854_775_807], // i64::MAX boundary
+        ];
+        for refs in cases {
+            let encoded = encode_way_refs(refs).unwrap();
+            assert_eq!(&decode_way_refs(&encoded).unwrap(), refs, "refs {refs:?}");
+        }
+
+        // Compactness: consecutive IDs cost one byte per node after the first
+        // delta, regardless of the IDs' magnitude.
+        let dense: Vec<u64> = (8_000_000_000..8_000_001_000).collect();
+        let encoded = encode_way_refs(&dense).unwrap();
+        assert!(
+            encoded.len() < 1_000 + 8,
+            "delta coding must beat 8 bytes/node: {} bytes for 1000 refs",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn way_refs_reject_garbage() {
+        // ID outside the OSM sint64 domain.
+        assert!(matches!(
+            encode_way_refs(&[u64::MAX]),
+            Err(IndexError::InvalidInput(_))
+        ));
+        // Truncated varint (continuation bit set, then EOF).
+        assert!(matches!(
+            decode_way_refs(&[0x80]),
+            Err(IndexError::InvalidInput(_))
+        ));
+        // Varint longer than 64 bits.
+        assert!(matches!(
+            decode_way_refs(&[0xff; 11]),
+            Err(IndexError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn ways_table_batched_insert_and_lookup() {
+        let dir = tmp_dir("ways");
+        let db = open_coord_db(&dir.join("index.redb")).unwrap();
+
+        // Both tables coexist in the one per-job index database.
+        insert_coords_batched(&db, [(7u64, (1.0, 2.0))], DEFAULT_BATCH_SIZE).unwrap();
+
+        let ways: Vec<(u64, Vec<u64>)> = (0..25u64)
+            .map(|w| (w, vec![w * 10, w * 10 + 1, w * 10 + 2]))
+            .collect();
+        let n = insert_ways_batched(&db, ways, 10).unwrap(); // 10 + 10 + 5
+        assert_eq!(n, 25);
+
+        assert_eq!(
+            get_way_refs(&db, 24).unwrap(),
+            Some(vec![240, 241, 242]),
+            "last chunk must be committed"
+        );
+        assert_eq!(get_way_refs(&db, 99).unwrap(), None);
+        assert_eq!(get_coord(&db, 7).unwrap(), Some((1.0, 2.0)));
+
+        // Fresh DB: Ways absent entirely → None, not an error.
+        let db2 = open_coord_db(&dir.join("empty.redb")).unwrap();
+        assert_eq!(get_way_refs(&db2, 1).unwrap(), None);
     }
 
     // -- Projection ----------------------------------------------------------

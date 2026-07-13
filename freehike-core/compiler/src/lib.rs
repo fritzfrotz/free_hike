@@ -2,10 +2,11 @@
 //!
 //! `engine` holds the suspendable slice state machine (the Phase 7-shaped
 //! contract: budget-bounded slices, durable checkpoints, resume by job
-//! identity). The block work inside it is simulated until the real two-pass
-//! PBF pipeline and terrain encoder land (see `research/On-Device Map
-//! Compilation - Feasibility, Architecture, and Implementation Plan.md`,
-//! Phases 3-7).
+//! identity). Pass 1 (node indexing) is REAL as of P3.C3 — it drives
+//! `pbf::run_pass1_slice` over the mmap'd extract into the per-job redb
+//! index. Pass 2 / Terrain / Finalize remain simulated until Phases 4-6
+//! land (see `research/On-Device Map Compilation - Feasibility,
+//! Architecture, and Implementation Plan.md`).
 
 pub mod engine;
 

@@ -348,7 +348,8 @@ pub fn run_pass1_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{DenseNodes, Node, PrimitiveGroup, StringTable};
+    use crate::fixtures::{data_blob, dense_block, frame, synthetic_pbf};
+    use crate::proto::{Node, PrimitiveGroup, StringTable};
     use crate::{coord_count, get_coord, open_coord_db};
     use std::fs;
     use std::path::PathBuf;
@@ -361,71 +362,12 @@ mod tests {
         d
     }
 
-    /// Frames `header` + `blob` bytes as `[u32 BE len][BlobHeader][Blob]`.
-    fn frame(blob_type: &str, blob: &Blob) -> Vec<u8> {
-        let blob_bytes = blob.encode_to_vec();
-        let header = BlobHeader {
-            r#type: blob_type.to_string(),
-            indexdata: None,
-            datasize: blob_bytes.len() as i32,
-        };
-        let header_bytes = header.encode_to_vec();
-        let mut out = (header_bytes.len() as u32).to_be_bytes().to_vec();
-        out.extend_from_slice(&header_bytes);
-        out.extend_from_slice(&blob_bytes);
-        out
-    }
-
-    /// Zlib-compressed OSMData blob from a PrimitiveBlock.
-    fn data_blob(block: &PrimitiveBlock) -> Blob {
-        let payload = block.encode_to_vec();
-        Blob {
-            raw: None,
-            raw_size: Some(payload.len() as i32),
-            zlib_data: Some(miniz_oxide::deflate::compress_to_vec_zlib(&payload, 6)),
-        }
-    }
-
-    /// Delta-encodes absolute `(id, lat_units, lon_units)` triples into a
-    /// DenseNodes-bearing PrimitiveBlock — the inverse of what
-    /// `extract_node_coords` must perform.
-    fn dense_block(nodes: &[(i64, i64, i64)], granularity: Option<i32>) -> PrimitiveBlock {
-        let (mut pid, mut plat, mut plon) = (0i64, 0i64, 0i64);
-        let mut dense = DenseNodes::default();
-        for &(id, lat, lon) in nodes {
-            dense.id.push(id - pid);
-            dense.lat.push(lat - plat);
-            dense.lon.push(lon - plon);
-            (pid, plat, plon) = (id, lat, lon);
-        }
-        PrimitiveBlock {
-            stringtable: Some(StringTable::default()),
-            primitivegroup: vec![PrimitiveGroup {
-                nodes: vec![],
-                dense: Some(dense),
-            }],
-            granularity,
-            lat_offset: None,
-            lon_offset: None,
-        }
-    }
-
     /// Writes a synthetic-but-wire-valid PBF: OSMHeader + one OSMData block
-    /// per node group.
-    fn write_test_pbf(dir: &std::path::Path, groups: &[Vec<(i64, i64, i64)>]) -> PathBuf {
-        let mut bytes = frame(
-            "OSMHeader",
-            &Blob {
-                raw: Some(b"stub header block".to_vec()),
-                raw_size: None,
-                zlib_data: None,
-            },
-        );
-        for group in groups {
-            bytes.extend_from_slice(&frame("OSMData", &data_blob(&dense_block(group, None))));
-        }
+    /// per node group. (Builders live in `crate::fixtures`, shared with the
+    /// compiler/ffi test suites.)
+    fn write_test_pbf(dir: &std::path::Path, groups: &[&[(i64, i64, i64)]]) -> PathBuf {
         let path = dir.join("test.osm.pbf");
-        fs::write(&path, bytes).unwrap();
+        fs::write(&path, synthetic_pbf(groups)).unwrap();
         path
     }
 
@@ -454,7 +396,7 @@ mod tests {
     #[test]
     fn pass1_full_run_delta_decodes_and_indexes_all_nodes() {
         let dir = tmp_dir("full");
-        let pbf_path = write_test_pbf(&dir, &[GROUP_A.to_vec(), GROUP_B.to_vec()]);
+        let pbf_path = write_test_pbf(&dir, &[GROUP_A, GROUP_B]);
         let pbf = PbfMmap::open(&pbf_path).unwrap();
         let db = open_coord_db(&dir.join("coords.redb")).unwrap();
 
@@ -477,7 +419,7 @@ mod tests {
     #[test]
     fn pass1_yields_at_block_boundaries_and_resumes_without_duplicates() {
         let dir = tmp_dir("yield");
-        let pbf_path = write_test_pbf(&dir, &[GROUP_A.to_vec(), GROUP_B.to_vec()]);
+        let pbf_path = write_test_pbf(&dir, &[GROUP_A, GROUP_B]);
         let pbf = PbfMmap::open(&pbf_path).unwrap();
         let db = open_coord_db(&dir.join("coords.redb")).unwrap();
 
@@ -696,7 +638,7 @@ mod tests {
     #[test]
     fn resume_offset_past_eof_rejected() {
         let dir = tmp_dir("badresume");
-        let pbf_path = write_test_pbf(&dir, &[GROUP_A.to_vec()]);
+        let pbf_path = write_test_pbf(&dir, &[GROUP_A]);
         let pbf = PbfMmap::open(&pbf_path).unwrap();
         let db = open_coord_db(&dir.join("coords.redb")).unwrap();
         match run_pass1_slice(&pbf, &db, pbf.len() + 1, &mut || false) {

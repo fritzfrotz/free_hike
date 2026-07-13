@@ -14,10 +14,11 @@
 //!   one block even if the budget is already exhausted, so a runner passing
 //!   a too-small budget degrades to slow progress instead of livelocking.
 //!
-//! The block work is currently *simulated* (deterministic counters + a small
-//! sleep standing in for CPU work). Phases 3-6 replace the body of
-//! `process_block` with the real PBF/redb/terrain pipelines behind this same
-//! contract; the checkpoint file becomes a redb table with identical fields.
+//! **Pass1Nodes is REAL** (P3.C3): it drives `pbf::run_pass1_slice` over the
+//! mmap'd input, resuming from the checkpoint's `pbf_byte_offset` and writing
+//! the node index into the per-job redb database (`index_db_path`). The
+//! remaining phases (Pass2Ways / Terrain / Finalize) are still simulated
+//! block loops — placeholders for Phases 4-6 behind this same contract.
 
 use std::fmt;
 use std::fs;
@@ -85,28 +86,30 @@ pub struct JobSpec {
     pub bbox: BBox,
     pub min_zoom: u8,
     pub max_zoom: u8,
-    /// Path to the raw .osm.pbf (unused by the simulated engine; the real
-    /// Pass 1/2 mmap this).
+    /// Path to the raw .osm.pbf — mmap'd read-only by the real Pass 1.
     pub pbf_path: String,
     /// Optional DEM GeoTIFF; `None` skips the Terrain phase entirely.
     pub dem_path: Option<String>,
-    /// Directory owning checkpoints and outputs for this job.
+    /// Directory owning checkpoints, the redb index, and outputs for this job.
     pub output_dir: String,
 }
 
-/// Durable resume state. Field-compatible with the future redb checkpoint
-/// table (Phase 7) — only the storage medium changes.
+/// Durable resume state (checkpoint format v2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub job_id: String,
     pub phase: Phase,
-    /// Next block index within `phase` (blocks before it are complete).
+    /// Blocks completed *within* `phase` (Pass 1: PBF blocks scanned;
+    /// simulated phases: block index).
     pub next_block: u32,
-    /// Simulated for now; the real Pass 1/2 store the mmap read offset here
-    /// so a resume re-enters the PBF at the exact block boundary.
+    /// Absolute byte offset into the source PBF — the exact mmap re-entry
+    /// point for the real Pass 1 (`pbf::run_pass1_slice` resume contract).
     pub pbf_byte_offset: u64,
-    /// Total bytes appended to output archives so far.
+    /// Total logical bytes written (node-index bytes + simulated output).
     pub bytes_written: u64,
+    /// Blocks completed across ALL phases — feeds `RunSummary::blocks_total`
+    /// (per-phase counters reset at phase boundaries; this one never does).
+    pub blocks_done: u32,
 }
 
 /// Completion report for a finished job.
@@ -120,7 +123,7 @@ pub struct RunSummary {
 /// Result of one execution slice.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SliceOutcome {
-    /// 100% complete; the checkpoint (temporary state) has been purged.
+    /// 100% complete; temporary state (checkpoint + redb index) purged.
     Finished(RunSummary),
     /// Budget expired; durable checkpoint written. Call `run_slice` again
     /// with the same JobSpec to resume.
@@ -130,10 +133,11 @@ pub enum SliceOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Simulated work model (deterministic; replaced by real pipelines later)
+// Phase plan
 // ---------------------------------------------------------------------------
 
-const PASS1_BLOCKS: u32 = 24;
+// Simulated block counts for the not-yet-real phases (Phases 4-6 replace
+// these loops with the way/terrain/archive pipelines).
 const PASS2_BLOCKS: u32 = 24;
 const TERRAIN_BLOCKS: u32 = 12;
 const FINALIZE_BLOCKS: u32 = 2;
@@ -141,42 +145,49 @@ const FINALIZE_BLOCKS: u32 = 2;
 const BLOCK_WORK: Duration = Duration::from_millis(2);
 /// Simulated bytes appended per completed block.
 const BLOCK_OUTPUT_BYTES: u64 = 4_096;
-/// Simulated PBF bytes consumed per Pass 1/2 block.
-const BLOCK_PBF_BYTES: u64 = 8_192;
+/// Logical bytes accounted per indexed node (u64 key + 2×f64 coordinate),
+/// so `bytes_written` stays meaningful and deterministic for the real Pass 1.
+const NODE_INDEX_BYTES: u64 = 24;
 
-/// Phase schedule for a job (order + block counts).
-fn schedule(job: &JobSpec) -> Vec<(Phase, u32)> {
-    let mut plan = vec![
-        (Phase::Pass1Nodes, PASS1_BLOCKS),
-        (Phase::Pass2Ways, PASS2_BLOCKS),
-    ];
+/// Phase order for a job.
+fn phase_plan(job: &JobSpec) -> Vec<Phase> {
+    let mut plan = vec![Phase::Pass1Nodes, Phase::Pass2Ways];
     if job.dem_path.is_some() {
-        plan.push((Phase::Terrain, TERRAIN_BLOCKS));
+        plan.push(Phase::Terrain);
     }
-    plan.push((Phase::Finalize, FINALIZE_BLOCKS));
+    plan.push(Phase::Finalize);
     plan
 }
 
-fn total_blocks(plan: &[(Phase, u32)]) -> u32 {
-    plan.iter().map(|(_, n)| n).sum()
+/// Simulated block count for a phase (Pass 1 is real and dynamic → 0).
+fn sim_blocks(phase: Phase) -> u32 {
+    match phase {
+        Phase::Pass1Nodes => 0,
+        Phase::Pass2Ways => PASS2_BLOCKS,
+        Phase::Terrain => TERRAIN_BLOCKS,
+        Phase::Finalize => FINALIZE_BLOCKS,
+    }
 }
 
-/// One unit of work. The real pipelines replace this body; the contract
-/// (advance counters, return bytes) stays.
-fn process_block(phase: Phase, checkpoint: &mut Checkpoint) {
+/// One unit of simulated work (Phases 4-6 placeholders).
+fn process_sim_block(cp: &mut Checkpoint) {
     std::thread::sleep(BLOCK_WORK);
-    checkpoint.bytes_written += BLOCK_OUTPUT_BYTES;
-    if matches!(phase, Phase::Pass1Nodes | Phase::Pass2Ways) {
-        checkpoint.pbf_byte_offset += BLOCK_PBF_BYTES;
-    }
-    checkpoint.next_block += 1;
+    cp.bytes_written += BLOCK_OUTPUT_BYTES;
+    cp.next_block += 1;
+    cp.blocks_done += 1;
+}
+
+/// The per-job redb index (Coordinates + Ways tables). Lives beside the
+/// checkpoint; purged together with it on finish/cancel.
+pub fn index_db_path(output_dir: &str, job_id: &str) -> PathBuf {
+    Path::new(output_dir).join(format!("{job_id}.index.redb"))
 }
 
 // ---------------------------------------------------------------------------
 // Durable checkpoint persistence (std-only; becomes a redb table in Phase 7)
 // ---------------------------------------------------------------------------
 
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 
 fn checkpoint_path(output_dir: &str, job_id: &str) -> PathBuf {
     Path::new(output_dir).join(format!("{job_id}.checkpoint"))
@@ -189,8 +200,8 @@ fn save_checkpoint(output_dir: &str, cp: &Checkpoint) -> Result<(), String> {
     let tmp_path = final_path.with_extension("checkpoint.tmp");
 
     let body = format!(
-        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\nbytes_written={}\n",
-        cp.job_id, cp.phase, cp.next_block, cp.pbf_byte_offset, cp.bytes_written,
+        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\nbytes_written={}\nblocks_done={}\n",
+        cp.job_id, cp.phase, cp.next_block, cp.pbf_byte_offset, cp.bytes_written, cp.blocks_done,
     );
 
     let mut f = fs::File::create(&tmp_path)
@@ -222,6 +233,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
     let mut next_block = None;
     let mut pbf_byte_offset = None;
     let mut bytes_written = None;
+    let mut blocks_done = None;
 
     for line in raw.lines() {
         let Some((k, v)) = line.split_once('=') else {
@@ -234,6 +246,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             "next_block" => next_block = v.parse::<u32>().ok(),
             "pbf_byte_offset" => pbf_byte_offset = v.parse::<u64>().ok(),
             "bytes_written" => bytes_written = v.parse::<u64>().ok(),
+            "blocks_done" => blocks_done = v.parse::<u32>().ok(),
             other => return Err(format!("corrupted checkpoint: unknown key '{other}'")),
         }
     }
@@ -245,8 +258,17 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
         next_block,
         pbf_byte_offset,
         bytes_written,
+        blocks_done,
     ) {
-        (Some(CHECKPOINT_VERSION), Some(id), Some(phase), Some(nb), Some(po), Some(bw)) => {
+        (
+            Some(CHECKPOINT_VERSION),
+            Some(id),
+            Some(phase),
+            Some(nb),
+            Some(po),
+            Some(bw),
+            Some(bd),
+        ) => {
             if id != job_id {
                 return Err(format!(
                     "corrupted checkpoint: job_id mismatch (file='{id}', requested='{job_id}')"
@@ -258,6 +280,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
                 next_block: nb,
                 pbf_byte_offset: po,
                 bytes_written: bw,
+                blocks_done: bd,
             }))
         }
         (Some(v), ..) if v != CHECKPOINT_VERSION => {
@@ -267,10 +290,13 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
     }
 }
 
-/// Removes all durable state for a job (checkpoint today; partial outputs
-/// too once the real pipelines land). Used by Finished and by cancel/purge.
+/// Removes all durable state for a job: the checkpoint AND the redb index.
+/// Used by Finished (Blueprint step 8: "temporary redb files are purged")
+/// and by cancel/purge. Returns true if anything existed and was removed.
 pub fn purge_job_state(output_dir: &str, job_id: &str) -> bool {
-    fs::remove_file(checkpoint_path(output_dir, job_id)).is_ok()
+    let checkpoint_gone = fs::remove_file(checkpoint_path(output_dir, job_id)).is_ok();
+    let index_gone = fs::remove_file(index_db_path(output_dir, job_id)).is_ok();
+    checkpoint_gone || index_gone
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +310,7 @@ pub fn run_slice(
     budget: Duration,
     on_progress: &mut dyn FnMut(f32, String),
 ) -> SliceOutcome {
-    // Output dir must exist (checkpoints live there).
+    // Output dir must exist (checkpoints + index live there).
     if let Err(e) = fs::create_dir_all(&job.output_dir) {
         return SliceOutcome::Failed(format!(
             "cannot create output dir '{}': {e}",
@@ -292,8 +318,7 @@ pub fn run_slice(
         ));
     }
 
-    let plan = schedule(job);
-    let total = total_blocks(&plan);
+    let plan = phase_plan(job);
 
     // Resume or fresh start. Corrupted state is fatal, never silently reset.
     let mut cp = match load_checkpoint(&job.output_dir, &job.job_id) {
@@ -301,7 +326,7 @@ pub fn run_slice(
             // A checkpoint for a phase not in this job's plan (e.g. Terrain
             // checkpoint but the job now has no DEM) means the job definition
             // changed under us — refuse rather than guess.
-            if !plan.iter().any(|(p, _)| *p == cp.phase) {
+            if !plan.contains(&cp.phase) {
                 return SliceOutcome::Failed(format!(
                     "corrupted checkpoint: phase '{}' not in this job's plan (job definition changed?)",
                     cp.phase
@@ -311,51 +336,108 @@ pub fn run_slice(
         }
         Ok(None) => Checkpoint {
             job_id: job.job_id.clone(),
-            phase: plan[0].0,
+            phase: plan[0],
             next_block: 0,
             pbf_byte_offset: 0,
             bytes_written: 0,
+            blocks_done: 0,
         },
         Err(e) => return SliceOutcome::Failed(e),
     };
 
     let started = Instant::now();
-    let mut blocks_done_before: u32 = plan
-        .iter()
-        .take_while(|(p, _)| *p != cp.phase)
-        .map(|(_, n)| n)
-        .sum();
-    blocks_done_before += cp.next_block;
-    let mut done = blocks_done_before;
+    let n_phases = plan.len() as f32;
+    // Minimum-forward-progress bookkeeping: once ANY block has been processed
+    // in this slice, budget checks may yield.
+    let mut slice_blocks: u32 = 0;
 
-    // Walk the plan from the checkpointed phase forward.
-    let phase_index = plan.iter().position(|(p, _)| *p == cp.phase).unwrap();
-    for (phase, blocks) in plan[phase_index..].iter().copied() {
+    let phase_index = plan.iter().position(|p| *p == cp.phase).unwrap();
+    for (idx, phase) in plan.iter().copied().enumerate().skip(phase_index) {
         cp.phase = phase;
-        while cp.next_block < blocks {
-            // Budget check BEFORE each block except the very first of the
-            // slice: minimum forward progress guarantee (no livelock).
-            let first_block_of_slice = done == blocks_done_before;
-            if !first_block_of_slice && started.elapsed() >= budget {
-                return match save_checkpoint(&job.output_dir, &cp) {
-                    Ok(()) => SliceOutcome::Yielded(cp),
-                    Err(e) => SliceOutcome::Failed(e),
+        match phase {
+            // ---- REAL Pass 1: mmap → decode → project → redb ------------
+            Phase::Pass1Nodes => {
+                let pbf = match pbf::PbfMmap::open(Path::new(&job.pbf_path)) {
+                    Ok(m) => m,
+                    Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
                 };
-            }
+                let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
+                    Ok(db) => db,
+                    Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
+                };
+                let resume_offset = match usize::try_from(cp.pbf_byte_offset) {
+                    Ok(o) => o,
+                    Err(_) => {
+                        return SliceOutcome::Failed(format!(
+                            "corrupted checkpoint: pbf_byte_offset {} exceeds address space",
+                            cp.pbf_byte_offset
+                        ));
+                    }
+                };
 
-            process_block(phase, &mut cp);
-            done += 1;
-            let pct = (done as f32 / total as f32) * 100.0;
-            on_progress(pct, format!("{} ({done}/{total})", phase.label()));
+                let sub = match pbf::run_pass1_slice(&pbf, &db, resume_offset, &mut || {
+                    started.elapsed() >= budget
+                }) {
+                    Ok(s) => s,
+                    Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
+                };
+
+                cp.pbf_byte_offset = sub.next_offset as u64;
+                cp.next_block += sub.blocks_scanned;
+                cp.blocks_done += sub.blocks_scanned;
+                cp.bytes_written += sub.nodes_indexed * NODE_INDEX_BYTES;
+                slice_blocks += sub.blocks_scanned;
+
+                let frac = if pbf.is_empty() {
+                    1.0
+                } else {
+                    sub.next_offset as f32 / pbf.len() as f32
+                };
+                let pct = ((idx as f32 + frac) / n_phases) * 100.0;
+                on_progress(
+                    pct,
+                    format!("{} ({} blocks scanned)", phase.label(), cp.next_block),
+                );
+
+                if !sub.finished {
+                    return match save_checkpoint(&job.output_dir, &cp) {
+                        Ok(()) => SliceOutcome::Yielded(cp),
+                        Err(e) => SliceOutcome::Failed(e),
+                    };
+                }
+                cp.next_block = 0; // phase complete; next phase starts fresh
+            }
+            // ---- Simulated phases (Phases 4-6 placeholders) --------------
+            _ => {
+                let blocks = sim_blocks(phase);
+                while cp.next_block < blocks {
+                    // Budget check BEFORE each block, except when this slice
+                    // has done nothing yet (no-livelock guarantee).
+                    if slice_blocks > 0 && started.elapsed() >= budget {
+                        return match save_checkpoint(&job.output_dir, &cp) {
+                            Ok(()) => SliceOutcome::Yielded(cp),
+                            Err(e) => SliceOutcome::Failed(e),
+                        };
+                    }
+                    process_sim_block(&mut cp);
+                    slice_blocks += 1;
+                    let frac = cp.next_block as f32 / blocks as f32;
+                    let pct = ((idx as f32 + frac) / n_phases) * 100.0;
+                    on_progress(
+                        pct,
+                        format!("{} ({}/{blocks})", phase.label(), cp.next_block),
+                    );
+                }
+                cp.next_block = 0;
+            }
         }
-        cp.next_block = 0; // phase complete; next phase starts at block 0
     }
 
-    // All phases complete: purge temporary state, report.
+    // All phases complete: purge temporary state (checkpoint + index), report.
     purge_job_state(&job.output_dir, &job.job_id);
     SliceOutcome::Finished(RunSummary {
         job_id: job.job_id.clone(),
-        blocks_total: total,
+        blocks_total: cp.blocks_done,
         bytes_written: cp.bytes_written,
     })
 }
@@ -368,13 +450,33 @@ pub fn run_slice(
 mod tests {
     use super::*;
 
+    // Two dense-node groups → fixture layout: 1 OSMHeader + 2 OSMData blocks.
+    const G1: &[(i64, i64, i64)] = &[
+        (1_000, 472_700_000, 113_900_000),
+        (1_005, 472_700_100, 113_900_050),
+        (900, -338_650_000, -703_450_000),
+    ];
+    const G2: &[(i64, i64, i64)] = &[(2_000_000_000, 0, 0), (2_000_000_007, 100, 100)];
+    const FIXTURE_PASS1_BLOCKS: u32 = 3;
+    const FIXTURE_NODES: u64 = 5;
+
+    fn sim_total(dem: bool) -> u32 {
+        PASS2_BLOCKS + if dem { TERRAIN_BLOCKS } else { 0 } + FINALIZE_BLOCKS
+    }
+
+    fn expected_bytes(dem: bool) -> u64 {
+        FIXTURE_NODES * NODE_INDEX_BYTES + u64::from(sim_total(dem)) * BLOCK_OUTPUT_BYTES
+    }
+
     fn test_job(dir: &Path, dem: bool) -> JobSpec {
+        let pbf_path = dir.join("fixture.osm.pbf");
+        fs::write(&pbf_path, pbf::fixtures::synthetic_pbf(&[G1, G2])).unwrap();
         JobSpec {
             job_id: "job-alps-1".into(),
             bbox: BBox::parse("11.15,47.05,11.65,47.45").unwrap(),
             min_zoom: 5,
             max_zoom: 14,
-            pbf_path: "unused.osm.pbf".into(),
+            pbf_path: pbf_path.to_string_lossy().into_owned(),
             dem_path: dem.then(|| "unused_dem.tif".into()),
             output_dir: dir.to_string_lossy().into_owned(),
         }
@@ -392,42 +494,83 @@ mod tests {
     const TINY: Duration = Duration::from_millis(5);
 
     #[test]
-    fn large_budget_finishes_and_purges_checkpoint() {
+    fn large_budget_finishes_real_pass1_and_purges_state() {
         let dir = tmp_dir("finish");
         let job = test_job(&dir, true);
         let mut ticks = 0u32;
         let out = run_slice(&job, BIG, &mut |_, _| ticks += 1);
         match out {
             SliceOutcome::Finished(s) => {
-                assert_eq!(
-                    s.blocks_total,
-                    PASS1_BLOCKS + PASS2_BLOCKS + TERRAIN_BLOCKS + FINALIZE_BLOCKS
-                );
-                assert_eq!(s.bytes_written, s.blocks_total as u64 * BLOCK_OUTPUT_BYTES);
+                assert_eq!(s.blocks_total, FIXTURE_PASS1_BLOCKS + sim_total(true));
+                assert_eq!(s.bytes_written, expected_bytes(true));
             }
             other => panic!("expected Finished, got {other:?}"),
         }
-        assert_eq!(
-            ticks,
-            PASS1_BLOCKS + PASS2_BLOCKS + TERRAIN_BLOCKS + FINALIZE_BLOCKS
-        );
+        // 1 pass1 event (whole file in one sub-slice) + 1 per simulated block.
+        assert_eq!(ticks, 1 + sim_total(true));
         assert!(
             load_checkpoint(&job.output_dir, &job.job_id)
                 .unwrap()
                 .is_none(),
             "checkpoint must be purged"
         );
+        assert!(
+            !index_db_path(&job.output_dir, &job.job_id).exists(),
+            "redb index must be purged on finish"
+        );
     }
 
     #[test]
-    fn tiny_budget_yields_with_checkpoint_file() {
+    fn pass1_indexes_real_nodes_into_redb() {
+        let dir = tmp_dir("index");
+        let job = test_job(&dir, true);
+        // Zero budget → yields immediately after minimum progress, so the
+        // index survives between slices for inspection.
+        let SliceOutcome::Yielded(_) = run_slice(&job, Duration::ZERO, &mut |_, _| {}) else {
+            panic!("expected yield");
+        };
+        // Drive to the end of pass1 (blocks arrive one per zero-budget slice).
+        let cp = loop {
+            match run_slice(&job, Duration::ZERO, &mut |_, _| {}) {
+                SliceOutcome::Yielded(cp) => {
+                    if cp.phase != Phase::Pass1Nodes {
+                        break cp;
+                    }
+                }
+                other => panic!("job should still be yielding, got {other:?}"),
+            }
+        };
+        assert_eq!(cp.phase, Phase::Pass2Ways);
+
+        // All five fixture nodes must be durably queryable mid-job.
+        let db = pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)).unwrap();
+        assert_eq!(pbf::coord_count(&db).unwrap(), FIXTURE_NODES);
+        for &(id, lat, lon) in G1.iter().chain(G2) {
+            let want = pbf::web_mercator(1e-9 * (100 * lon) as f64, 1e-9 * (100 * lat) as f64);
+            assert_eq!(
+                pbf::get_coord(&db, id as u64).unwrap(),
+                Some(want),
+                "node {id}"
+            );
+        }
+        drop(db);
+
+        // And the recorded offset must equal the full file length.
+        assert_eq!(
+            cp.pbf_byte_offset,
+            fs::metadata(&job.pbf_path).unwrap().len(),
+            "pass1 must have consumed the whole file"
+        );
+    }
+
+    #[test]
+    fn tiny_budget_yields_with_durable_checkpoint() {
         let dir = tmp_dir("yield");
         let job = test_job(&dir, true);
         let out = run_slice(&job, TINY, &mut |_, _| {});
         match out {
             SliceOutcome::Yielded(cp) => {
-                assert_eq!(cp.phase, Phase::Pass1Nodes);
-                assert!(cp.next_block > 0, "must have made progress");
+                assert!(cp.blocks_done > 0, "must have made progress");
                 let on_disk = load_checkpoint(&job.output_dir, &job.job_id)
                     .unwrap()
                     .unwrap();
@@ -447,9 +590,8 @@ mod tests {
         let SliceOutcome::Yielded(cp2) = run_slice(&job, TINY, &mut |_, _| {}) else {
             panic!("expected second slice to yield");
         };
-        let progressed = cp2.phase != cp1.phase || cp2.next_block > cp1.next_block;
         assert!(
-            progressed,
+            cp2.blocks_done > cp1.blocks_done,
             "second slice must continue past the first: {cp1:?} -> {cp2:?}"
         );
         assert!(cp2.bytes_written > cp1.bytes_written);
@@ -458,8 +600,7 @@ mod tests {
     #[test]
     fn sliced_run_matches_single_run() {
         // Determinism: many tiny slices must produce the same final summary
-        // as one big slice — this property is what makes the L3 kill-resume
-        // torture tests meaningful later.
+        // as one big slice — the property behind the kill-resume invariant.
         let dir_a = tmp_dir("det-a");
         let dir_b = tmp_dir("det-b");
         let job_a = test_job(&dir_a, true);
@@ -493,11 +634,38 @@ mod tests {
         let SliceOutcome::Yielded(cp1) = run_slice(&job, Duration::ZERO, &mut |_, _| {}) else {
             panic!("expected yield");
         };
-        assert_eq!(cp1.next_block, 1, "exactly the guaranteed minimum block");
+        assert_eq!(cp1.blocks_done, 1, "exactly the guaranteed minimum block");
+        assert_eq!(cp1.phase, Phase::Pass1Nodes);
         let SliceOutcome::Yielded(cp2) = run_slice(&job, Duration::ZERO, &mut |_, _| {}) else {
             panic!("expected yield");
         };
-        assert_eq!(cp2.next_block, 2, "forward progress under zero budget");
+        assert_eq!(cp2.blocks_done, 2, "forward progress under zero budget");
+    }
+
+    #[test]
+    fn missing_pbf_file_fails() {
+        let dir = tmp_dir("nopbf");
+        let mut job = test_job(&dir, true);
+        job.pbf_path = dir.join("does-not-exist.osm.pbf").display().to_string();
+        match run_slice(&job, BIG, &mut |_, _| {}) {
+            SliceOutcome::Failed(reason) => {
+                assert!(reason.starts_with("pass1:"), "got: {reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupted_pbf_fails_loudly() {
+        let dir = tmp_dir("badpbf");
+        let job = test_job(&dir, true);
+        fs::write(&job.pbf_path, b"<!DOCTYPE html><html>not a pbf</html>").unwrap();
+        match run_slice(&job, BIG, &mut |_, _| {}) {
+            SliceOutcome::Failed(reason) => {
+                assert!(reason.contains("corrupted PBF"), "got: {reason}")
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -554,10 +722,7 @@ mod tests {
         });
         match out {
             SliceOutcome::Finished(s) => {
-                assert_eq!(
-                    s.blocks_total,
-                    PASS1_BLOCKS + PASS2_BLOCKS + FINALIZE_BLOCKS
-                );
+                assert_eq!(s.blocks_total, FIXTURE_PASS1_BLOCKS + sim_total(false));
             }
             other => panic!("expected Finished, got {other:?}"),
         }
@@ -588,6 +753,43 @@ mod tests {
             }
         }
         panic!("did not finish");
+    }
+
+    /// Integrated engine over the REAL 19.5MB Innsbruck extract, sliced with
+    /// a production-shaped 250ms budget — the full FFI execution contract on
+    /// real data. Ignored so the L1 ladder stays fixture-independent; run:
+    ///   cargo test -p compiler --release -- --ignored --nocapture real_innsbruck
+    #[test]
+    #[ignore]
+    fn real_innsbruck_end_to_end_sliced() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../offline_sandbox/raw_data/innsbruck.osm.pbf");
+        let dir = tmp_dir("real-e2e");
+        let mut job = test_job(&dir, true);
+        job.pbf_path = fixture.to_string_lossy().into_owned();
+
+        let budget = Duration::from_millis(250);
+        let mut slices = 0u32;
+        let summary = loop {
+            match run_slice(&job, budget, &mut |_, _| {}) {
+                SliceOutcome::Yielded(_) => slices += 1,
+                SliceOutcome::Finished(s) => break s,
+                SliceOutcome::Failed(e) => panic!("failed after {slices} slices: {e}"),
+            }
+            assert!(slices < 10_000, "runaway");
+        };
+
+        // 265 real PBF blocks + the simulated placeholder phases.
+        assert_eq!(summary.blocks_total, 265 + sim_total(true));
+        // 1,900,652 nodes × 24 logical bytes + simulated output bytes.
+        assert_eq!(
+            summary.bytes_written,
+            1_900_652 * NODE_INDEX_BYTES + u64::from(sim_total(true)) * BLOCK_OUTPUT_BYTES
+        );
+        println!(
+            "real end-to-end: {} blocks / {slices} yields",
+            summary.blocks_total
+        );
     }
 
     #[test]

@@ -680,3 +680,73 @@ real-extract test re-run green post-change.
 
 **Outcome:** CLOSED. Implementation aligned with research/ specs; one spec
 correctness bug documented and routed to Pass 2 instead of blindly applied.
+
+---
+
+## P3.C3 — Pipeline integration (real Pass 1 in the engine) + Pass 2 schema
+
+**Status:** CLOSED
+**Date:** 2026-07-13
+**Goal:** replace the simulated Pass1Nodes loop in compiler/engine.rs with the
+real `pbf::run_pass1_slice` driver (resume via durable `pbf_byte_offset`);
+declare the Pass-2 `Ways` redb schema with compact node-ref values; coordinate
+lookup helper.
+
+**Files declared:** compiler/src/engine.rs (integration rewrite), compiler
+lib.rs docs + Cargo.toml, pbf/src/lib.rs (Ways table + varint codec +
+helpers), pbf/src/fixtures.rs (new, shared synthetic-PBF builders),
+pbf/src/scan.rs (tests refactored onto fixtures), pbf/Cargo.toml (`fixtures`
+feature), ffi/src/lib.rs (tests + doc), ffi/Cargo.toml, LOOPLOG.
+
+**Design:**
+- Engine integration: Pass1Nodes now mmaps `job.pbf_path`, opens the per-job
+  index (`{job_id}.index.redb`, bounded-cache), and calls `run_pass1_slice`
+  with `should_yield = elapsed >= budget`, resuming from the checkpoint's
+  `pbf_byte_offset` — the offset maps back through Yielded exactly as the
+  directive specifies. Pass2/Terrain/Finalize stay simulated placeholders.
+- Checkpoint format v2: added cumulative `blocks_done` (feeds
+  RunSummary::blocks_total now that Pass 1's block count is dynamic).
+  INTERNAL only — the FFI CheckpointState record is UNCHANGED (no Surface v1
+  HITL gate triggered); v1 checkpoints are rejected as unsupported-version
+  (no shipped users; corrupt-state posture preserved).
+- Progress model: per-phase fraction (pass1 = byte offset / file length; sim
+  = block/blocks) mapped to overall pct = (phase_idx + frac)/n_phases.
+  Monotonicity property preserved (test kept green).
+- Purge now removes checkpoint AND index db on finish/cancel (Blueprint step
+  8, "temporary redb files are purged"); index deliberately SURVIVES yields —
+  it is the resume substrate.
+- `Ways` table: `TableDefinition<u64, &[u8]>` — values are delta+zigzag+
+  LEB128 varint node-ref sequences (the PBF wire format's own integer coding;
+  ~1 byte/node for consecutive IDs vs 8 raw — proven by test). No in-memory
+  coordinate vectors on the write path (50MB posture). encode/decode reject
+  IDs outside the OSM sint64 domain, truncated varints, >64-bit varints, and
+  delta overflow. `insert_ways_batched` mirrors the coords batching contract;
+  `get_way_refs` decodes on read. Coordinate lookup = existing `get_coord`
+  (P3.C1) — cited rather than duplicated.
+- Fixtures: synthetic-PBF builders extracted to `pbf::fixtures`
+  (cfg(any(test, feature = "fixtures"))); compiler/ffi consume via
+  dev-dependency feature — never in production builds; scan.rs test
+  duplication removed.
+
+**Proof:**
+- compiler 20/20 (+1 ignored L2): real-nodes-into-redb mid-job verification
+  (all 5 fixture nodes durably queryable between zero-budget slices, offset ==
+  file length at pass1 end), kill-resume determinism (sliced == single run),
+  zero-budget min-progress, missing/corrupted PBF → typed Failed, phase order,
+  monotonic progress, checkpoint v2 roundtrip, purge removes index db.
+- pbf 23/23: way-refs roundtrip (incl. non-monotonic, i64::MAX boundary,
+  compactness <1.01 byte/node), garbage rejection, Ways+Coordinates coexist,
+  chunked commits.
+- ffi 7/7 against real (synthetic) PBF through compile_chunk.
+- **L2 real-data, integrated:** `real_innsbruck_end_to_end_sliced` (ignored):
+  full engine over the real 19.5MB extract at a production-shaped 250ms
+  budget → **303 blocks (265 real + 38 sim) / 8 yields / ~2.3s**, byte
+  accounting exact for 1,900,652 nodes through the integrated path.
+- fmt + clippy -D warnings clean; workspace 63/63 (3 ignored L2s);
+  `cargo ndk -t arm64-v8a build -p ffi` CLEAN — the full shipping chain
+  (ffi→compiler→pbf: redb/prost/memmap2/miniz) cross-compiles.
+
+**Outcome:** CLOSED. Pivots: 0. The engine's Pass 1 is production-real under
+the Phase-2 budget-yield contract; Pass 2 storage schema ready. Next: Pass 2
+way extraction (StringTable-filtered) into `Ways`, then geometry
+reconstruction via `get_coord` joins.

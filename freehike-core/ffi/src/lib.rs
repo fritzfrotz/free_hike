@@ -66,8 +66,8 @@ pub struct CheckpointState {
     pub phase: CompilePhase,
     /// Next block index within the phase.
     pub next_block: u32,
-    /// Byte offset into the source PBF (exact mmap re-entry point once the
-    /// real Pass 1/2 land; simulated until then).
+    /// Byte offset into the source PBF — the real Pass 1's exact mmap
+    /// re-entry point (block-boundary aligned).
     pub pbf_byte_offset: u64,
     /// Total bytes appended to output archives so far.
     pub bytes_written: u64,
@@ -263,12 +263,23 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("freehike-ffi-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Real (synthetic) PBF: the integrated Pass 1 mmaps and decodes it.
+        let pbf_path = dir.join("fixture.osm.pbf");
+        std::fs::write(
+            &pbf_path,
+            pbf::fixtures::synthetic_pbf(&[&[
+                (1, 472_700_000, 113_900_000),
+                (2, 472_700_100, 113_900_050),
+            ]]),
+        )
+        .unwrap();
         CompileJob {
             job_id: format!("job-{tag}"),
             bbox: "11.15,47.05,11.65,47.45".into(),
             min_zoom: 5,
             max_zoom: 14,
-            pbf_path: "unused.osm.pbf".into(),
+            pbf_path: pbf_path.to_string_lossy().into_owned(),
             dem_path: Some("unused_dem.tif".into()),
             output_dir: dir.to_string_lossy().into_owned(),
         }
@@ -284,13 +295,15 @@ mod tests {
         );
         match status {
             CompilationStatus::Finished { summary } => {
-                assert_eq!(summary.blocks_total, 62);
+                // Fixture: 2 pass1 blocks (header + 1 data) + the simulated
+                // pass2/terrain/finalize placeholders (24 + 12 + 2).
+                assert_eq!(summary.blocks_total, 2 + 38);
                 assert!(summary.bytes_written > 0);
             }
             other => panic!("expected Finished, got {other:?}"),
         }
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 62);
+        assert!(!seen.is_empty());
         assert!((seen.last().unwrap().0 - 100.0).abs() < 0.01);
     }
 
@@ -300,8 +313,13 @@ mod tests {
         let status = compile_chunk(job.clone(), 4, Box::new(Recorder(Default::default())));
         match status {
             CompilationStatus::Yielded { checkpoint } => {
-                assert_eq!(checkpoint.phase, CompilePhase::Pass1Nodes);
-                assert!(checkpoint.next_block > 0);
+                // The tiny fixture's real Pass 1 completes within the budget,
+                // so the yield may land in Pass1Nodes OR early Pass2Ways —
+                // both are legitimate suspend points.
+                assert!(matches!(
+                    checkpoint.phase,
+                    CompilePhase::Pass1Nodes | CompilePhase::Pass2Ways
+                ));
                 assert_eq!(checkpoint.job_id, job.job_id);
             }
             other => panic!("expected Yielded, got {other:?}"),

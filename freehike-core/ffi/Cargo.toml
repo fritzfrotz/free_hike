@@ -26,3 +26,7 @@ cli = ["uniffi/cli"]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi_bindgen.rs"
 required-features = ["cli"]
+
+[dev-dependencies]
+# Synthetic-PBF fixtures: compile_chunk tests exercise the real Pass 1.
+pbf = { workspace = true, features = ["fixtures"] }

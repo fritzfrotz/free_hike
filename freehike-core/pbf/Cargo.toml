@@ -10,3 +10,8 @@ memmap2 = { workspace = true }
 miniz_oxide = { workspace = true }
 prost = { workspace = true }
 redb = { workspace = true }
+
+[features]
+# Exposes the synthetic-PBF builders in `fixtures` to downstream test suites
+# (compiler/ffi dev-dependencies). Never enable in a production dependency.
+fixtures = []

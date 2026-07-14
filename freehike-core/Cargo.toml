@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["compiler", "pbf", "terrain", "tiles", "ffi", "fetcher"]
+members = ["compiler", "pbf", "terrain", "tiles", "ffi", "fetcher", "geom"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,7 @@ pbf = { path = "pbf" }
 terrain = { path = "terrain" }
 fetcher = { path = "fetcher" }
 tiles = { path = "tiles" }
+geom = { path = "geom" }
 
 # Release profile tuned for mobile distribution: maximum optimization with full
 # LTO so the iOS .a / Android .so ship lean and fast.

@@ -819,3 +819,108 @@ impact). Both passes of the two-pass architecture are now real end-to-end
 under the budget-yield contract; geometry reconstruction works from durable
 state. Next (Phase 4 proper): RDP simplification + Sutherland-Hodgman
 clipping over assembled linestrings, then tile binning.
+
+---
+
+## P4.C0 — Phase 4 scaffold: `geom` crate (handoff to geometry agent)
+
+**Status:** CLOSED (scaffold only — implementation halted for handoff)
+**Date:** 2026-07-13
+**Goal:** empty-but-contractual `geom` crate so the geometry agent can
+implement RDP simplification and Sutherland-Hodgman clipping against fixed
+signatures.
+
+**Done:**
+- New workspace member `geom` (+ workspace.dependencies registry entry).
+- **Dependency decision: NO `geo`/`geo-types` — raw `(f64, f64)` tuples.**
+  Rationale in lib.rs: the pipeline already speaks `Vec<(f64,f64)>`
+  (`assemble_way_geometry` output), both algorithms are ~100 lines of
+  dependency-free math, and the aarch64 mobile cross-compile wants the
+  smallest possible tree.
+- `simplify_rdp(&[(f64,f64)], epsilon) -> Vec<(f64,f64)>` and
+  `clip_to_bounds(&[(f64,f64)], (f64,f64,f64,f64)) -> Vec<(f64,f64)>`
+  declared exactly as directed, bodies `todo!()`, with full implementer
+  contracts in doc comments (units = Web-Mercator meters; RDP must preserve
+  endpoints, pass through <3-vertex inputs, and be stack-safe; clip must
+  insert boundary-intersection vertices).
+- **FLAG for the operator/geometry agent:** `clip_to_bounds`'s directed
+  single-`Vec` return cannot faithfully represent a linestring that exits
+  and re-enters the tile box (multiple disjoint segments). Documented in the
+  signature's doc comment: resolve the return shape (likely
+  `Vec<Vec<(f64,f64)>>`) BEFORE wiring into tile binning; never silently
+  bridge disjoint segments.
+
+**Verification:** `cargo check --workspace --all-targets` clean; clippy
+-D warnings clean; workspace tests all green (stubs are `todo!()` and
+uncalled). P3.C4 committed as `7e143e6` per operator instruction.
+
+**Outcome:** CLOSED. Halted here per operator instruction — implementation
+of the two functions belongs to the geometry agent.
+
+---
+
+## P4.C1 — `geom`: RDP simplification + Liang-Barsky clip implementation
+
+**Status:** CLOSED
+**Date:** 2026-07-14
+**Goal:** `simplify_rdp` and `clip_to_bounds` fully implemented, dependency-free,
+stack-safe, with exhaustive unit coverage; `clip_to_bounds`'s return-shape flag
+from P4.C0 resolved.
+
+**Files declared:** `geom/src/lib.rs` (implementation + tests), `LOOPLOG.md`.
+
+**Design:**
+- **RDP — iterative, explicit heap stack.** `Vec<(usize, usize)>` of
+  `(start, end)` index ranges stands in for the call stack; a `keep: Vec<bool>`
+  accumulates survivors, filtered into the output at the end. No native
+  recursion at any point — verified with a 20k-vertex zigzag fixture
+  (`rdp_handles_large_input_without_recursing`) where nearly every split
+  survives, forcing the deepest/widest stack the algorithm can produce.
+  Perpendicular distance uses the standard cross-product-over-segment-length
+  form, degenerating to Euclidean point distance when start==end coincide
+  (zero-length chord).
+- **Clip return-shape flag (P4.C0) resolved: `Vec<Vec<(f64,f64)>>`,** per
+  operator direction. Implemented as per-segment **Liang-Barsky** parametric
+  clipping (not Sutherland-Hodgman — that algorithm is for closed convex
+  polygons and has no notion of "disjoint output pieces"; an open linestring
+  that exits and re-enters the box needs exactly the per-segment
+  entry/exit-run tracking Liang-Barsky gives for free via its `t0/t1`
+  parametrization). Each segment clips independently against the 4
+  half-planes; runs are chained across segments by comparing the current
+  segment's entry point against the last point pushed, using plain `==` —
+  safe because un-clipped endpoints are returned bit-identical to the input
+  (`t<=0`/`t>=1` short-circuit in `at()`, never reconstructed via
+  interpolation), so a shared vertex between two adjacent in-bounds segments
+  is the same f64 bits in both calls.
+- **Degenerate-run filter:** tangential single-point corner touches clip to
+  two bit-identical points, which would pass a naive `len() >= 2` check
+  without representing a real line. `flush()` additionally requires at least
+  one pair of adjacent points to differ before emitting a run.
+
+**Proof (geom 14/14, all new):**
+- RDP: empty/1-point/2-point passthrough, collinear removal, sharp-corner
+  preservation, epsilon-boundary wiggle (kept vs. dropped at two epsilons),
+  endpoint invariant under an aggressive epsilon, 20k-vertex stack-safety
+  smoke test.
+- Clip: fully inside (unmodified single run), fully outside (empty),
+  single intersection (one inserted boundary vertex), exit-and-reentry (two
+  disjoint runs, exact boundary coordinates), corner intersection (diagonal
+  clipped exactly to both corners), tangential corner touch (degenerate,
+  correctly dropped), short-input (<2 vertices) passthrough-to-empty.
+
+**Verification:** `cargo fmt --check` clean; `cargo clippy -p geom
+--all-targets -- -D warnings` and `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo check --workspace --all-targets` clean;
+`cargo test --workspace` 83/83 passing (69 pre-existing + 14 new, 2 ignored
+L2s unaffected); `cargo build -p geom --target aarch64-apple-ios` and
+`cargo ndk -t arm64-v8a build -p geom` both clean (mobile cross-compile
+confirmed directly on the new code — `ffi` doesn't depend on `geom` yet, so
+the `ffi` cross-build doesn't exercise it).
+
+**Outcome:** CLOSED. Both Phase 4 geometry primitives are real. Not yet
+wired into `ffi`/tile binning — that integration (and the corresponding
+`geom` entry in `ffi`'s `Cargo.toml`) is a separate chunk. Pivots: 1 — an
+initial unit test for the tangential-corner-touch case used a line that
+doesn't actually pass through the box corner; caught by hand-verifying the
+Liang-Barsky arithmetic before trusting the test, which also surfaced the
+real degenerate-run bug in `flush()` fixed above.

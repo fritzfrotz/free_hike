@@ -924,3 +924,108 @@ initial unit test for the tangential-corner-touch case used a line that
 doesn't actually pass through the box corner; caught by hand-verifying the
 Liang-Barsky arithmetic before trusting the test, which also surfaced the
 real degenerate-run bug in `flush()` fixed above.
+
+(P4.C1 committed as `e390784` per operator approval.)
+
+---
+
+## P4.C2 — Pass 3: tile binning (geom → engine integration)
+
+**Status:** CLOSED
+**Date:** 2026-07-14
+**Goal:** real Pass 3 end-to-end: iterate WAYS, assemble → RDP-simplify →
+clip per z14 tile → store disjoint segments in a `TileFeatures` index, under
+the same budget-yield/kill-resume contract as Passes 1-2.
+
+**Files declared:** geom/src/lib.rs (tile grid math), pbf/Cargo.toml (+geom
+dep, operator-directed), pbf/src/tile.rs (NEW: table, ser/de, driver),
+pbf/src/lib.rs (module + way_count + varint visibility),
+compiler/src/engine.rs (Pass3Tiles arm + checkpoint v4),
+compiler/Cargo.toml (+geom dev-dep), ffi/src/lib.rs (CompilePhase),
+LOOPLOG.
+
+**Design:**
+- **`TileFeatures` schema (pbf):** `(u8 z, u32 x, u32 y, u64 way_id)` →
+  bytes, exactly as directed. Way ID in the composite KEY keeps writes
+  append-shaped (no read-modify-write of shared per-tile blobs); a tile's
+  features come back via key-range scan. Value format:
+  `varint(n_segments) [varint(n_vertices) (f64 LE x, f64 LE y)...]...` —
+  full-precision Web Mercator; quantization belongs to the MVT stage.
+  Decode is corruption-typed (truncation, hostile counts, trailing bytes).
+- **Tile math (geom, dependency-free):** `MERCATOR_HALF_WORLD_M`,
+  `tile_extent_m` / `meters_per_pixel` / `epsilon_for_zoom` (half a display
+  pixel — ~2.4km at z5, ~4.8m at z14, the Blueprint's per-zoom scaling),
+  `mercator_to_tile` / `tile_bounds` (XYZ y-down, clamped at world edges),
+  and `tiles_crossed_by_segment` (Amanatides-Woo grid traversal).
+- **DEVIATION (logged per §0):** the directive said way *bbox* → tile range.
+  A way-bbox scan is O(bbox area): one extract-clipped diagonal way
+  (Innsbruck→Valparaíso was literally in our own engine fixture) spans
+  ~3,700×4,000 z14 tiles → 15M clip calls — a self-DoS on device. Implemented
+  per-SEGMENT grid traversal instead: O(tiles actually crossed), identical
+  output, immune to hostile/clipped geometry. Candidate tiles are dilated by
+  one ring so ways grazing a neighbour's *buffer* zone still contribute
+  (buffer << tile, so one ring is always sufficient).
+- **Clip buffer:** each tile clips to bounds + `64/4096` of extent (MVT
+  buffer convention) — Blueprint's "bbox plus a minor rendering buffer",
+  so strokes have join geometry across tile seams.
+- **Driver (`run_pass3_slice`):** cursor = last fully-binned way ID
+  (`pass3_last_way_id`, 0 = fresh; OSM way IDs ≥ 1). Same
+  yield/min-progress/flush-before-cursor contract as Passes 1-2; re-binning
+  a way after a crash rewrites identical `(z,x,y,way)` keys — idempotent.
+  Geometry is materialized one way at a time via `assemble_way_geometry`
+  and dropped immediately (50MB posture); simplification runs ONCE per way
+  (epsilon is zoom-fixed, so per-tile simplify would be identical output for
+  3× the work). Unassemblable ways (refs outside the extract) count as
+  progress and are skipped.
+- **Engine:** `Phase::Pass3Tiles` between Pass2Ways and Terrain; checkpoint
+  **v4** (+`pass3_last_way_id`); progress denominator = `pbf::way_count`;
+  accounting +64 logical bytes/feature (`TILE_FEATURE_BYTES`).
+- **SURFACE v1 CHANGE (flag):** `ffi::CompilePhase` mirrors `engine::Phase`
+  exhaustively, so `Pass3Tiles` had to be appended — new Swift/Kotlin enum
+  case, existing cases unchanged. Made under the operator's P4.C2
+  integration directive; no other FFI surface change (CheckpointState
+  unchanged — the new field stays internal).
+- **Fixture change:** engine-test way 500 refs became local
+  ([1000, 1005], both Innsbruck) — the old cross-hemisphere way would bin
+  thousands of tiles and make byte-accounting assertions unverifiable.
+  Cross-hemisphere assembly coverage remains in the pbf crate's own tests.
+
+**Proof:**
+- geom 18/18 (+4): tile corners/quadrants/clamping, bounds↔tile roundtrip,
+  epsilon-vs-zoom scaling, traversal (single-tile / 3-tile crossing /
+  100×50 diagonal visits ~151 tiles not 5,151 / zero-length degenerate).
+- pbf 36/36 (+8): ser/de roundtrip + 4-way corruption rejection; **the
+  required integration test** (`way_crossing_tile_boundary_splits_into_both_tiles`:
+  one way straddling x=0 at z14 → exactly 2 features, each clipped to its
+  buffered box, unclipped endpoints bit-exact, boundary vertices at ±buffer);
+  fully-inside way binned once unclipped; yield-every-way resume with zero
+  duplication (3 ways / 4 slices / 3 features); unassemblable-way skip;
+  empty/absent WAYS table; sub-epsilon wiggle simplified before storage.
+- compiler 22/22 (+1): `pass3_bins_tiles_mid_job` proves the binned feature
+  from durable state alone mid-job; determinism (sliced==single),
+  monotonic progress, phase order, and checkpoint-roundtrip tests all now
+  cover the third real pass; ffi 7/7.
+- **L2 real-data:** integrated engine over the real 19.5MB Innsbruck
+  extract, 250ms budget, release: **81,395 ways binned / 97,619 tile
+  features / 11 yields / 3.18s total across all three real passes** —
+  ~1.2 features per way is exactly the local-ways-mostly-fit-one-tile
+  shape expected at z14, with boundary-crossers contributing the rest.
+- fmt clean; clippy --workspace --all-targets -D warnings clean (one
+  type_complexity resolved via a named `TileFeature` alias); workspace
+  96/96; `cargo ndk -t arm64-v8a build -p ffi` CLEAN. `cargo build
+  --target aarch64-apple-ios` compiles every crate; the final `ffi` cdylib
+  LINK step fails on this machine with or without P4.C2 (CommandLineTools
+  only, no iPhoneOS SDK) — pre-existing environment gap, verified by
+  stash-and-rebuild of the committed tree, not a code regression.
+
+**Outcome:** CLOSED. All three real passes now run under the budget-yield
+contract; TileFeatures is ready for the Phase 5/6 MVT encode + PMTiles
+stages (note: the index, TileFeatures included, is still purged on job
+finish — Finalize must drain it into the archive before that purge once
+Phase 6 lands). Pivots: 1 — the way-bbox→tiles blowup above, resolved by
+grid traversal.
+
+**Operator review:** APPROVED — grid-traversal deviation, serialization
+format, and MVT-buffer math all accepted. Committed with this entry per
+operator instruction. **The Rust backend is FROZEN at this commit per
+operator directive** — no further core chunks; work halts here.

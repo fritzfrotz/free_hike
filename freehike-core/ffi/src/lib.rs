@@ -86,10 +86,16 @@ pub struct CompileSummary {
 // ---------------------------------------------------------------------------
 
 /// Compilation phases, in execution order.
+///
+/// P4.C2 surface note: `Pass3Tiles` was appended when the real tile-binning
+/// pass landed — a Surface v1 addition made under the operator's Phase-4
+/// integration directive (adds a Swift/Kotlin enum case; existing cases and
+/// their ordinals are unchanged).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum CompilePhase {
     Pass1Nodes,
     Pass2Ways,
+    Pass3Tiles,
     Terrain,
     Finalize,
 }
@@ -99,6 +105,7 @@ impl From<engine::Phase> for CompilePhase {
         match p {
             engine::Phase::Pass1Nodes => CompilePhase::Pass1Nodes,
             engine::Phase::Pass2Ways => CompilePhase::Pass2Ways,
+            engine::Phase::Pass3Tiles => CompilePhase::Pass3Tiles,
             engine::Phase::Terrain => CompilePhase::Terrain,
             engine::Phase::Finalize => CompilePhase::Finalize,
         }

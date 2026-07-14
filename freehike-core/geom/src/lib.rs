@@ -1,4 +1,5 @@
-//! `geom` — pure geometry math for Phase 4 (simplification + clipping).
+//! `geom` — pure geometry math for Phase 4 (simplification, clipping,
+//! and slippy-tile grid math).
 //!
 //! Web Mercator meters (EPSG:3857) in, Web Mercator meters out.
 //! Dependency-free: the pipeline already speaks `Vec<(f64, f64)>`
@@ -8,6 +9,8 @@
 //! References: research/On-Device Map Compiler Blueprint.pdf
 //! ("Geospatial Transformation: Projection, Simplification, and
 //! Clipping"), md master plan Phase 4.
+
+use std::collections::BTreeSet;
 
 /// Ramer-Douglas-Peucker polyline simplification.
 ///
@@ -228,6 +231,141 @@ fn at(a: (f64, f64), b: (f64, f64), dx: f64, dy: f64, t: f64) -> (f64, f64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Slippy-tile grid math (XYZ convention: x rightward, y downward from the
+// north-west corner of the Web Mercator square)
+// ---------------------------------------------------------------------------
+
+/// Half the side of the Web Mercator world square, in meters:
+/// `R * π` for the WGS84 equatorial radius. The projected world spans
+/// `[-HALF, +HALF]` on both axes.
+pub const MERCATOR_HALF_WORLD_M: f64 = 20_037_508.342_789_244;
+
+/// All tile functions take a zoom in this range: `2^zoom` must fit the grid
+/// arithmetic and `u32` tile coordinates. Real jobs use z0-z16.
+pub const MAX_TILE_ZOOM: u8 = 30;
+
+/// Side length of one tile at `zoom`, in Web Mercator meters.
+pub fn tile_extent_m(zoom: u8) -> f64 {
+    debug_assert!(zoom <= MAX_TILE_ZOOM);
+    (2.0 * MERCATOR_HALF_WORLD_M) / (1u64 << zoom.min(MAX_TILE_ZOOM)) as f64
+}
+
+/// Ground resolution of one 256px-tile pixel at `zoom` (at the equator).
+pub fn meters_per_pixel(zoom: u8) -> f64 {
+    tile_extent_m(zoom) / 256.0
+}
+
+/// RDP epsilon for geometry rendered at `zoom`: half a display pixel.
+/// Deviations under half a pixel are invisible, so this is the smallest
+/// epsilon worth simplifying with — aggressive at overview zooms (~2.4km
+/// at z5), imperceptible at the z14 base tiles (~4.8m), per the Blueprint's
+/// "aggressive at z5, minimized at z14" scaling.
+pub fn epsilon_for_zoom(zoom: u8) -> f64 {
+    meters_per_pixel(zoom) / 2.0
+}
+
+/// The tile containing a Web Mercator point at `zoom`. Points outside the
+/// world square clamp into the edge tiles (the projection already clamps
+/// latitude, so only x can legitimately sit on the ±180° seam).
+pub fn mercator_to_tile(x: f64, y: f64, zoom: u8) -> (u32, u32) {
+    let extent = tile_extent_m(zoom);
+    let n = 1i64 << zoom.min(MAX_TILE_ZOOM);
+    let tx = (((x + MERCATOR_HALF_WORLD_M) / extent).floor() as i64).clamp(0, n - 1);
+    let ty = (((MERCATOR_HALF_WORLD_M - y) / extent).floor() as i64).clamp(0, n - 1);
+    (tx as u32, ty as u32)
+}
+
+/// Web Mercator bounds `(min_x, min_y, max_x, max_y)` of tile `(tx, ty)`
+/// at `zoom` — the exact box, no buffer (callers add their own rendering
+/// buffer before clipping).
+pub fn tile_bounds(zoom: u8, tx: u32, ty: u32) -> (f64, f64, f64, f64) {
+    let extent = tile_extent_m(zoom);
+    let min_x = tx as f64 * extent - MERCATOR_HALF_WORLD_M;
+    let max_y = MERCATOR_HALF_WORLD_M - ty as f64 * extent;
+    (min_x, max_y - extent, min_x + extent, max_y)
+}
+
+/// Inserts into `out` every tile the segment `a`-`b` passes through at
+/// `zoom`, via Amanatides-Woo grid traversal.
+///
+/// This is O(tiles actually crossed), NOT O(bounding-box area): a long
+/// diagonal segment (extract-clipped ways can jump across the whole bbox)
+/// crosses `|Δtx| + |Δty| + 1` tiles, while its bounding box can cover
+/// millions — scanning the box would be a denial-of-service on the device.
+/// Both endpoint tiles are always included, and the traversal is bounded by
+/// the cell distance, so float noise can neither hang the loop nor drop an
+/// endpoint.
+pub fn tiles_crossed_by_segment(
+    a: (f64, f64),
+    b: (f64, f64),
+    zoom: u8,
+    out: &mut BTreeSet<(u32, u32)>,
+) {
+    let extent = tile_extent_m(zoom);
+    let n = 1i64 << zoom.min(MAX_TILE_ZOOM);
+    let clamp_cell = |c: f64| (c.floor() as i64).clamp(0, n - 1);
+
+    // Grid space: u rightward, v downward, one unit per tile.
+    let (u0, v0) = (
+        (a.0 + MERCATOR_HALF_WORLD_M) / extent,
+        (MERCATOR_HALF_WORLD_M - a.1) / extent,
+    );
+    let (u1, v1) = (
+        (b.0 + MERCATOR_HALF_WORLD_M) / extent,
+        (MERCATOR_HALF_WORLD_M - b.1) / extent,
+    );
+
+    let (mut cx, mut cy) = (clamp_cell(u0), clamp_cell(v0));
+    let (ex, ey) = (clamp_cell(u1), clamp_cell(v1));
+    out.insert((cx as u32, cy as u32));
+    out.insert((ex as u32, ey as u32));
+
+    let du = u1 - u0;
+    let dv = v1 - v0;
+    let step_x: i64 = if du >= 0.0 { 1 } else { -1 };
+    let step_y: i64 = if dv >= 0.0 { 1 } else { -1 };
+    // Parametric distance (in units of the segment) to the first grid line
+    // on each axis, then per-cell increments.
+    let mut t_max_x = if du == 0.0 {
+        f64::INFINITY
+    } else {
+        let boundary = if du > 0.0 { (cx + 1) as f64 } else { cx as f64 };
+        (boundary - u0) / du
+    };
+    let mut t_max_y = if dv == 0.0 {
+        f64::INFINITY
+    } else {
+        let boundary = if dv > 0.0 { (cy + 1) as f64 } else { cy as f64 };
+        (boundary - v0) / dv
+    };
+    let t_delta_x = if du == 0.0 {
+        f64::INFINITY
+    } else {
+        (1.0 / du).abs()
+    };
+    let t_delta_y = if dv == 0.0 {
+        f64::INFINITY
+    } else {
+        (1.0 / dv).abs()
+    };
+
+    let max_steps = (ex - cx).abs() + (ey - cy).abs();
+    for _ in 0..max_steps {
+        if cx == ex && cy == ey {
+            break;
+        }
+        if t_max_x < t_max_y {
+            t_max_x += t_delta_x;
+            cx = (cx + step_x).clamp(0, n - 1);
+        } else {
+            t_max_y += t_delta_y;
+            cy = (cy + step_y).clamp(0, n - 1);
+        }
+        out.insert((cx as u32, cy as u32));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +508,84 @@ mod tests {
 
         let one = vec![(5.0, 5.0)];
         assert!(clip_to_bounds(&one, BOUNDS).is_empty());
+    }
+
+    // ---- tile grid math ----
+
+    const H: f64 = MERCATOR_HALF_WORLD_M;
+
+    #[test]
+    fn tile_math_world_corners_and_center() {
+        // z0: the whole world is tile (0,0).
+        assert_eq!(mercator_to_tile(0.0, 0.0, 0), (0, 0));
+        assert_eq!(tile_bounds(0, 0, 0), (-H, -H, H, H));
+
+        // z1: four quadrants; y is DOWN (north-west is (0,0)).
+        assert_eq!(mercator_to_tile(-1.0, 1.0, 1), (0, 0), "NW");
+        assert_eq!(mercator_to_tile(1.0, 1.0, 1), (1, 0), "NE");
+        assert_eq!(mercator_to_tile(-1.0, -1.0, 1), (0, 1), "SW");
+        assert_eq!(mercator_to_tile(1.0, -1.0, 1), (1, 1), "SE");
+
+        // Out-of-world points clamp into edge tiles instead of wrapping.
+        assert_eq!(mercator_to_tile(-H - 10.0, H + 10.0, 1), (0, 0));
+        assert_eq!(mercator_to_tile(H + 10.0, -H - 10.0, 1), (1, 1));
+    }
+
+    #[test]
+    fn tile_bounds_roundtrip_through_mercator_to_tile() {
+        for &(z, tx, ty) in &[(1u8, 0u32, 1u32), (5, 17, 11), (14, 8710, 5744)] {
+            let (min_x, min_y, max_x, max_y) = tile_bounds(z, tx, ty);
+            assert!(min_x < max_x && min_y < max_y);
+            let cx = (min_x + max_x) / 2.0;
+            let cy = (min_y + max_y) / 2.0;
+            assert_eq!(mercator_to_tile(cx, cy, z), (tx, ty), "z{z} ({tx},{ty})");
+            let extent = tile_extent_m(z);
+            assert!((max_x - min_x - extent).abs() < 1e-6);
+            assert!((max_y - min_y - extent).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn epsilon_shrinks_with_zoom() {
+        // Half a pixel: ~2.4km at z5, ~4.8m at z14 (the Blueprint scaling).
+        assert!((epsilon_for_zoom(5) - 2_446.0).abs() < 1.0);
+        assert!((epsilon_for_zoom(14) - 4.777).abs() < 0.01);
+        assert!(epsilon_for_zoom(14) < epsilon_for_zoom(5) / 100.0);
+    }
+
+    #[test]
+    fn segment_traversal_covers_straight_and_diagonal_paths() {
+        let e = tile_extent_m(14);
+        let (tx, ty) = mercator_to_tile(0.5 * e, -0.5 * e, 14); // just SE of origin
+
+        // Within one tile.
+        let mut tiles = BTreeSet::new();
+        tiles_crossed_by_segment((0.1 * e, -0.5 * e), (0.9 * e, -0.5 * e), 14, &mut tiles);
+        assert_eq!(tiles.into_iter().collect::<Vec<_>>(), vec![(tx, ty)]);
+
+        // Horizontal crossing of 3 tiles.
+        let mut tiles = BTreeSet::new();
+        tiles_crossed_by_segment((0.5 * e, -0.5 * e), (2.5 * e, -0.5 * e), 14, &mut tiles);
+        assert_eq!(
+            tiles.into_iter().collect::<Vec<_>>(),
+            vec![(tx, ty), (tx + 1, ty), (tx + 2, ty)]
+        );
+
+        // Diagonal: cost is O(tiles crossed), and endpoints always included.
+        let mut tiles = BTreeSet::new();
+        tiles_crossed_by_segment((0.5 * e, -0.5 * e), (100.5 * e, -50.5 * e), 14, &mut tiles);
+        assert!(tiles.contains(&(tx, ty)), "start tile");
+        assert!(tiles.contains(&(tx + 100, ty + 50)), "end tile");
+        // A 100x50-tile bbox has 5,151 tiles; the line crosses ~151.
+        assert!(
+            tiles.len() >= 101 && tiles.len() <= 152,
+            "diagonal must visit ~|dx|+|dy| tiles, got {}",
+            tiles.len()
+        );
+
+        // Degenerate zero-length segment: exactly its own tile.
+        let mut tiles = BTreeSet::new();
+        tiles_crossed_by_segment((0.5 * e, -0.5 * e), (0.5 * e, -0.5 * e), 14, &mut tiles);
+        assert_eq!(tiles.len(), 1);
     }
 }

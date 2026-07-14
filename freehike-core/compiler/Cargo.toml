@@ -11,3 +11,5 @@ pbf = { workspace = true }
 [dev-dependencies]
 # Synthetic-PBF builders for the integrated Pass-1 engine tests.
 pbf = { workspace = true, features = ["fixtures"] }
+# Tile grid math for asserting Pass-3 binning results.
+geom = { workspace = true }

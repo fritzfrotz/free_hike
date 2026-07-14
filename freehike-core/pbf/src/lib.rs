@@ -28,6 +28,7 @@
 
 pub mod proto;
 pub mod scan;
+pub mod tile;
 
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
@@ -36,6 +37,10 @@ pub use scan::{
     extract_relevant_ways, run_pass1_slice, run_pass2_slice, stringtable_has_relevant_keys,
     stringtable_is_relevant, BlockKind, BlockScanner, Pass1Slice, Pass2Slice, WayScan,
     RELEVANT_TAG_KEYS,
+};
+pub use tile::{
+    decode_tile_segments, encode_tile_segments, get_tile_features, run_pass3_slice, Pass3Slice,
+    BASE_TILE_ZOOM, TILE_FEATURES,
 };
 
 use std::fmt;
@@ -106,7 +111,7 @@ impl fmt::Display for IndexError {
 
 impl std::error::Error for IndexError {}
 
-fn db_err(e: impl fmt::Display) -> IndexError {
+pub(crate) fn db_err(e: impl fmt::Display) -> IndexError {
     IndexError::Db(e.to_string())
 }
 
@@ -277,7 +282,7 @@ pub fn coord_count(db: &Database) -> Result<u64, IndexError> {
 // value stays a few bytes per node instead of 8, and no in-memory coordinate
 // vectors ever exist on the write path (50MB-ceiling posture).
 
-fn push_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn push_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
@@ -289,11 +294,11 @@ fn push_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn read_varint(bytes: &[u8], pos: &mut usize) -> Result<u64, IndexError> {
+pub(crate) fn read_varint(bytes: &[u8], pos: &mut usize) -> Result<u64, IndexError> {
     let mut value: u64 = 0;
     for shift in (0..64).step_by(7) {
         let &byte = bytes.get(*pos).ok_or_else(|| {
-            IndexError::InvalidInput("corrupted way refs: truncated varint".to_string())
+            IndexError::InvalidInput("corrupted varint stream: truncated varint".to_string())
         })?;
         *pos += 1;
         value |= u64::from(byte & 0x7f) << shift;
@@ -302,7 +307,7 @@ fn read_varint(bytes: &[u8], pos: &mut usize) -> Result<u64, IndexError> {
         }
     }
     Err(IndexError::InvalidInput(
-        "corrupted way refs: varint exceeds 64 bits".to_string(),
+        "corrupted varint stream: varint exceeds 64 bits".to_string(),
     ))
 }
 
@@ -399,6 +404,18 @@ pub fn get_way_refs(db: &Database, way_id: u64) -> Result<Option<Vec<u64>>, Inde
         Some(guard) => Ok(Some(decode_way_refs(guard.value())?)),
         None => Ok(None),
     }
+}
+
+/// Total indexed ways (0 if the table hasn't been created yet). Pass 3 uses
+/// this as its progress denominator.
+pub fn way_count(db: &Database) -> Result<u64, IndexError> {
+    let tx = db.begin_read().map_err(db_err)?;
+    let table = match tx.open_table(WAYS) {
+        Ok(t) => t,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(db_err(e)),
+    };
+    table.len().map_err(db_err)
 }
 
 /// Reconstructs a way's projected geometry by joining [`WAYS`] against

@@ -209,6 +209,12 @@ function makeThrottle(intervalMs: number) {
 /**
  * Imperative handle for swapping the active offline region without unmounting
  * the map.  Handed to the parent via onRegionSwitcherReady.
+ *
+ * Two producers feed this today: App.tsx's fetch-based region download, and
+ * compilerStore's handleJobFinished (native Rust compile → opfsMover → OPFS)
+ * — both simply call useMapStore's setActiveRegion, and the effect below
+ * drives loadOfflineRegion() from there. Neither producer needs to know this
+ * switcher exists.
  */
 export interface OfflineRegionSwitcher {
   /**
@@ -737,6 +743,11 @@ export default function MapView({
   // reaches this effect, satisfying the "insulate the map from the download
   // panel" requirement. loadOfflineRegion() swaps sources in place; the map
   // instance itself is never torn down or remounted.
+  //
+  // A natively-compiled job lands here the same way: compilerStore's
+  // handleJobFinished copies the Rust engine's archive into OPFS via
+  // opfsMover, then calls setActiveRegion with the copied filename — no
+  // separate hot-swap path was needed for that pipeline.
   // ---------------------------------------------------------------------------
 
   useEffect(() => {

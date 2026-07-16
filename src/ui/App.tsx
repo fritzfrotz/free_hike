@@ -422,6 +422,11 @@ export default function App() {
       if (event.state !== 'yielded') {
         useCompilerStore.getState().setCompiling(false);
       }
+      if (event.state === 'finished') {
+        // Fire-and-forget: handleJobFinished owns its own error handling
+        // (this listener callback is synchronous, so nothing here can await it).
+        void useCompilerStore.getState().handleJobFinished(event.jobId);
+      }
     }).catch(() => null);
 
     return () => {

@@ -12,21 +12,25 @@
 //! to the tile's own bounds — buffered vertices legitimately land slightly
 //! outside `0..=4096`, which MVT expects (that's what the buffer is for).
 //!
-//! **Known simplification (P5.C1, logged):** a single layer `"features"`
-//! with the OSM way ID as feature id and no key/value attributes —
-//! `TileFeatures` persists geometry only. Styled layers (highway/waterway/
-//! natural classes) require Pass 2/3 to persist the matched tag; flagged as
-//! follow-up work in the LOOPLOG.
+//! **Layering (P5.C2):** features are grouped by their persisted layer
+//! index into one named MVT layer each (`highway`/`waterway`/`natural`/
+//! `landuse`, deterministic index order), and every feature carries a
+//! single `class` attribute — its layer tag's value (`highway=path` →
+//! layer `"highway"`, `class="path"`), encoded through the layer's
+//! `keys`/`values` pools with per-layer value dedup.
 
+use std::collections::{BTreeMap, HashMap};
+
+use pbf::tile::TileFeature;
 use prost::Message;
 
 /// The standard MVT tile extent: coordinates are quantized to a
 /// 4096×4096 integer grid per tile.
 pub const MVT_EXTENT: u32 = 4096;
 
-/// Layer name for all P5.C1 output (see module docs on the single-layer
-/// simplification). The client style must reference this source-layer.
-pub const LAYER_NAME: &str = "features";
+/// The one attribute key every layer carries (per-feature `class` = the
+/// layer tag's value). Client styles filter on `["get", "class"]`.
+pub const CLASS_KEY: &str = "class";
 
 const GEOM_TYPE_LINESTRING: i32 = 2;
 const CMD_MOVE_TO: u32 = 1;
@@ -104,79 +108,113 @@ fn quantize(merc: (f64, f64), origin: (f64, f64), scale: f64) -> (i64, i64) {
     (px, py)
 }
 
+/// Quantizes one feature's disjoint segments into an MVT geometry command
+/// stream. The cursor persists across ALL segments of one feature (spec:
+/// parameter deltas are relative to the previous point of the same
+/// feature, MoveTo included). Empty result = every segment degenerate.
+fn encode_geometry(segments: &[Vec<(f64, f64)>], origin: (f64, f64), scale: f64) -> Vec<u32> {
+    let mut geometry: Vec<u32> = Vec::new();
+    let mut cursor = (0i64, 0i64);
+
+    for seg in segments {
+        // Quantize, dropping consecutive duplicates: sub-pixel wiggle that
+        // collapses onto one grid point must not emit zero-length LineTo
+        // steps (spec forbids them).
+        let mut pts: Vec<(i64, i64)> = Vec::with_capacity(seg.len());
+        for &v in seg {
+            let p = quantize(v, origin, scale);
+            if pts.last() != Some(&p) {
+                pts.push(p);
+            }
+        }
+        if pts.len() < 2 {
+            continue; // degenerate after quantization
+        }
+
+        geometry.push(command(CMD_MOVE_TO, 1));
+        geometry.push(zigzag(pts[0].0 - cursor.0));
+        geometry.push(zigzag(pts[0].1 - cursor.1));
+        geometry.push(command(CMD_LINE_TO, (pts.len() - 1) as u32));
+        for pair in pts.windows(2) {
+            geometry.push(zigzag(pair[1].0 - pair[0].0));
+            geometry.push(zigzag(pair[1].1 - pair[0].1));
+        }
+        cursor = pts[pts.len() - 1];
+    }
+    geometry
+}
+
 /// Encodes one tile's features into an (uncompressed) MVT payload.
 ///
-/// `features` are `(way_id, disjoint segments)` in Web Mercator meters —
-/// [`pbf::tile::TileFeature`], exactly as decoded from the `TileFeatures`
-/// index. Returns `None` when nothing survives quantization (every segment
-/// degenerate) — the caller writes no archive entry for such a tile.
+/// `features` come straight from the `TileFeatures` index decode. They are
+/// grouped by layer index into one named MVT layer each (ascending index —
+/// deterministic output, which payload dedup and the engine's determinism
+/// proof rely on); each feature carries `tags = [0, v]` pointing at
+/// `keys[0] = "class"` and its deduped class string in the layer's value
+/// pool. Returns `None` when nothing survives quantization — the caller
+/// writes no archive entry for such a tile.
 pub fn encode_tile_mvt(
     zoom: u8,
     tile_x: u32,
     tile_y: u32,
-    features: &[pbf::tile::TileFeature],
+    features: &[TileFeature],
 ) -> Option<Vec<u8>> {
     let (min_x, _min_y, max_x, max_y) = geom::tile_bounds(zoom, tile_x, tile_y);
     let scale = f64::from(MVT_EXTENT) / (max_x - min_x);
     let origin = (min_x, max_y);
 
-    let mut out_features = Vec::with_capacity(features.len());
-    for (way_id, segments) in features {
-        let mut geometry: Vec<u32> = Vec::new();
-        // The cursor persists across ALL segments of one feature (spec:
-        // parameter deltas are relative to the previous point of the same
-        // feature, MoveTo included).
-        let mut cursor = (0i64, 0i64);
+    // Grouped by layer index; BTreeMap gives ascending-index layer order.
+    let mut layers: BTreeMap<u8, Layer> = BTreeMap::new();
+    // Per-layer class-string → value-pool index (first-seen order, so the
+    // pool itself stays deterministic).
+    let mut value_pool: HashMap<(u8, Vec<u8>), u32> = HashMap::new();
 
-        for seg in segments {
-            // Quantize, dropping consecutive duplicates: sub-pixel wiggle
-            // that collapses onto one grid point must not emit zero-length
-            // LineTo steps (spec forbids them).
-            let mut pts: Vec<(i64, i64)> = Vec::with_capacity(seg.len());
-            for &v in seg {
-                let p = quantize(v, origin, scale);
-                if pts.last() != Some(&p) {
-                    pts.push(p);
-                }
-            }
-            if pts.len() < 2 {
-                continue; // degenerate after quantization
-            }
-
-            geometry.push(command(CMD_MOVE_TO, 1));
-            geometry.push(zigzag(pts[0].0 - cursor.0));
-            geometry.push(zigzag(pts[0].1 - cursor.1));
-            geometry.push(command(CMD_LINE_TO, (pts.len() - 1) as u32));
-            for pair in pts.windows(2) {
-                geometry.push(zigzag(pair[1].0 - pair[0].0));
-                geometry.push(zigzag(pair[1].1 - pair[0].1));
-            }
-            cursor = pts[pts.len() - 1];
+    for feature in features {
+        let geometry = encode_geometry(&feature.segments, origin, scale);
+        if geometry.is_empty() {
+            continue;
         }
 
-        if !geometry.is_empty() {
-            out_features.push(Feature {
-                id: *way_id,
-                tags: Vec::new(),
-                geom_type: GEOM_TYPE_LINESTRING,
-                geometry,
-            });
-        }
-    }
-
-    if out_features.is_empty() {
-        return None;
-    }
-
-    let tile = Tile {
-        layers: vec![Layer {
+        // Layer indices come from decode_tile_segments, which rejects
+        // out-of-range values — reaching this expect means the index and
+        // the taxonomy went out of sync, which is a bug, not bad data.
+        let name =
+            pbf::layer_name(feature.layer).expect("layer index validated at TileFeatures decode");
+        let layer = layers.entry(feature.layer).or_insert_with(|| Layer {
             version: 2,
-            name: LAYER_NAME.to_string(),
-            features: out_features,
-            keys: Vec::new(),
+            name: name.to_string(),
+            features: Vec::new(),
+            keys: vec![CLASS_KEY.to_string()],
             values: Vec::new(),
             extent: MVT_EXTENT,
-        }],
+        });
+
+        let pool_key = (feature.layer, feature.class.clone());
+        let value_idx = match value_pool.get(&pool_key) {
+            Some(&idx) => idx,
+            None => {
+                let idx = layer.values.len() as u32;
+                layer.values.push(Value {
+                    string_value: Some(String::from_utf8_lossy(&feature.class).into_owned()),
+                });
+                value_pool.insert(pool_key, idx);
+                idx
+            }
+        };
+
+        layer.features.push(Feature {
+            id: feature.way_id,
+            tags: vec![0, value_idx],
+            geom_type: GEOM_TYPE_LINESTRING,
+            geometry,
+        });
+    }
+
+    if layers.is_empty() {
+        return None;
+    }
+    let tile = Tile {
+        layers: layers.into_values().collect(),
     };
     Some(tile.encode_to_vec())
 }
@@ -192,6 +230,16 @@ mod tests {
     const TX: u32 = 8703;
     const TY: u32 = 5747;
 
+    /// TileFeature shorthand for encoder tests.
+    fn feat(way_id: u64, layer: u8, class: &[u8], segments: Vec<Vec<(f64, f64)>>) -> TileFeature {
+        TileFeature {
+            way_id,
+            layer,
+            class: class.to_vec(),
+            segments,
+        }
+    }
+
     /// Web Mercator point that quantizes to exactly `(px, py)` tile-local.
     fn merc_at(px: f64, py: f64) -> (f64, f64) {
         let (min_x, _, max_x, max_y) = geom::tile_bounds(Z, TX, TY);
@@ -206,18 +254,25 @@ mod tests {
     #[test]
     fn commands_encode_moveto_lineto_zigzag() {
         let seg = vec![merc_at(10.0, 20.0), merc_at(15.0, 20.0), merc_at(15.0, 8.0)];
-        let payload = encode_tile_mvt(Z, TX, TY, &[(42, vec![seg])]).unwrap();
+        let payload = encode_tile_mvt(Z, TX, TY, &[feat(42, 0, b"path", vec![seg])]).unwrap();
         let tile = decode(&payload);
 
         assert_eq!(tile.layers.len(), 1);
         let layer = &tile.layers[0];
         assert_eq!(layer.version, 2);
-        assert_eq!(layer.name, LAYER_NAME);
+        assert_eq!(layer.name, "highway");
         assert_eq!(layer.extent, MVT_EXTENT);
-        assert!(layer.keys.is_empty() && layer.values.is_empty());
+        assert_eq!(layer.keys, vec![CLASS_KEY.to_string()]);
+        assert_eq!(
+            layer.values,
+            vec![Value {
+                string_value: Some("path".into())
+            }]
+        );
 
         let f = &layer.features[0];
         assert_eq!(f.id, 42);
+        assert_eq!(f.tags, vec![0, 0], "keys[0]=class, values[0]=path");
         assert_eq!(f.geom_type, GEOM_TYPE_LINESTRING);
         // MoveTo(1) (10,20); LineTo(2) (+5,0), (0,-12).
         assert_eq!(
@@ -239,7 +294,7 @@ mod tests {
     fn disjoint_segments_share_one_feature_cursor() {
         let s1 = vec![merc_at(0.0, 0.0), merc_at(4.0, 0.0)];
         let s2 = vec![merc_at(10.0, 10.0), merc_at(10.0, 14.0)];
-        let payload = encode_tile_mvt(Z, TX, TY, &[(7, vec![s1, s2])]).unwrap();
+        let payload = encode_tile_mvt(Z, TX, TY, &[feat(7, 0, b"path", vec![s1, s2])]).unwrap();
         let f = &decode(&payload).layers[0].features[0];
         // Second MoveTo is relative to the END of segment 1 at (4,0).
         assert_eq!(
@@ -266,7 +321,7 @@ mod tests {
     #[test]
     fn buffered_vertices_exceed_extent() {
         let seg = vec![merc_at(-30.0, 2000.0), merc_at(4120.0, 2000.0)];
-        let payload = encode_tile_mvt(Z, TX, TY, &[(1, vec![seg])]).unwrap();
+        let payload = encode_tile_mvt(Z, TX, TY, &[feat(1, 0, b"path", vec![seg])]).unwrap();
         let f = &decode(&payload).layers[0].features[0];
         assert_eq!(f.geometry[1], zigzag(-30));
         assert_eq!(f.geometry[4], zigzag(4150)); // delta from -30 to 4120
@@ -282,17 +337,106 @@ mod tests {
         let real = vec![merc_at(0.0, 0.0), merc_at(9.0, 0.0)];
 
         // Degenerate-only feature vanishes; the tile keeps the real one.
-        let payload =
-            encode_tile_mvt(Z, TX, TY, &[(1, vec![degenerate]), (2, vec![real])]).unwrap();
+        let payload = encode_tile_mvt(
+            Z,
+            TX,
+            TY,
+            &[
+                feat(1, 0, b"path", vec![degenerate]),
+                feat(2, 0, b"path", vec![real]),
+            ],
+        )
+        .unwrap();
         let layer = &decode(&payload).layers[0];
         assert_eq!(layer.features.len(), 1);
         assert_eq!(layer.features[0].id, 2);
+        assert_eq!(
+            layer.values.len(),
+            1,
+            "the dropped feature must not leak a value-pool entry"
+        );
     }
 
     #[test]
     fn all_degenerate_tile_encodes_none() {
         let p = merc_at(5.0, 5.0);
-        assert_eq!(encode_tile_mvt(Z, TX, TY, &[(1, vec![vec![p, p]])]), None);
+        assert_eq!(
+            encode_tile_mvt(Z, TX, TY, &[feat(1, 0, b"path", vec![vec![p, p]])]),
+            None
+        );
         assert_eq!(encode_tile_mvt(Z, TX, TY, &[]), None);
+    }
+
+    /// The P5.C2 core proof: features of different layers land in separate
+    /// named MVT layers, ordered by ascending layer index regardless of
+    /// input order.
+    #[test]
+    fn features_group_into_named_layers_in_index_order() {
+        let seg = |y: f64| vec![merc_at(0.0, y), merc_at(50.0, y)];
+        // Input order: natural, highway, waterway — output must be
+        // highway(0), waterway(1), natural(2).
+        let payload = encode_tile_mvt(
+            Z,
+            TX,
+            TY,
+            &[
+                feat(30, 2, b"wood", vec![seg(30.0)]),
+                feat(10, 0, b"path", vec![seg(10.0)]),
+                feat(20, 1, b"stream", vec![seg(20.0)]),
+            ],
+        )
+        .unwrap();
+        let tile = decode(&payload);
+
+        let names: Vec<&str> = tile.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["highway", "waterway", "natural"]);
+        for layer in &tile.layers {
+            assert_eq!(layer.version, 2);
+            assert_eq!(layer.keys, vec![CLASS_KEY.to_string()]);
+            assert_eq!(layer.features.len(), 1);
+            assert_eq!(layer.features[0].tags, vec![0, 0]);
+        }
+        assert_eq!(
+            tile.layers[2].values,
+            vec![Value {
+                string_value: Some("wood".into())
+            }]
+        );
+    }
+
+    /// Class strings dedup within a layer: two path features share one
+    /// value-pool entry; a third class appends a second entry.
+    #[test]
+    fn class_values_dedup_within_layer() {
+        let seg = |y: f64| vec![merc_at(0.0, y), merc_at(50.0, y)];
+        let payload = encode_tile_mvt(
+            Z,
+            TX,
+            TY,
+            &[
+                feat(1, 0, b"path", vec![seg(10.0)]),
+                feat(2, 0, b"track", vec![seg(20.0)]),
+                feat(3, 0, b"path", vec![seg(30.0)]),
+            ],
+        )
+        .unwrap();
+        let tile = decode(&payload);
+        assert_eq!(tile.layers.len(), 1);
+        let layer = &tile.layers[0];
+
+        assert_eq!(
+            layer.values,
+            vec![
+                Value {
+                    string_value: Some("path".into())
+                },
+                Value {
+                    string_value: Some("track".into())
+                },
+            ],
+            "first-seen order, no duplicates"
+        );
+        let tags: Vec<&Vec<u32>> = layer.features.iter().map(|f| &f.tags).collect();
+        assert_eq!(tags, vec![&vec![0, 0], &vec![0, 1], &vec![0, 0]]);
     }
 }

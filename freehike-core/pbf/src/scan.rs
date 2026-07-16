@@ -19,8 +19,8 @@ use prost::Message;
 
 use crate::proto::{Blob, BlobHeader, PrimitiveBlock, StringTable, StringTableProbe, WayBlock};
 use crate::{
-    insert_coords_batched, insert_ways_batched, web_mercator, IndexError, PbfMmap,
-    DEFAULT_BATCH_SIZE,
+    insert_coords_batched, insert_ways_batched, web_mercator, IndexError, IndexedWay, PbfMmap,
+    DEFAULT_BATCH_SIZE, LAYER_KEYS,
 };
 
 /// Spec: the serialized BlobHeader "must be less than 64 KiB".
@@ -262,9 +262,18 @@ fn decompress_blob(blob_bytes: &[u8], offset: usize) -> Result<Vec<u8>, IndexErr
 /// Tag keys that make a block semantically relevant to the hiking pipeline,
 /// per the Blueprint ("sac_scale for trail difficulty, highway for paths,
 /// waterway for streams, or contour-related tags") and the architecture plan
-/// (research/, Phase 3/4).
-pub const RELEVANT_TAG_KEYS: &[&[u8]] =
-    &[b"highway", b"sac_scale", b"waterway", b"natural", b"ele"];
+/// (research/, Phase 3/4). Superset of [`crate::LAYER_KEYS`]: this list gates
+/// BLOCKS (conservative — a sac_scale-bearing block is worth deserializing),
+/// while the way-level keep-filter requires an actual layer key (P5.C2 —
+/// un-layered geometry cannot be styled and no longer has a storage form).
+pub const RELEVANT_TAG_KEYS: &[&[u8]] = &[
+    b"highway",
+    b"sac_scale",
+    b"waterway",
+    b"natural",
+    b"ele",
+    b"landuse",
+];
 
 /// True when `block`'s StringTable contains at least one hiking-relevant tag
 /// key — the Blueprint's pre-filter for skipping a block "without incurring
@@ -424,12 +433,17 @@ pub fn run_pass1_slice(
 // ---------------------------------------------------------------------------
 
 /// Extracts renderable ways from a pre-filter-surviving block: keeps a way
-/// iff at least one of its tag keys resolves (via the StringTable) to a
-/// member of [`RELEVANT_TAG_KEYS`], then delta-decodes its node refs.
+/// iff one of its tag keys resolves (via the StringTable) to a member of
+/// [`crate::LAYER_KEYS`], resolving the way's `(layer, class)` from the
+/// highest-priority matching key, then delta-decodes its node refs.
 /// Degenerate ways (< 2 refs) are dropped — they cannot form geometry.
+///
+/// `keys`/`vals` are parallel arrays per the OSM wire spec; a length
+/// mismatch, an index outside the StringTable, or a non-UTF-8 class value
+/// are typed corruption errors (stringtable strings are UTF-8 by spec).
 pub fn extract_relevant_ways(
     block: &WayBlock,
-    out: &mut Vec<(u64, Vec<u64>)>,
+    out: &mut Vec<IndexedWay>,
 ) -> Result<u64, IndexError> {
     let Some(st) = block.stringtable.as_ref() else {
         return Ok(0); // no stringtable → no resolvable tags → nothing renderable
@@ -437,8 +451,19 @@ pub fn extract_relevant_ways(
     let mut extracted = 0u64;
     for group in &block.primitivegroup {
         for way in &group.ways {
-            let mut relevant = false;
-            for &key_idx in &way.keys {
+            if way.keys.len() != way.vals.len() {
+                return Err(IndexError::InvalidInput(format!(
+                    "corrupted way {}: {} keys but {} vals (parallel arrays)",
+                    way.id,
+                    way.keys.len(),
+                    way.vals.len()
+                )));
+            }
+
+            // Highest-priority layer key wins (e.g. highway over natural on
+            // a way carrying both).
+            let mut best: Option<(u8, u32)> = None; // (layer idx, val idx)
+            for (&key_idx, &val_idx) in way.keys.iter().zip(&way.vals) {
                 let key = st.s.get(key_idx as usize).ok_or_else(|| {
                     IndexError::InvalidInput(format!(
                         "corrupted way {}: key index {key_idx} outside StringTable (len {})",
@@ -446,13 +471,32 @@ pub fn extract_relevant_ways(
                         st.s.len()
                     ))
                 })?;
-                if RELEVANT_TAG_KEYS.contains(&key.as_slice()) {
-                    relevant = true;
-                    break;
+                if let Some(layer) = LAYER_KEYS.iter().position(|k| *k == key.as_slice()) {
+                    let layer = layer as u8;
+                    if best.is_none_or(|(l, _)| layer < l) {
+                        best = Some((layer, val_idx));
+                    }
                 }
             }
-            if !relevant || way.refs.len() < 2 {
+            let Some((layer, val_idx)) = best else {
+                continue; // no layer key → not styleable → dropped
+            };
+            if way.refs.len() < 2 {
                 continue;
+            }
+
+            let class = st.s.get(val_idx as usize).ok_or_else(|| {
+                IndexError::InvalidInput(format!(
+                    "corrupted way {}: value index {val_idx} outside StringTable (len {})",
+                    way.id,
+                    st.s.len()
+                ))
+            })?;
+            if std::str::from_utf8(class).is_err() {
+                return Err(IndexError::InvalidInput(format!(
+                    "corrupted way {}: non-UTF-8 tag value in StringTable",
+                    way.id
+                )));
             }
 
             let way_id = u64::try_from(way.id).map_err(|_| {
@@ -472,7 +516,12 @@ pub fn extract_relevant_ways(
                 })?;
                 refs.push(id);
             }
-            out.push((way_id, refs));
+            out.push(IndexedWay {
+                id: way_id,
+                layer,
+                class: class.clone(),
+                refs,
+            });
             extracted += 1;
         }
     }
@@ -507,7 +556,7 @@ pub fn run_pass2_slice(
     should_yield: &mut dyn FnMut() -> bool,
 ) -> Result<Pass2Slice, IndexError> {
     let mut scanner = BlockScanner::resume(pbf, resume_offset);
-    let mut buffer: Vec<(u64, Vec<u64>)> = Vec::new();
+    let mut buffer: Vec<IndexedWay> = Vec::new();
     let mut ways_indexed = 0u64;
     let mut blocks_scanned = 0u32;
     let mut blocks_prefiltered = 0u32;
@@ -861,18 +910,22 @@ mod tests {
     // -- Pass 2: way extraction + geometry assembly -----------------------
 
     use crate::fixtures::{synthetic_pbf_with_ways, FixtureWay};
-    use crate::{assemble_way_geometry, get_way_refs, insert_ways_batched};
+    use crate::{assemble_way_geometry, get_way_refs, insert_ways_batched, IndexedWay};
 
     /// Nodes 1000/1005/900 (GROUP_A) + ways over them. Way 501 is tagged
     /// `building` — present in the StringTable but NOT a relevant key, so the
     /// block survives the pre-filter while the way itself is dropped.
+    /// Way 503 is tagged `sac_scale` only: its key keeps the BLOCK relevant
+    /// (prefilter) but carries no LAYER key, so the way itself is dropped —
+    /// the P5.C2 tightened keep-rule.
     const WAYS_RELEVANT: &[FixtureWay<'static>] = &[
-        (500, b"highway", &[1_000, 1_005, 900]),
-        (501, b"building", &[1_000, 900]),
-        (502, b"waterway", &[900, 1_005]),
+        (500, b"highway", b"path", &[1_000, 1_005, 900]),
+        (501, b"building", b"yes", &[1_000, 900]),
+        (502, b"waterway", b"stream", &[900, 1_005]),
+        (503, b"sac_scale", b"hiking", &[1_000, 900]),
     ];
     /// A block whose StringTable holds no relevant key at all → prefiltered.
-    const WAYS_IRRELEVANT: &[FixtureWay<'static>] = &[(600, b"created_by", &[1_000, 900])];
+    const WAYS_IRRELEVANT: &[FixtureWay<'static>] = &[(600, b"created_by", b"JOSM", &[1_000, 900])];
 
     fn indexed_fixture(dir: &std::path::Path) -> (PbfMmap, redb::Database) {
         let path = dir.join("two-pass.osm.pbf");
@@ -902,7 +955,8 @@ mod tests {
         // prefiltered: the node block (empty stringtable) + WAYS_IRRELEVANT.
         assert_eq!(s.blocks_scanned, 4);
         assert_eq!(s.blocks_prefiltered, 2);
-        // Ways 500 + 502 kept; 501 (building) tag-filtered; 600 prefiltered.
+        // Ways 500 + 502 kept; 501 (building) tag-filtered; 503 (sac_scale
+        // only — no layer key) dropped by the P5.C2 rule; 600 prefiltered.
         assert_eq!(s.ways_indexed, 2);
 
         assert_eq!(
@@ -911,7 +965,63 @@ mod tests {
         );
         assert_eq!(get_way_refs(&db, 502).unwrap(), Some(vec![900, 1_005]));
         assert_eq!(get_way_refs(&db, 501).unwrap(), None, "building filtered");
+        assert_eq!(get_way_refs(&db, 503).unwrap(), None, "no layer key");
         assert_eq!(get_way_refs(&db, 600).unwrap(), None, "block prefiltered");
+
+        // Tag metadata persisted in the same transaction as the refs.
+        assert_eq!(
+            crate::get_way_tags(&db, 500).unwrap(),
+            Some((0, b"path".to_vec())),
+            "highway=path"
+        );
+        assert_eq!(
+            crate::get_way_tags(&db, 502).unwrap(),
+            Some((1, b"stream".to_vec())),
+            "waterway=stream"
+        );
+        assert_eq!(crate::get_way_tags(&db, 501).unwrap(), None);
+    }
+
+    /// A way carrying multiple layer keys resolves to the highest-priority
+    /// one (highway wins over natural), and landuse is now a keeper.
+    #[test]
+    fn pass2_layer_priority_and_landuse() {
+        use crate::proto::{Way, WayGroup};
+        let block = WayBlock {
+            stringtable: Some(StringTable {
+                s: vec![
+                    b"".to_vec(),
+                    b"natural".to_vec(),
+                    b"wood".to_vec(),
+                    b"highway".to_vec(),
+                    b"track".to_vec(),
+                    b"landuse".to_vec(),
+                    b"meadow".to_vec(),
+                ],
+            }),
+            primitivegroup: vec![WayGroup {
+                ways: vec![
+                    // natural=wood AND highway=track → highway (priority 0).
+                    Way {
+                        id: 1,
+                        keys: vec![1, 3],
+                        vals: vec![2, 4],
+                        refs: vec![10, 1],
+                    },
+                    // landuse=meadow → kept as layer 3.
+                    Way {
+                        id: 2,
+                        keys: vec![5],
+                        vals: vec![6],
+                        refs: vec![20, 1],
+                    },
+                ],
+            }],
+        };
+        let mut out = Vec::new();
+        assert_eq!(extract_relevant_ways(&block, &mut out).unwrap(), 2);
+        assert_eq!((out[0].layer, out[0].class.as_slice()), (0, &b"track"[..]));
+        assert_eq!((out[1].layer, out[1].class.as_slice()), (3, &b"meadow"[..]));
     }
 
     #[test]
@@ -970,12 +1080,18 @@ mod tests {
 
         // Ways with refs partially outside the extract (nodes never indexed)
         // — the clipped-extract reality at bbox edges.
+        let hw = |id: u64, refs: Vec<u64>| IndexedWay {
+            id,
+            layer: 0,
+            class: b"path".to_vec(),
+            refs,
+        };
         insert_ways_batched(
             &db,
             [
-                (700u64, vec![1_000u64, 77_777, 1_005]), // 1 missing mid-way
-                (701u64, vec![88_888u64, 99_999]),       // all missing
-                (702u64, vec![1_000u64, 55_555]),        // only 1 resolvable
+                hw(700, vec![1_000, 77_777, 1_005]), // 1 missing mid-way
+                hw(701, vec![88_888, 99_999]),       // all missing
+                hw(702, vec![1_000, 55_555]),        // only 1 resolvable
             ],
             DEFAULT_BATCH_SIZE,
         )
@@ -1008,12 +1124,13 @@ mod tests {
         // Key index pointing outside the StringTable.
         let mut bad = WayBlock {
             stringtable: Some(StringTable {
-                s: vec![b"".to_vec(), b"highway".to_vec()],
+                s: vec![b"".to_vec(), b"highway".to_vec(), b"path".to_vec()],
             }),
             primitivegroup: vec![crate::proto::WayGroup {
                 ways: vec![crate::proto::Way {
                     id: 1,
                     keys: vec![9],
+                    vals: vec![2],
                     refs: vec![10, 1],
                 }],
             }],
@@ -1024,8 +1141,24 @@ mod tests {
             Err(IndexError::InvalidInput(_))
         ));
 
-        // Negative ref after delta accumulation.
+        // keys/vals parallel-array length mismatch.
         bad.primitivegroup[0].ways[0].keys = vec![1];
+        bad.primitivegroup[0].ways[0].vals = vec![];
+        assert!(matches!(
+            extract_relevant_ways(&bad, &mut out),
+            Err(IndexError::InvalidInput(_))
+        ));
+
+        // Value index pointing outside the StringTable (on a layer key,
+        // so the value actually gets resolved).
+        bad.primitivegroup[0].ways[0].vals = vec![9];
+        assert!(matches!(
+            extract_relevant_ways(&bad, &mut out),
+            Err(IndexError::InvalidInput(_))
+        ));
+
+        // Negative ref after delta accumulation.
+        bad.primitivegroup[0].ways[0].vals = vec![2];
         bad.primitivegroup[0].ways[0].refs = vec![10, -100];
         assert!(matches!(
             extract_relevant_ways(&bad, &mut out),
@@ -1035,6 +1168,14 @@ mod tests {
         // Negative way id.
         bad.primitivegroup[0].ways[0].id = -5;
         bad.primitivegroup[0].ways[0].refs = vec![10, 1];
+        assert!(matches!(
+            extract_relevant_ways(&bad, &mut out),
+            Err(IndexError::InvalidInput(_))
+        ));
+
+        // Non-UTF-8 tag value on a layer key.
+        bad.primitivegroup[0].ways[0].id = 7;
+        bad.stringtable.as_mut().unwrap().s[2] = vec![0xff, 0xfe];
         assert!(matches!(
             extract_relevant_ways(&bad, &mut out),
             Err(IndexError::InvalidInput(_))

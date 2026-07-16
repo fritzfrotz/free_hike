@@ -35,11 +35,11 @@ use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
 };
 
-use pbf::tile::{decode_tile_segments, BASE_TILE_ZOOM, TILE_FEATURES};
+use pbf::tile::{decode_tile_segments, TileFeature, BASE_TILE_ZOOM, TILE_FEATURES};
 use pbf::IndexError;
 
 use crate::hilbert::{tile_id, tile_id_to_zxy};
-use crate::mvt::{encode_tile_mvt, LAYER_NAME};
+use crate::mvt::encode_tile_mvt;
 use crate::pmtiles::{encode_header, gzip, serialize_directory, DirEntry, Header, HEADER_BYTES};
 
 /// Finalize bookkeeping: PMTiles tile ID → `(offset, length)` of the
@@ -246,7 +246,17 @@ pub fn run_finalize_encode_slice(
             };
             let (key, value) = first.map_err(db_err)?;
             let (z, x, y, first_way) = key.value();
-            let mut feats = vec![(first_way, decode_tile_segments(value.value())?)];
+            let decode_feature =
+                |way_id: u64, bytes: &[u8]| -> Result<TileFeature, FinalizeError> {
+                    let (layer, class, segments) = decode_tile_segments(bytes)?;
+                    Ok(TileFeature {
+                        way_id,
+                        layer,
+                        class,
+                        segments,
+                    })
+                };
+            let mut feats = vec![decode_feature(first_way, value.value())?];
             loop {
                 let same_tile = match rows.peek() {
                     Some(Ok((pk, _))) => {
@@ -262,7 +272,7 @@ pub fn run_finalize_encode_slice(
                 }
                 let (k2, v2) = rows.next().expect("peeked").map_err(db_err)?;
                 let (_, _, _, way) = k2.value();
-                feats.push((way, decode_tile_segments(v2.value())?));
+                feats.push(decode_feature(way, v2.value())?);
             }
 
             // ---- Encode, dedup, append -----------------------------------
@@ -406,9 +416,22 @@ pub fn assemble_archive(
     }
 
     let root_dir = gzip(&serialize_directory(&dir));
+    // TileJSON vector_layers: one entry per taxonomy layer, each carrying
+    // the per-feature `class` attribute (P5.C2). Listing all four
+    // unconditionally is deliberate — styles reference them statically and
+    // an absent layer simply yields no features.
+    let vector_layers = (0..pbf::LAYER_KEYS.len() as u8)
+        .map(|i| {
+            let name = pbf::layer_name(i).expect("taxonomy index");
+            format!(
+                r#"{{"id":"{name}","fields":{{"class":"String"}},"minzoom":{min_zoom},"maxzoom":{max_zoom}}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let metadata = gzip(
         format!(
-            r#"{{"name":"freehike-basemap","format":"pbf","vector_layers":[{{"id":"{LAYER_NAME}","fields":{{}},"minzoom":{min_zoom},"maxzoom":{max_zoom}}}]}}"#
+            r#"{{"name":"freehike-basemap","format":"pbf","vector_layers":[{vector_layers}]}}"#
         )
         .as_bytes(),
     );
@@ -511,8 +534,9 @@ mod tests {
     }
 
     /// Seeds the dummy rows the directive's integration test requires:
-    /// three z14 tiles; tiles A and B carry way 42 at identical tile-local
-    /// geometry (dedup pair), tile C carries way 7 at different geometry.
+    /// three z14 tiles; tiles A and B carry highway-way 42 at identical
+    /// tile-local geometry AND identical tags (dedup pair), tile C carries
+    /// waterway-way 7 — a second MVT layer, proving the per-layer readback.
     fn seed_dummy_rows(db: &Database) -> [(u8, u32, u32); 3] {
         let a = (BASE_TILE_ZOOM, 8703u32, 5747u32);
         let b = (BASE_TILE_ZOOM, 8704u32, 5747u32);
@@ -522,15 +546,15 @@ mod tests {
         let rows = vec![
             (
                 (a.0, a.1, a.2, 42u64),
-                encode_tile_segments(&[local_segment(a.0, a.1, a.2, &line)]),
+                encode_tile_segments(0, b"path", &[local_segment(a.0, a.1, a.2, &line)]),
             ),
             (
                 (b.0, b.1, b.2, 42u64),
-                encode_tile_segments(&[local_segment(b.0, b.1, b.2, &line)]),
+                encode_tile_segments(0, b"path", &[local_segment(b.0, b.1, b.2, &line)]),
             ),
             (
                 (c.0, c.1, c.2, 7u64),
-                encode_tile_segments(&[local_segment(c.0, c.1, c.2, &other)]),
+                encode_tile_segments(1, b"stream", &[local_segment(c.0, c.1, c.2, &other)]),
             ),
         ];
         insert_tile_features_batched(db, rows, 100).unwrap();
@@ -646,15 +670,34 @@ mod tests {
         let eb = e_by_id(tile_id(tiles[1].0, tiles[1].1, tiles[1].2));
         assert_eq!((ea.offset, ea.length), (eb.offset, eb.length));
 
-        // Every payload gunzips and prost-decodes to our layer.
+        // Every payload gunzips and prost-decodes to exactly one NAMED
+        // layer with the class attribute wired through keys/values/tags
+        // (P5.C2). Tiles A/B are highway=path; tile C is waterway=stream.
+        let c_id = tile_id(tiles[2].0, tiles[2].1, tiles[2].2);
         for e in &entries {
             let start = (h.data.0 + e.offset) as usize;
             let payload = gunzip(&bytes[start..start + e.length as usize]);
             let tile = Tile::decode(payload.as_slice()).unwrap();
             assert_eq!(tile.layers.len(), 1);
-            assert_eq!(tile.layers[0].name, LAYER_NAME);
-            assert_eq!(tile.layers[0].extent, MVT_EXTENT);
-            assert!(!tile.layers[0].features.is_empty());
+            let layer = &tile.layers[0];
+            let (want_name, want_class) = if e.tile_id == c_id {
+                ("waterway", "stream")
+            } else {
+                ("highway", "path")
+            };
+            assert_eq!(layer.name, want_name);
+            assert_eq!(layer.extent, MVT_EXTENT);
+            assert_eq!(layer.keys, vec!["class".to_string()]);
+            assert_eq!(
+                layer.values[0].string_value.as_deref(),
+                Some(want_class),
+                "tile {} class",
+                e.tile_id
+            );
+            assert!(!layer.features.is_empty());
+            for f in &layer.features {
+                assert_eq!(f.tags, vec![0, 0], "class attribute via tags");
+            }
         }
 
         // Clustered invariant: first-occurrence offsets ascend with tile ID.
@@ -666,10 +709,19 @@ mod tests {
             } // else: dedup back-reference, allowed by the clustered spec
         }
 
-        // Metadata section is valid gzip'd JSON naming our layer.
+        // Metadata section is valid gzip'd JSON declaring all four taxonomy
+        // layers with the class field.
         let meta = gunzip(&bytes[h.metadata.0 as usize..(h.metadata.0 + h.metadata.1) as usize]);
         let meta = String::from_utf8(meta).unwrap();
-        assert!(meta.contains(r#""vector_layers""#) && meta.contains(LAYER_NAME));
+        assert!(meta.contains(r#""vector_layers""#));
+        for i in 0..pbf::LAYER_KEYS.len() as u8 {
+            let name = pbf::layer_name(i).unwrap();
+            assert!(
+                meta.contains(&format!(r#""id":"{name}""#)),
+                "metadata must declare layer {name}: {meta}"
+            );
+        }
+        assert!(meta.contains(r#""class":"String""#));
     }
 
     #[test]

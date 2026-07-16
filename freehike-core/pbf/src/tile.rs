@@ -19,7 +19,8 @@ use std::collections::BTreeSet;
 use redb::{Database, ReadableDatabase, TableDefinition, TableError};
 
 use crate::{
-    assemble_way_geometry, db_err, push_varint, read_varint, IndexError, DEFAULT_BATCH_SIZE, WAYS,
+    assemble_way_geometry, db_err, get_way_tags, layer_name, push_varint, read_varint, IndexError,
+    DEFAULT_BATCH_SIZE, WAYS,
 };
 
 /// Pass-3 tile index: `(zoom, tile_x, tile_y, way_id)` → encoded disjoint
@@ -53,14 +54,21 @@ pub fn tile_clip_bounds(zoom: u8, tx: u32, ty: u32) -> (f64, f64, f64, f64) {
 // Segment serialization (the TILE_FEATURES value format)
 // ---------------------------------------------------------------------------
 
-/// Encodes clipped disjoint segments as
-/// `varint(n_segments) [varint(n_vertices) (x: f64 LE, y: f64 LE)...]...`.
+/// Encodes a feature's tag metadata + clipped disjoint segments (format v2,
+/// P5.C2) as
+/// `u8 layer | varint(class_len) class-bytes |
+///  varint(n_segments) [varint(n_vertices) (x: f64 LE, y: f64 LE)...]...`.
+/// The `(layer, class)` pair is denormalized from `WayTags` into every row
+/// (bytes on disk, not RAM) so the Finalize drain stays a single-table scan.
 /// Coordinates stay full-precision f64 Web Mercator meters — quantization
 /// to the tile-local integer grid belongs to the MVT encode stage, not the
 /// index.
-pub fn encode_tile_segments(segments: &[Vec<(f64, f64)>]) -> Vec<u8> {
+pub fn encode_tile_segments(layer: u8, class: &[u8], segments: &[Vec<(f64, f64)>]) -> Vec<u8> {
     let n_vertices: usize = segments.iter().map(Vec::len).sum();
-    let mut out = Vec::with_capacity(2 + 2 * segments.len() + 16 * n_vertices);
+    let mut out = Vec::with_capacity(4 + class.len() + 2 * segments.len() + 16 * n_vertices);
+    out.push(layer);
+    push_varint(&mut out, class.len() as u64);
+    out.extend_from_slice(class);
     push_varint(&mut out, segments.len() as u64);
     for seg in segments {
         push_varint(&mut out, seg.len() as u64);
@@ -72,13 +80,30 @@ pub fn encode_tile_segments(segments: &[Vec<(f64, f64)>]) -> Vec<u8> {
     out
 }
 
-/// Decodes a [`TILE_FEATURES`] value back into disjoint segments. Truncated
-/// or trailing bytes are typed errors — a torn value must never silently
+/// Decoded [`TILE_FEATURES`] value: `(layer, class, disjoint segments)`.
+pub type DecodedTileSegments = (u8, Vec<u8>, Vec<Vec<(f64, f64)>>);
+
+/// Decodes a [`TILE_FEATURES`] value back into tag metadata + disjoint
+/// segments. Truncated or trailing bytes, an out-of-range layer index, and
+/// hostile lengths are typed errors — a torn value must never silently
 /// decode into wrong geometry.
-pub fn decode_tile_segments(bytes: &[u8]) -> Result<Vec<Vec<(f64, f64)>>, IndexError> {
+pub fn decode_tile_segments(bytes: &[u8]) -> Result<DecodedTileSegments, IndexError> {
     let corrupt = |what: &str| IndexError::InvalidInput(format!("corrupted tile feature: {what}"));
 
     let mut pos = 0usize;
+    let &layer = bytes.first().ok_or_else(|| corrupt("empty value"))?;
+    pos += 1;
+    if layer_name(layer).is_none() {
+        return Err(corrupt("layer index out of range"));
+    }
+    let class_len = read_varint(bytes, &mut pos)?;
+    let class_len = usize::try_from(class_len)
+        .ok()
+        .filter(|n| bytes.len() - pos >= *n)
+        .ok_or_else(|| corrupt("class length exceeds payload"))?;
+    let class = bytes[pos..pos + class_len].to_vec();
+    pos += class_len;
+
     let n_segments = read_varint(bytes, &mut pos)?;
     // Each declared segment costs at least 1 length byte: a count larger
     // than the remaining bytes is corruption, caught before any allocation.
@@ -108,7 +133,7 @@ pub fn decode_tile_segments(bytes: &[u8]) -> Result<Vec<Vec<(f64, f64)>>, IndexE
     if pos != bytes.len() {
         return Err(corrupt("trailing bytes after last segment"));
     }
-    Ok(segments)
+    Ok((layer, class, segments))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,9 +184,18 @@ where
     Ok(total)
 }
 
-/// One decoded feature read back from a tile: the way ID and its clipped
-/// disjoint segments.
-pub type TileFeature = (u64, Vec<Vec<(f64, f64)>>);
+/// One decoded feature read back from a tile: identity, its rendering
+/// layer/class (see [`crate::LAYER_KEYS`]), and its clipped disjoint
+/// segments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TileFeature {
+    pub way_id: u64,
+    /// Index into [`crate::LAYER_KEYS`] — resolve via [`crate::layer_name`].
+    pub layer: u8,
+    /// Raw class bytes (the layer tag's value, validated UTF-8).
+    pub class: Vec<u8>,
+    pub segments: Vec<Vec<(f64, f64)>>,
+}
 
 /// All features binned into tile `(zoom, tx, ty)`, in ascending way order.
 /// `Ok(empty)` for an untouched tile or a not-yet-created table.
@@ -184,7 +218,13 @@ pub fn get_tile_features(
     for entry in range {
         let (key, value) = entry.map_err(db_err)?;
         let (_, _, _, way_id) = key.value();
-        out.push((way_id, decode_tile_segments(value.value())?));
+        let (layer, class, segments) = decode_tile_segments(value.value())?;
+        out.push(TileFeature {
+            way_id,
+            layer,
+            class,
+            segments,
+        });
     }
     Ok(out)
 }
@@ -214,8 +254,15 @@ pub struct Pass3Slice {
 /// continent-diagonal bounding-box blowup), dilates by one ring so tiles
 /// whose *buffer* the way merely grazes are also considered, then clips to
 /// each candidate's buffered box. Tiles where the clip degenerates to
-/// nothing produce no row.
-fn bin_way(way_id: u64, simplified: &[(f64, f64)], sink: &mut Vec<PendingFeature>) {
+/// nothing produce no row. The way's `(layer, class)` tag metadata is
+/// denormalized into every row written (format v2).
+fn bin_way(
+    way_id: u64,
+    layer: u8,
+    class: &[u8],
+    simplified: &[(f64, f64)],
+    sink: &mut Vec<PendingFeature>,
+) {
     let mut crossed: BTreeSet<(u32, u32)> = BTreeSet::new();
     for pair in simplified.windows(2) {
         geom::tiles_crossed_by_segment(pair[0], pair[1], BASE_TILE_ZOOM, &mut crossed);
@@ -245,7 +292,7 @@ fn bin_way(way_id: u64, simplified: &[(f64, f64)], sink: &mut Vec<PendingFeature
         if !clipped.is_empty() {
             sink.push((
                 (BASE_TILE_ZOOM, tx, ty, way_id),
-                encode_tile_segments(&clipped),
+                encode_tile_segments(layer, class, &clipped),
             ));
         }
     }
@@ -301,8 +348,18 @@ pub fn run_pass3_slice(
         // Transient join: the linestring lives exactly as long as this
         // iteration (50MB-ceiling posture).
         if let Some(line) = assemble_way_geometry(db, way_id)? {
+            // Pass 2 writes WAYS and WAY_TAGS in one transaction, so a refs
+            // row without a tags row means the index predates P5.C2 —
+            // refuse rather than emit un-layered geometry (same posture as
+            // an unsupported checkpoint version).
+            let (layer, class) = get_way_tags(db, way_id)?.ok_or_else(|| {
+                IndexError::InvalidInput(format!(
+                    "way {way_id} has refs but no tag record — index written by an \
+                     incompatible pipeline version"
+                ))
+            })?;
             let simplified = geom::simplify_rdp(&line, epsilon);
-            bin_way(way_id, &simplified, &mut buffer);
+            bin_way(way_id, layer, &class, &simplified, &mut buffer);
         }
         last_way_id = way_id;
         ways_binned += 1;
@@ -334,7 +391,7 @@ pub fn run_pass3_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{insert_coords_batched, insert_ways_batched, open_coord_db};
+    use crate::{insert_coords_batched, insert_ways_batched, open_coord_db, IndexedWay};
     use std::fs;
     use std::path::PathBuf;
 
@@ -346,24 +403,41 @@ mod tests {
         d
     }
 
+    /// A default-tagged (`highway=path`) way for binning tests that don't
+    /// exercise tag variety themselves.
+    fn hw(id: u64, refs: Vec<u64>) -> IndexedWay {
+        IndexedWay {
+            id,
+            layer: 0,
+            class: b"path".to_vec(),
+            refs,
+        }
+    }
+
     // -- serialization -----------------------------------------------------
 
     #[test]
     fn tile_segments_roundtrip() {
-        let cases: Vec<Vec<Vec<(f64, f64)>>> = vec![
-            vec![],
-            vec![vec![(0.0, 0.0), (1.5, -2.5)]],
-            vec![
-                vec![(1_268_000.25, 5_988_000.75), (1_268_100.0, 5_988_100.0)],
-                vec![(-1.0, -2.0), (-3.0, -4.0), (-5.0, -6.0)],
-            ],
+        type Case = (u8, &'static [u8], Vec<Vec<(f64, f64)>>);
+        let cases: Vec<Case> = vec![
+            (0, b"path", vec![]),
+            (1, b"stream", vec![vec![(0.0, 0.0), (1.5, -2.5)]]),
+            (3, b"", vec![vec![(0.0, 0.0), (1.0, 1.0)]]), // empty class survives
+            (
+                2,
+                b"wood",
+                vec![
+                    vec![(1_268_000.25, 5_988_000.75), (1_268_100.0, 5_988_100.0)],
+                    vec![(-1.0, -2.0), (-3.0, -4.0), (-5.0, -6.0)],
+                ],
+            ),
         ];
-        for segments in cases {
-            let encoded = encode_tile_segments(&segments);
+        for (layer, class, segments) in cases {
+            let encoded = encode_tile_segments(layer, class, &segments);
             assert_eq!(
                 decode_tile_segments(&encoded).unwrap(),
-                segments,
-                "roundtrip {segments:?}"
+                (layer, class.to_vec(), segments.clone()),
+                "roundtrip layer={layer} class={class:?} {segments:?}"
             );
         }
     }
@@ -371,7 +445,7 @@ mod tests {
     #[test]
     fn tile_segments_reject_garbage() {
         // Truncated mid-vertex.
-        let full = encode_tile_segments(&[vec![(1.0, 2.0), (3.0, 4.0)]]);
+        let full = encode_tile_segments(0, b"path", &[vec![(1.0, 2.0), (3.0, 4.0)]]);
         assert!(matches!(
             decode_tile_segments(&full[..full.len() - 5]),
             Err(IndexError::InvalidInput(_))
@@ -383,12 +457,24 @@ mod tests {
             decode_tile_segments(&padded),
             Err(IndexError::InvalidInput(_))
         ));
-        // Hostile segment count with no data behind it.
+        // Layer index outside LAYER_KEYS.
+        let mut bad_layer = full.clone();
+        bad_layer[0] = 9;
         assert!(matches!(
-            decode_tile_segments(&[0xff, 0xff, 0xff, 0x7f]),
+            decode_tile_segments(&bad_layer),
             Err(IndexError::InvalidInput(_))
         ));
-        // Empty input (not even a count).
+        // Hostile class length with no bytes behind it.
+        assert!(matches!(
+            decode_tile_segments(&[0, 0xff, 0xff, 0xff, 0x7f]),
+            Err(IndexError::InvalidInput(_))
+        ));
+        // Hostile segment count with no data behind it (valid layer+class).
+        assert!(matches!(
+            decode_tile_segments(&[0, 0, 0xff, 0xff, 0xff, 0x7f]),
+            Err(IndexError::InvalidInput(_))
+        ));
+        // Empty input (not even a layer byte).
         assert!(matches!(
             decode_tile_segments(&[]),
             Err(IndexError::InvalidInput(_))
@@ -425,7 +511,7 @@ mod tests {
         let a = (-0.4 * e, -0.5 * e);
         let z = (0.4 * e, -0.5 * e);
         insert_coords_batched(&db, [(1u64, a), (2u64, z)], DEFAULT_BATCH_SIZE).unwrap();
-        insert_ways_batched(&db, [(77u64, vec![1u64, 2])], DEFAULT_BATCH_SIZE).unwrap();
+        insert_ways_batched(&db, [hw(77, vec![1, 2])], DEFAULT_BATCH_SIZE).unwrap();
 
         let s = run_pass3_slice(&db, 0, &mut || false).unwrap();
         assert!(s.finished);
@@ -443,20 +529,42 @@ mod tests {
             );
         };
 
-        // Left tile: from the way's start to the buffered boundary.
+        // Left tile: from the way's start to the buffered boundary. The tag
+        // metadata must survive the clip into BOTH tiles (P5.C2).
         let left = get_tile_features(&db, BASE_TILE_ZOOM, tx - 1, ty).unwrap();
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].0, 77);
-        assert_eq!(left[0].1.len(), 1, "one contiguous run in the left tile");
-        assert_eq!(left[0].1[0].first(), Some(&a), "start survives unclipped");
-        approx(*left[0].1[0].last().unwrap(), (b, -0.5 * e));
+        assert_eq!(left[0].way_id, 77);
+        assert_eq!((left[0].layer, left[0].class.as_slice()), (0, &b"path"[..]));
+        assert_eq!(
+            left[0].segments.len(),
+            1,
+            "one contiguous run in the left tile"
+        );
+        assert_eq!(
+            left[0].segments[0].first(),
+            Some(&a),
+            "start survives unclipped"
+        );
+        approx(*left[0].segments[0].last().unwrap(), (b, -0.5 * e));
 
         // Right tile: from the buffered boundary to the way's end.
         let right = get_tile_features(&db, BASE_TILE_ZOOM, tx, ty).unwrap();
         assert_eq!(right.len(), 1);
-        assert_eq!(right[0].1.len(), 1, "one contiguous run in the right tile");
-        approx(right[0].1[0][0], (-b, -0.5 * e));
-        assert_eq!(right[0].1[0].last(), Some(&z), "end survives unclipped");
+        assert_eq!(
+            (right[0].layer, right[0].class.as_slice()),
+            (0, &b"path"[..])
+        );
+        assert_eq!(
+            right[0].segments.len(),
+            1,
+            "one contiguous run in the right tile"
+        );
+        approx(right[0].segments[0][0], (-b, -0.5 * e));
+        assert_eq!(
+            right[0].segments[0].last(),
+            Some(&z),
+            "end survives unclipped"
+        );
 
         // No leakage into a tile the way never comes near.
         assert!(get_tile_features(&db, BASE_TILE_ZOOM, tx + 5, ty)
@@ -482,7 +590,7 @@ mod tests {
             DEFAULT_BATCH_SIZE,
         )
         .unwrap();
-        insert_ways_batched(&db, [(9u64, vec![1u64, 2, 3])], DEFAULT_BATCH_SIZE).unwrap();
+        insert_ways_batched(&db, [hw(9, vec![1, 2, 3])], DEFAULT_BATCH_SIZE).unwrap();
 
         let s = run_pass3_slice(&db, 0, &mut || false).unwrap();
         assert_eq!(s.features_written, 1, "single tile, no neighbour leakage");
@@ -491,7 +599,15 @@ mod tests {
         // The zigzag deviates ~0.2*E (hundreds of meters) — far above the
         // ~4.8m z14 epsilon, so simplification must keep all 3 vertices and
         // the fully-inside clip must return them unmodified.
-        assert_eq!(feats, vec![(9, vec![pts.to_vec()])]);
+        assert_eq!(
+            feats,
+            vec![TileFeature {
+                way_id: 9,
+                layer: 0,
+                class: b"path".to_vec(),
+                segments: vec![pts.to_vec()],
+            }]
+        );
     }
 
     #[test]
@@ -507,7 +623,7 @@ mod tests {
             let y = -(0.2 + 0.2 * w as f64) * e;
             coords.push((w * 2 + 1, (0.2 * e, y)));
             coords.push((w * 2 + 2, (0.8 * e, y)));
-            ways.push((w + 1, vec![w * 2 + 1, w * 2 + 2]));
+            ways.push(hw(w + 1, vec![w * 2 + 1, w * 2 + 2]));
         }
         insert_coords_batched(&db, coords, DEFAULT_BATCH_SIZE).unwrap();
         insert_ways_batched(&db, ways, DEFAULT_BATCH_SIZE).unwrap();
@@ -559,8 +675,8 @@ mod tests {
         insert_ways_batched(
             &db,
             [
-                (10u64, vec![900u64, 901]), // refs entirely outside the extract
-                (11u64, vec![1u64, 2]),     // assemblable
+                hw(10, vec![900, 901]), // refs entirely outside the extract
+                hw(11, vec![1, 2]),     // assemblable
             ],
             DEFAULT_BATCH_SIZE,
         )
@@ -593,7 +709,7 @@ mod tests {
         assert_eq!(s.last_way_id, 0);
 
         // Resume-at-exhaustion is the legitimate "already finished" call.
-        insert_ways_batched(&db, [(5u64, vec![1u64, 2])], DEFAULT_BATCH_SIZE).unwrap();
+        insert_ways_batched(&db, [hw(5, vec![1, 2])], DEFAULT_BATCH_SIZE).unwrap();
         let s = run_pass3_slice(&db, 5, &mut || false).unwrap();
         assert!(s.finished);
         assert_eq!(s.ways_binned, 0);
@@ -617,15 +733,46 @@ mod tests {
             (5, (0.8 * e, y)),
         ];
         insert_coords_batched(&db, coords, DEFAULT_BATCH_SIZE).unwrap();
-        insert_ways_batched(&db, [(3u64, vec![1u64, 2, 3, 4, 5])], DEFAULT_BATCH_SIZE).unwrap();
+        insert_ways_batched(&db, [hw(3, vec![1, 2, 3, 4, 5])], DEFAULT_BATCH_SIZE).unwrap();
 
         run_pass3_slice(&db, 0, &mut || false).unwrap();
         let feats = get_tile_features(&db, BASE_TILE_ZOOM, tx, ty).unwrap();
         assert_eq!(feats.len(), 1);
         assert_eq!(
-            feats[0].1,
+            feats[0].segments,
             vec![vec![(0.2 * e, y), (0.8 * e, y)]],
             "sub-epsilon vertices must be simplified away before storage"
+        );
+    }
+
+    /// P5.C2 posture check: a WAYS row without its WAY_TAGS twin (an index
+    /// written by the pre-tag pipeline) must fail loudly, not emit
+    /// un-layered geometry.
+    #[test]
+    fn pass3_rejects_way_without_tag_record() {
+        let dir = tmp_dir("no-tags");
+        let db = open_coord_db(&dir.join("index.redb")).unwrap();
+        let (e, _) = anchor();
+
+        insert_coords_batched(
+            &db,
+            [(1u64, (0.3 * e, -0.5 * e)), (2u64, (0.7 * e, -0.5 * e))],
+            DEFAULT_BATCH_SIZE,
+        )
+        .unwrap();
+        // Simulate a legacy index: refs row present, tags row missing.
+        let tx = db.begin_write().unwrap();
+        {
+            let mut table = tx.open_table(WAYS).unwrap();
+            let encoded = crate::encode_way_refs(&[1, 2]).unwrap();
+            table.insert(42u64, encoded.as_slice()).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let err = run_pass3_slice(&db, 0, &mut || false).unwrap_err();
+        assert!(
+            matches!(&err, IndexError::InvalidInput(m) if m.contains("no tag record")),
+            "got: {err:?}"
         );
     }
 }

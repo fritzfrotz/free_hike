@@ -68,23 +68,28 @@ pub fn synthetic_pbf(groups: &[&[(i64, i64, i64)]]) -> Vec<u8> {
 }
 
 /// One way for [`way_block`] / [`synthetic_pbf_with_ways`]:
-/// `(way_id, tag_key, absolute node refs)`.
-pub type FixtureWay<'a> = (i64, &'a [u8], &'a [i64]);
+/// `(way_id, tag_key, tag_value, absolute node refs)`.
+pub type FixtureWay<'a> = (i64, &'a [u8], &'a [u8], &'a [i64]);
 
 /// Builds a way-bearing OSMData block: a StringTable holding each distinct
-/// tag key (index 0 reserved empty, per OSM convention), and one Way per
-/// entry with delta-encoded refs — the inverse of Pass 2's decoding.
+/// tag key and value (index 0 reserved empty, per OSM convention), and one
+/// Way per entry with parallel `keys`/`vals` and delta-encoded refs — the
+/// inverse of Pass 2's decoding.
 pub fn way_block(ways: &[FixtureWay<'_>]) -> Vec<u8> {
     let mut strings: Vec<Vec<u8>> = vec![Vec::new()]; // index 0: empty
-    let mut way_msgs = Vec::with_capacity(ways.len());
-    for &(id, key, refs) in ways {
-        let key_idx = match strings.iter().position(|s| s == key) {
-            Some(i) => i,
+    let intern = |s: &[u8], strings: &mut Vec<Vec<u8>>| -> u32 {
+        match strings.iter().position(|x| x == s) {
+            Some(i) => i as u32,
             None => {
-                strings.push(key.to_vec());
-                strings.len() - 1
+                strings.push(s.to_vec());
+                (strings.len() - 1) as u32
             }
-        };
+        }
+    };
+    let mut way_msgs = Vec::with_capacity(ways.len());
+    for &(id, key, value, refs) in ways {
+        let key_idx = intern(key, &mut strings);
+        let val_idx = intern(value, &mut strings);
         let mut deltas = Vec::with_capacity(refs.len());
         let mut prev = 0i64;
         for &r in refs {
@@ -93,7 +98,8 @@ pub fn way_block(ways: &[FixtureWay<'_>]) -> Vec<u8> {
         }
         way_msgs.push(Way {
             id,
-            keys: vec![key_idx as u32],
+            keys: vec![key_idx],
+            vals: vec![val_idx],
             refs: deltas,
         });
     }

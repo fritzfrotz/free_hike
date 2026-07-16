@@ -727,11 +727,11 @@ mod tests {
     /// assertions unverifiable by hand. Cross-hemisphere assembly stays
     /// covered by the pbf crate's own tests.
     const W1: &[FixtureWay<'static>] = &[
-        (500, b"highway", &[1_000, 1_005]),
-        (501, b"building", &[1_000, 900]),
+        (500, b"highway", b"path", &[1_000, 1_005]),
+        (501, b"building", b"yes", &[1_000, 900]),
     ];
     /// Irrelevant block: rejected whole by the StringTable pre-filter.
-    const W2: &[FixtureWay<'static>] = &[(600, b"created_by", &[1_000, 900])];
+    const W2: &[FixtureWay<'static>] = &[(600, b"created_by", b"JOSM", &[1_000, 900])];
     const FIXTURE_BLOCKS: u32 = 5; // scanned once per real pass
     const FIXTURE_NODES: u64 = 5;
     const FIXTURE_WAYS: u64 = 1;
@@ -946,8 +946,17 @@ mod tests {
         let (tx, ty) = geom::mercator_to_tile(want_line[0].0, want_line[0].1, pbf::BASE_TILE_ZOOM);
         let feats = pbf::get_tile_features(&db, pbf::BASE_TILE_ZOOM, tx, ty).unwrap();
         // The 2-vertex way passes through RDP unchanged and lies fully
-        // inside the tile, so the stored segments are the geometry verbatim.
-        assert_eq!(feats, vec![(500, vec![want_line])]);
+        // inside the tile, so the stored segments are the geometry verbatim —
+        // now carrying its layer/class tag metadata end to end (P5.C2).
+        assert_eq!(
+            feats,
+            vec![pbf::tile::TileFeature {
+                way_id: 500,
+                layer: 0,
+                class: b"path".to_vec(),
+                segments: vec![want_line],
+            }]
+        );
     }
 
     #[test]

@@ -1157,3 +1157,118 @@ Committed with this entry per operator instruction. **The Rust backend is
 LOCKED at this commit per operator directive** — Phase 5 compiler work
 complete; next work is client integration of the produced `.pmtiles`
 archive (the Phase 5 exit criterion: render in the FreeHike app).
+
+---
+
+## P5.C2 — Tag persistence and MVT layering
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-16
+**Operator context:** P5.C1 lock lifted by directive for this chunk. Goal: styled
+MVT output — persist rendering-relevant OSM tags from Pass 2 extraction through
+to per-layer MVT encoding, within the 50MB out-of-core posture.
+
+**Design (locked before code):**
+- **Layer taxonomy** (pbf, shared): `LAYER_KEYS = [highway, waterway, natural,
+  landuse]` in match-priority order. A way's LAYER is the first of these keys it
+  carries; its CLASS is that tag's value (e.g. highway=path → layer "highway",
+  class "path"). Open-ended class strings are stored verbatim (UTF-8 validated
+  at extraction — OSM stringtables are UTF-8 by spec; invalid is corruption).
+- **SEMANTICS TIGHTENING (deviation, logged):** Pass 2's keep-filter becomes
+  "way carries a LAYER key" — `sac_scale`/`ele` alone no longer keep a way.
+  Rationale: a way with sac_scale but no highway cannot be styled into any
+  layer, and un-layered geometry can no longer exist in the new TileFeatures
+  format. `RELEVANT_TAG_KEYS` (the block-level StringTable prefilter) KEEPS
+  sac_scale/ele and gains landuse — the prefilter stays conservative
+  (block-level relevance), the way-level filter becomes exact (layer-level).
+- **Schema:** new `WayTags` table `way_id → (u8 layer, &[u8] class)` written in
+  the SAME chunked write txns as `Ways` (one crash-consistency domain).
+  `insert_ways_batched` item becomes `IndexedWay {id, layer, class, refs}`.
+  Proto `Way` gains `vals` (tag 3) — keys/vals parallel arrays; length mismatch
+  is a typed corruption error.
+- **TileFeatures value format v2:** `u8 layer | varint(class_len) class |
+  varint(n_segments) [segments…]` — Pass 3 denormalizes tags into every row it
+  writes (class ≈ bytes-per-feature cost, disk not RAM), so Finalize's drain
+  stays a single-table scan. Decode is corruption-typed incl. layer ≥ 4.
+  `get_tile_features` returns a named `TileFeature` struct (way_id, layer,
+  class, segments) — the tuple outgrew itself.
+- **Pass 3:** joins `WayTags` per way; a WAYS row without a WayTags row is a
+  HARD error (only reachable by resuming a pre-P5.C2 index against new code —
+  refuse rather than guess, same posture as checkpoint version bumps).
+- **MVT encoder:** groups a tile's features by layer index (BTreeMap →
+  deterministic layer order), emits one named MVT Layer per group with
+  `keys=["class"]`, `values` = first-seen-deduped class strings, and per-feature
+  `tags=[0, value_idx]`. Archive metadata `vector_layers` lists the four layers
+  with `fields: {"class":"String"}`.
+- **Accounting unchanged:** WAY_INDEX_BYTES (32) and TILE_FEATURE_BYTES (64)
+  stay — they were already amortized estimates; docs updated to mention tags.
+- **Fixtures:** `FixtureWay` becomes `(id, key, value, refs)` (compiler/ffi
+  test suites updated in the same sweep).
+
+**Proof tests (named up front):**
+- pbf::scan: keep/drop matrix rewritten for layer semantics (highway kept +
+  layer/class stored; sac_scale-only DROPPED — the new tightened rule; landuse
+  kept; building dropped; prefilter counts unchanged); keys/vals length
+  mismatch and val-index-out-of-StringTable rejected; layer priority (way with
+  natural+highway → highway).
+- pbf::tile: v2 roundtrip incl. layer/class; garbage rejection extended (bad
+  layer byte, truncated class); binning tests assert layer/class survive the
+  clip into every affected tile.
+- tiles::mvt: two-layer tile → two named Layer messages in deterministic
+  order; class value dedup within a layer (two features share one Value,
+  both tags = [0, idx]); keys==["class"] everywhere.
+- tiles::finalize: integration test now seeds two layers + asserts per-layer
+  readback through the root directory (prost decode → layer names, tags,
+  values) and metadata vector_layers naming all four layers.
+- compiler::engine: fixture ways carry values; pass3_bins_tiles_mid_job
+  asserts the TileFeature struct incl. layer/class; end-to-end totals
+  unchanged (accounting constants untouched).
+- Ladder: L1 ×2 green-lock + `cargo ndk -t arm64-v8a build -p ffi` + L2
+  real-Innsbruck rerun (expect same way/tile counts — the keep-filter change
+  only affects sac_scale/ele-only ways, which are rare anomalies).
+
+**Attempts:**
+- A1: proto `Way` gains `vals` (tag 3, parallel to keys — mismatch is typed
+  corruption). `LAYER_KEYS`/`layer_name` taxonomy + `IndexedWay` +
+  `WAY_TAGS` table in pbf; `insert_ways_batched` writes refs + tags in ONE
+  txn per chunk; `get_way_tags` point lookup. `extract_relevant_ways`
+  resolves highest-priority layer key + UTF-8-validated class value.
+- A2: TileFeatures value format v2 (layer byte + varint-length class +
+  segments); decode rejects bad layer / truncated class; `TileFeature`
+  struct replaces the outgrown tuple; Pass 3 joins WAY_TAGS per way and
+  HARD-fails on a refs-without-tags row (pre-P5.C2 index resumed against
+  new code — refuse, don't guess).
+- A3: MVT encoder groups by layer index (BTreeMap → deterministic layer
+  order), one named Layer per group, keys=["class"], first-seen-deduped
+  value pools, per-feature tags=[0,v]. `LAYER_NAME` const retired in favor
+  of `CLASS_KEY`. Archive metadata declares all four vector_layers with
+  fields {"class":"String"} unconditionally (styles reference statically).
+- A4: full test sweep across pbf/tiles/compiler fixtures (`FixtureWay` →
+  4-tuple). Workspace 122/122 first complete run; two clippy nits (unused
+  mut, test type_complexity) fixed; green-lock ×2; `cargo ndk -t arm64-v8a
+  build -p ffi` CLEAN.
+- A5 **L2 real-data:** Innsbruck extract, 250ms budget, release: **93,085
+  blocks / 1,030 archive tiles / 3,206,159-byte archive / 13 yields /
+  3.66s**. Deltas vs P5.C1 are the expected signature of the filter change:
+  ways ~81.4k → ~91.5k (landuse now kept), archive 2.4MB → 3.2MB (tag
+  attributes + landuse geometry), tiles 1,019 → 1,030.
+- A6 **Reference-reader proof:** the app's own `pmtiles` JS package parses
+  the new archive's metadata into the four named vector_layers (class:
+  String each) and the Innsbruck-centre z14 tile (74,223 bytes decompressed)
+  carries `highway`/`waterway`/`natural`/`landuse`/`class`/`path` strings
+  on the MVT wire — the styled-layer contract MapLibre needs is live
+  end-to-end.
+
+**Outcome:** CLOSED. Pivots: 0. Tags now persist raw-PBF → WayTags →
+TileFeatures v2 → per-layer MVT with class attributes, all within the
+out-of-core posture (tags are bytes-on-disk denormalization, never an
+in-memory join table). Way-level keep-filter deliberately tightened to
+layer keys (logged deviation, §above). FFI surface UNCHANGED; checkpoint
+format UNCHANGED (v5 — no new cursor state; the schema change lives inside
+the purged-per-job index).
+**Follow-ups:** client style referencing the new source-layers
+(high_contrast_outdoor_style.json still targets the old anonymous layer);
+sac_scale as a per-feature attribute on highway features (dropped entirely
+today); leaf directories + run-length coalescing still pending from P5.C1.
+Uncommitted (P5.C2 diff): pbf (proto/lib/scan/tile/fixtures), tiles
+(mvt/finalize), compiler test fixtures, LOOPLOG — awaiting operator.

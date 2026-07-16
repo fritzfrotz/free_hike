@@ -83,6 +83,47 @@ pub const COORDINATES: TableDefinition<u64, (f64, f64)> = TableDefinition::new("
 /// refs against [`COORDINATES`] at encode time.
 pub const WAYS: TableDefinition<u64, &[u8]> = TableDefinition::new("Ways");
 
+/// Pass-2 tag index (P5.C2): OSM way ID → `(layer, class)` where `layer`
+/// indexes [`LAYER_KEYS`] and `class` is that tag's raw value bytes
+/// (UTF-8-validated at extraction). Written in the SAME write transactions
+/// as [`WAYS`] — one crash-consistency domain; a way either has both rows
+/// or neither.
+pub const WAY_TAGS: TableDefinition<u64, (u8, &[u8])> = TableDefinition::new("WayTags");
+
+/// Rendering layer keys, in match-priority order. A way's layer is the FIRST
+/// of these tag keys it carries; its class is that tag's value (e.g.
+/// `highway=path` → layer `"highway"`, class `"path"`). The index into this
+/// array is the `u8` persisted in [`WAY_TAGS`] and in the TileFeatures value
+/// format — the MVT encoder turns it back into the layer name.
+pub const LAYER_KEYS: &[&[u8]] = &[b"highway", b"waterway", b"natural", b"landuse"];
+
+/// Layer name for a persisted layer index (the MVT layer string).
+/// `None` for an out-of-range index — decode-side corruption.
+pub fn layer_name(layer: u8) -> Option<&'static str> {
+    match layer {
+        0 => Some("highway"),
+        1 => Some("waterway"),
+        2 => Some("natural"),
+        3 => Some("landuse"),
+        _ => None,
+    }
+}
+
+// layer_name and LAYER_KEYS must stay in lockstep.
+const _: () = assert!(LAYER_KEYS.len() == 4);
+
+/// One renderable way as extracted by Pass 2: identity, layer/class tag
+/// metadata, and the ordered node refs. The unit of [`insert_ways_batched`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedWay {
+    pub id: u64,
+    /// Index into [`LAYER_KEYS`].
+    pub layer: u8,
+    /// Raw value bytes of the layer tag (validated UTF-8).
+    pub class: Vec<u8>,
+    pub refs: Vec<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -353,12 +394,14 @@ pub fn decode_way_refs(bytes: &[u8]) -> Result<Vec<u64>, IndexError> {
     Ok(ids)
 }
 
-/// Inserts `(way_id, ordered node refs)` pairs into [`WAYS`] in chunked write
+/// Inserts extracted ways into [`WAYS`] + [`WAY_TAGS`] in chunked write
 /// transactions — same commit/thread-safety contract as
-/// [`insert_coords_batched`]. Returns the number of ways inserted.
+/// [`insert_coords_batched`]. Both tables are written inside the SAME
+/// transaction per chunk, so a way's refs and its tag row commit or roll
+/// back together. Returns the number of ways inserted.
 pub fn insert_ways_batched<I>(db: &Database, ways: I, batch_size: usize) -> Result<u64, IndexError>
 where
-    I: IntoIterator<Item = (u64, Vec<u64>)>,
+    I: IntoIterator<Item = IndexedWay>,
 {
     if batch_size == 0 {
         return Err(IndexError::InvalidInput(
@@ -371,10 +414,16 @@ where
         let tx = db.begin_write().map_err(db_err)?;
         let mut in_chunk: usize = 0;
         {
-            let mut table = tx.open_table(WAYS).map_err(db_err)?;
-            for (way_id, refs) in ways.by_ref().take(batch_size) {
-                let encoded = encode_way_refs(&refs)?;
-                table.insert(way_id, encoded.as_slice()).map_err(db_err)?;
+            let mut refs_table = tx.open_table(WAYS).map_err(db_err)?;
+            let mut tags_table = tx.open_table(WAY_TAGS).map_err(db_err)?;
+            for way in ways.by_ref().take(batch_size) {
+                let encoded = encode_way_refs(&way.refs)?;
+                refs_table
+                    .insert(way.id, encoded.as_slice())
+                    .map_err(db_err)?;
+                tags_table
+                    .insert(way.id, (way.layer, way.class.as_slice()))
+                    .map_err(db_err)?;
                 in_chunk += 1;
             }
         }
@@ -389,6 +438,24 @@ where
         }
     }
     Ok(total)
+}
+
+/// Point lookup of a way's `(layer, class)` tag metadata. `Ok(None)` for an
+/// absent way or a not-yet-created table.
+pub fn get_way_tags(db: &Database, way_id: u64) -> Result<Option<(u8, Vec<u8>)>, IndexError> {
+    let tx = db.begin_read().map_err(db_err)?;
+    let table = match tx.open_table(WAY_TAGS) {
+        Ok(t) => t,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(db_err(e)),
+    };
+    match table.get(way_id).map_err(db_err)? {
+        Some(guard) => {
+            let (layer, class) = guard.value();
+            Ok(Some((layer, class.to_vec())))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Point lookup of a way's ordered node refs. `Ok(None)` for an absent way
@@ -704,8 +771,13 @@ mod tests {
         // Both tables coexist in the one per-job index database.
         insert_coords_batched(&db, [(7u64, (1.0, 2.0))], DEFAULT_BATCH_SIZE).unwrap();
 
-        let ways: Vec<(u64, Vec<u64>)> = (0..25u64)
-            .map(|w| (w, vec![w * 10, w * 10 + 1, w * 10 + 2]))
+        let ways: Vec<IndexedWay> = (0..25u64)
+            .map(|w| IndexedWay {
+                id: w,
+                layer: (w % 4) as u8,
+                class: format!("class-{w}").into_bytes(),
+                refs: vec![w * 10, w * 10 + 1, w * 10 + 2],
+            })
             .collect();
         let n = insert_ways_batched(&db, ways, 10).unwrap(); // 10 + 10 + 5
         assert_eq!(n, 25);
@@ -715,12 +787,19 @@ mod tests {
             Some(vec![240, 241, 242]),
             "last chunk must be committed"
         );
+        assert_eq!(
+            get_way_tags(&db, 24).unwrap(),
+            Some((0, b"class-24".to_vec())),
+            "tags row commits in the same chunk as the refs row"
+        );
         assert_eq!(get_way_refs(&db, 99).unwrap(), None);
+        assert_eq!(get_way_tags(&db, 99).unwrap(), None);
         assert_eq!(get_coord(&db, 7).unwrap(), Some((1.0, 2.0)));
 
-        // Fresh DB: Ways absent entirely → None, not an error.
+        // Fresh DB: Ways/WayTags absent entirely → None, not an error.
         let db2 = open_coord_db(&dir.join("empty.redb")).unwrap();
         assert_eq!(get_way_refs(&db2, 1).unwrap(), None);
+        assert_eq!(get_way_tags(&db2, 1).unwrap(), None);
     }
 
     // -- Projection ----------------------------------------------------------

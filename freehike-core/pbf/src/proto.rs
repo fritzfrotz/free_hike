@@ -135,16 +135,19 @@ pub struct WayGroup {
     pub ways: Vec<Way>,
 }
 
-/// A way: tag-key indices into the block's StringTable plus **delta-coded**
-/// node refs (same sint64 delta scheme as DenseNodes). NOTE: `id` is plain
-/// int64 on the wire (not zigzag), unlike node IDs. `vals` (tag 3) and
-/// `info` (tag 4) are skipped — the current filter needs key presence only.
+/// A way: tag key/value indices into the block's StringTable plus
+/// **delta-coded** node refs (same sint64 delta scheme as DenseNodes).
+/// NOTE: `id` is plain int64 on the wire (not zigzag), unlike node IDs.
+/// `keys`/`vals` are parallel arrays per the OSM spec — a length mismatch is
+/// wire corruption. `info` (tag 4) stays wire-skipped.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Way {
     #[prost(int64, required, tag = "1")]
     pub id: i64,
     #[prost(uint32, repeated, tag = "2")]
     pub keys: Vec<u32>,
+    #[prost(uint32, repeated, tag = "3")]
+    pub vals: Vec<u32>,
     #[prost(sint64, repeated, tag = "8")]
     pub refs: Vec<i64>,
 }

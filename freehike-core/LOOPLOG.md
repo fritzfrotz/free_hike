@@ -1272,3 +1272,106 @@ sac_scale as a per-feature attribute on highway features (dropped entirely
 today); leaf directories + run-length coalescing still pending from P5.C1.
 Uncommitted (P5.C2 diff): pbf (proto/lib/scan/tile/fixtures), tiles
 (mvt/finalize), compiler test fixtures, LOOPLOG — awaiting operator.
+
+---
+
+## P5.C3 — Basemap enrichment: sac_scale as a second feature attribute
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-16
+**Operator context:** core lock lifted by directive. P5.C2 deliberately dropped
+`sac_scale` at the way-level keep-filter; the frontend now needs it back to
+color-code trail difficulty. This chunk threads it through as an OPTIONAL
+second attribute — the keep-filter itself is unchanged (a sac_scale-only way
+still has no layer and stays dropped).
+
+**Design (locked before code):**
+- **Schema:** [`WAY_TAGS`] value widens `(u8, &[u8])` → `(u8, &[u8], &[u8])`
+  — layer, class, sac_scale (EMPTY SLICE = absent; OSM sac_scale values are
+  never empty, so the sentinel is unambiguous). One table, one lookup, one
+  crash-consistency domain with WAYS, ~1 byte/way for the overwhelmingly-empty
+  case — chosen over a sparse secondary table because Pass 3 already pays a
+  per-way point lookup and a second one buys nothing but code. A pre-P5.C3
+  index resumed against new code fails loudly via redb's table-type-mismatch
+  error (same refuse-don't-guess posture as the P5.C2 no-tag-record check).
+- **Extraction scope:** sac_scale is resolved ONLY for layer-0 (highway) ways
+  (directive scope; also keeps the archive metadata exactly honest — no other
+  layer can ever carry the field). Values stored verbatim + UTF-8-validated,
+  same no-whitelist policy as `class` (unknown grades fall through the style's
+  match default).
+- **TileFeatures format v3:** `u8 layer | varint class | varint sac_scale |
+  varint n_segments …` — the same length-prefixed slot, empty = absent.
+  Decode corruption-typed as before (truncated sac slot is a new reject case).
+- **MVT encoder, multi-attribute:** per-layer key pool grows lazily —
+  `keys[0]="class"` at layer creation, `keys[1]="sac_scale"` appended on the
+  first sac-bearing feature (layers without any stay exactly `["class"]`,
+  byte-identical to P5.C2 output). The per-layer VALUE pool is shared across
+  keys (valid MVT; a class string and a sac string that coincide share one
+  entry). Feature tags: `[0,c]` or `[0,c,1,s]`.
+- **Metadata:** the highway vector_layer declares
+  `fields:{"class":"String","sac_scale":"String"}`; the other three stay
+  class-only.
+- **Unchanged:** keep-filter, block prefilter (sac_scale already in
+  RELEVANT_TAG_KEYS), checkpoint format (no new cursor state), FFI surface,
+  engine accounting constants.
+
+**Proof tests (named up front):**
+- pbf::scan: hand-built WayBlock — highway+sac_scale extracts both; sac on a
+  non-highway way is ignored; sac value index OOB / non-UTF-8 rejected.
+- pbf::lib: ways-roundtrip covers the widened triple incl. empty-sac.
+- pbf::tile: v3 roundtrip (with/without sac), truncated-sac rejection,
+  binning carries sac into every clipped tile.
+- tiles::mvt: sac-bearing highway feature → keys ["class","sac_scale"] +
+  tags [0,c,1,s]; mixed layer (one feature with, one without) keeps a single
+  key pool with per-feature tag arity; sac-free layers byte-stable at
+  ["class"]; class/sac value-pool sharing.
+- tiles::finalize: integration seeds sac on the dedup pair (identical sac →
+  payloads still dedup) + asserts highway keys/tags and metadata fields
+  through the assembled archive readback.
+- compiler::engine: fixture TileFeature gains the empty-sac field (fixture
+  ways carry no sac — single-tag fixture builder unchanged by design; the
+  two-tag wire path is proven at the scan unit level and on real data).
+- Ladder: L1 ×2 green-lock + `cargo ndk -t arm64-v8a build -p ffi` + L2
+  real-Innsbruck rerun (way counts must be UNCHANGED vs P5.C2 — the filter
+  didn't move; archive grows only by sac strings) + reference-reader scan
+  for sac_scale reaching the MVT wire.
+
+**Attempts:**
+- A1: schema + extraction: WAY_TAGS widened to `(u8, &[u8], &[u8])`,
+  `IndexedWay.sac_scale`, `WayTagRecord` alias; extract_relevant_ways notes
+  sac_scale's value index in the same key sweep and resolves it (shared
+  bounds+UTF-8 resolver with class) only when the way lands on layer 0 —
+  a grade on a waterway/natural/landuse way is nonsense data, ignored.
+- A2: TileFeatures v3 (second length-prefixed slot), TileFeature.sac_scale,
+  bin_way/run_pass3_slice denormalization — all mechanical, per plan.
+- A3: MVT encoder: per-layer lazy key pool (["class"] → +"sac_scale" on
+  first graded feature), value pool shared across keys, tags [0,c] or
+  [0,c,1,s]. Metadata declares sac_scale on highway ONLY. One clippy
+  type_complexity on the widened get_way_tags return → named WayTagRecord.
+- A4: workspace 127/127 green first complete run (24 compiler / 13 fetcher /
+  7 ffi / 18 geom / 40 pbf / 25 tiles), green-lock ×2, fmt/clippy clean,
+  `cargo ndk -t arm64-v8a build -p ffi` CLEAN. Self-caught: two stray noop
+  lines left in a test edit, removed before compile.
+- A5 **L2 real-data — the predicted fingerprint, exactly:** 93,085 blocks /
+  1,030 archive tiles — BOTH IDENTICAL to P5.C2 (keep-filter untouched,
+  way counts must not move, and they didn't); archive 3,206,159 →
+  3,242,090 bytes (+35,931 = precisely the grade strings + key/tag
+  entries); 13 yields / 3.67s.
+- A6 **Reference-reader proof:** app's own `pmtiles` JS — highway
+  vector_layer declares {"class","sac_scale"}, no other layer does; 199 of
+  221 Innsbruck-region z14 tiles carry the sac_scale key on the
+  decompressed MVT wire; ALL SIX canonical SAC grades observed (hiking →
+  difficult_alpine_hiking, the full T1-T6 scale — exactly what a Tirol
+  extract should yield).
+
+**Outcome:** CLOSED. Pivots: 0. sac_scale persists raw-PBF → WayTags →
+TileFeatures v3 → highway MVT features as a second attribute, with
+grade-free layers byte-stable at their P5.C2 shape. Keep-filter, block
+prefilter, checkpoint format (v5), FFI surface, and engine accounting all
+UNCHANGED. The P5.C2 follow-up "sac_scale as a per-feature attribute" is
+retired.
+**Follow-ups (carried):** client style can now color trails on
+`["get","sac_scale"]` (frontend chunk); leaf-directory splitting +
+run-length coalescing; Terrain (Phase 6) deferred.
+Uncommitted (P5.C3 diff): pbf (lib/scan/tile), tiles (mvt/finalize),
+compiler test fixture, LOOPLOG — awaiting operator.

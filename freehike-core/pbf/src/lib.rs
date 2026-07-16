@@ -83,12 +83,21 @@ pub const COORDINATES: TableDefinition<u64, (f64, f64)> = TableDefinition::new("
 /// refs against [`COORDINATES`] at encode time.
 pub const WAYS: TableDefinition<u64, &[u8]> = TableDefinition::new("Ways");
 
-/// Pass-2 tag index (P5.C2): OSM way ID → `(layer, class)` where `layer`
-/// indexes [`LAYER_KEYS`] and `class` is that tag's raw value bytes
-/// (UTF-8-validated at extraction). Written in the SAME write transactions
-/// as [`WAYS`] — one crash-consistency domain; a way either has both rows
-/// or neither.
-pub const WAY_TAGS: TableDefinition<u64, (u8, &[u8])> = TableDefinition::new("WayTags");
+/// Pass-2 tag index (P5.C2, widened P5.C3): OSM way ID →
+/// `(layer, class, sac_scale)` where `layer` indexes [`LAYER_KEYS`],
+/// `class` is that tag's raw value bytes, and `sac_scale` is the trail
+/// difficulty grade for highway-layer ways (EMPTY SLICE = absent — OSM
+/// sac_scale values are never empty, so the sentinel is unambiguous; other
+/// layers never carry one). Both strings are UTF-8-validated at extraction.
+/// Written in the SAME write transactions as [`WAYS`] — one
+/// crash-consistency domain; a way either has both rows or neither.
+///
+/// Widening the value type (rather than adding a sparse side table) keeps
+/// Pass 3 at one point lookup per way; the cost is ~1 byte per sac-less
+/// way. A pre-P5.C3 index resumed against this code fails loudly with
+/// redb's table-type mismatch — refuse rather than guess, same posture as
+/// the checkpoint version gate.
+pub const WAY_TAGS: TableDefinition<u64, (u8, &[u8], &[u8])> = TableDefinition::new("WayTags");
 
 /// Rendering layer keys, in match-priority order. A way's layer is the FIRST
 /// of these tag keys it carries; its class is that tag's value (e.g.
@@ -112,8 +121,8 @@ pub fn layer_name(layer: u8) -> Option<&'static str> {
 // layer_name and LAYER_KEYS must stay in lockstep.
 const _: () = assert!(LAYER_KEYS.len() == 4);
 
-/// One renderable way as extracted by Pass 2: identity, layer/class tag
-/// metadata, and the ordered node refs. The unit of [`insert_ways_batched`].
+/// One renderable way as extracted by Pass 2: identity, tag metadata, and
+/// the ordered node refs. The unit of [`insert_ways_batched`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedWay {
     pub id: u64,
@@ -121,6 +130,8 @@ pub struct IndexedWay {
     pub layer: u8,
     /// Raw value bytes of the layer tag (validated UTF-8).
     pub class: Vec<u8>,
+    /// Trail difficulty grade (highway-layer ways only; empty = absent).
+    pub sac_scale: Vec<u8>,
     pub refs: Vec<u64>,
 }
 
@@ -422,7 +433,10 @@ where
                     .insert(way.id, encoded.as_slice())
                     .map_err(db_err)?;
                 tags_table
-                    .insert(way.id, (way.layer, way.class.as_slice()))
+                    .insert(
+                        way.id,
+                        (way.layer, way.class.as_slice(), way.sac_scale.as_slice()),
+                    )
                     .map_err(db_err)?;
                 in_chunk += 1;
             }
@@ -440,9 +454,13 @@ where
     Ok(total)
 }
 
-/// Point lookup of a way's `(layer, class)` tag metadata. `Ok(None)` for an
-/// absent way or a not-yet-created table.
-pub fn get_way_tags(db: &Database, way_id: u64) -> Result<Option<(u8, Vec<u8>)>, IndexError> {
+/// A way's decoded tag metadata: `(layer, class, sac_scale)` — sac_scale
+/// empty = absent.
+pub type WayTagRecord = (u8, Vec<u8>, Vec<u8>);
+
+/// Point lookup of a way's tag metadata. `Ok(None)` for an absent way or a
+/// not-yet-created table.
+pub fn get_way_tags(db: &Database, way_id: u64) -> Result<Option<WayTagRecord>, IndexError> {
     let tx = db.begin_read().map_err(db_err)?;
     let table = match tx.open_table(WAY_TAGS) {
         Ok(t) => t,
@@ -451,8 +469,8 @@ pub fn get_way_tags(db: &Database, way_id: u64) -> Result<Option<(u8, Vec<u8>)>,
     };
     match table.get(way_id).map_err(db_err)? {
         Some(guard) => {
-            let (layer, class) = guard.value();
-            Ok(Some((layer, class.to_vec())))
+            let (layer, class, sac_scale) = guard.value();
+            Ok(Some((layer, class.to_vec(), sac_scale.to_vec())))
         }
         None => Ok(None),
     }
@@ -776,6 +794,13 @@ mod tests {
                 id: w,
                 layer: (w % 4) as u8,
                 class: format!("class-{w}").into_bytes(),
+                // Highway-layer ways carry a grade; the rest the empty
+                // sentinel — both shapes roundtrip through the same triple.
+                sac_scale: if w % 4 == 0 {
+                    b"hiking".to_vec()
+                } else {
+                    Vec::new()
+                },
                 refs: vec![w * 10, w * 10 + 1, w * 10 + 2],
             })
             .collect();
@@ -789,8 +814,13 @@ mod tests {
         );
         assert_eq!(
             get_way_tags(&db, 24).unwrap(),
-            Some((0, b"class-24".to_vec())),
+            Some((0, b"class-24".to_vec(), b"hiking".to_vec())),
             "tags row commits in the same chunk as the refs row"
+        );
+        assert_eq!(
+            get_way_tags(&db, 23).unwrap(),
+            Some((3, b"class-23".to_vec(), Vec::new())),
+            "absent grade roundtrips as the empty sentinel"
         );
         assert_eq!(get_way_refs(&db, 99).unwrap(), None);
         assert_eq!(get_way_tags(&db, 99).unwrap(), None);

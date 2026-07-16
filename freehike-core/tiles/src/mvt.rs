@@ -28,9 +28,15 @@ use prost::Message;
 /// 4096×4096 integer grid per tile.
 pub const MVT_EXTENT: u32 = 4096;
 
-/// The one attribute key every layer carries (per-feature `class` = the
-/// layer tag's value). Client styles filter on `["get", "class"]`.
+/// The attribute key every layer carries (per-feature `class` = the layer
+/// tag's value). Client styles filter on `["get", "class"]`.
 pub const CLASS_KEY: &str = "class";
+
+/// Optional second attribute on highway features: the trail difficulty
+/// grade (P5.C3). Appended to a layer's key pool only when at least one of
+/// its features carries a grade. Client styles color on
+/// `["get", "sac_scale"]`.
+pub const SAC_SCALE_KEY: &str = "sac_scale";
 
 const GEOM_TYPE_LINESTRING: i32 = 2;
 const CMD_MOVE_TO: u32 = 1;
@@ -149,10 +155,17 @@ fn encode_geometry(segments: &[Vec<(f64, f64)>], origin: (f64, f64), scale: f64)
 /// `features` come straight from the `TileFeatures` index decode. They are
 /// grouped by layer index into one named MVT layer each (ascending index —
 /// deterministic output, which payload dedup and the engine's determinism
-/// proof rely on); each feature carries `tags = [0, v]` pointing at
-/// `keys[0] = "class"` and its deduped class string in the layer's value
-/// pool. Returns `None` when nothing survives quantization — the caller
-/// writes no archive entry for such a tile.
+/// proof rely on). Attributes per feature (P5.C3):
+/// - `class` (always): `tags` starts `[0, c]` — `keys[0] = "class"`.
+/// - `sac_scale` (optional): `tags` continues `[1, s]`. The `"sac_scale"`
+///   key is appended to the layer's key pool lazily, on the first grade-
+///   bearing feature — layers without any stay byte-identical to their
+///   P5.C2 form at exactly `["class"]`.
+///
+/// The per-layer VALUE pool is shared across keys (valid MVT — a class
+/// string and a grade string that coincide share one entry), deduped in
+/// first-seen order. Returns `None` when nothing survives quantization —
+/// the caller writes no archive entry for such a tile.
 pub fn encode_tile_mvt(
     zoom: u8,
     tile_x: u32,
@@ -165,8 +178,8 @@ pub fn encode_tile_mvt(
 
     // Grouped by layer index; BTreeMap gives ascending-index layer order.
     let mut layers: BTreeMap<u8, Layer> = BTreeMap::new();
-    // Per-layer class-string → value-pool index (first-seen order, so the
-    // pool itself stays deterministic).
+    // Per-layer value-string → value-pool index (first-seen order, so the
+    // pool itself stays deterministic). Shared across keys within a layer.
     let mut value_pool: HashMap<(u8, Vec<u8>), u32> = HashMap::new();
 
     for feature in features {
@@ -189,22 +202,36 @@ pub fn encode_tile_mvt(
             extent: MVT_EXTENT,
         });
 
-        let pool_key = (feature.layer, feature.class.clone());
-        let value_idx = match value_pool.get(&pool_key) {
-            Some(&idx) => idx,
-            None => {
-                let idx = layer.values.len() as u32;
-                layer.values.push(Value {
-                    string_value: Some(String::from_utf8_lossy(&feature.class).into_owned()),
-                });
-                value_pool.insert(pool_key, idx);
-                idx
+        let mut pool_value = |layer: &mut Layer, layer_idx: u8, value: &[u8]| -> u32 {
+            let pool_key = (layer_idx, value.to_vec());
+            match value_pool.get(&pool_key) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = layer.values.len() as u32;
+                    layer.values.push(Value {
+                        string_value: Some(String::from_utf8_lossy(value).into_owned()),
+                    });
+                    value_pool.insert(pool_key, idx);
+                    idx
+                }
             }
         };
 
+        let class_value = pool_value(layer, feature.layer, &feature.class);
+        let mut tags = vec![0, class_value];
+        if !feature.sac_scale.is_empty() {
+            let sac_value = pool_value(layer, feature.layer, &feature.sac_scale);
+            // Key pool grows lazily: "sac_scale" lands at index 1 on the
+            // first grade-bearing feature of this layer.
+            if layer.keys.len() == 1 {
+                layer.keys.push(SAC_SCALE_KEY.to_string());
+            }
+            tags.extend_from_slice(&[1, sac_value]);
+        }
+
         layer.features.push(Feature {
             id: feature.way_id,
-            tags: vec![0, value_idx],
+            tags,
             geom_type: GEOM_TYPE_LINESTRING,
             geometry,
         });
@@ -230,13 +257,28 @@ mod tests {
     const TX: u32 = 8703;
     const TY: u32 = 5747;
 
-    /// TileFeature shorthand for encoder tests.
+    /// TileFeature shorthand for encoder tests (no grade).
     fn feat(way_id: u64, layer: u8, class: &[u8], segments: Vec<Vec<(f64, f64)>>) -> TileFeature {
         TileFeature {
             way_id,
             layer,
             class: class.to_vec(),
+            sac_scale: Vec::new(),
             segments,
+        }
+    }
+
+    /// Grade-bearing variant of [`feat`].
+    fn graded(
+        way_id: u64,
+        layer: u8,
+        class: &[u8],
+        sac: &[u8],
+        segments: Vec<Vec<(f64, f64)>>,
+    ) -> TileFeature {
+        TileFeature {
+            sac_scale: sac.to_vec(),
+            ..feat(way_id, layer, class, segments)
         }
     }
 
@@ -438,5 +480,74 @@ mod tests {
         );
         let tags: Vec<&Vec<u32>> = layer.features.iter().map(|f| &f.tags).collect();
         assert_eq!(tags, vec![&vec![0, 0], &vec![0, 1], &vec![0, 0]]);
+    }
+
+    /// The P5.C3 core proof: a grade-bearing highway feature carries BOTH
+    /// attributes — keys grow to ["class","sac_scale"] and its tags array
+    /// points at both, while a grade-less sibling in the same layer keeps a
+    /// 2-element tags array.
+    #[test]
+    fn sac_scale_encodes_as_second_attribute() {
+        let seg = |y: f64| vec![merc_at(0.0, y), merc_at(50.0, y)];
+        let payload = encode_tile_mvt(
+            Z,
+            TX,
+            TY,
+            &[
+                graded(1, 0, b"path", b"alpine_hiking", vec![seg(10.0)]),
+                feat(2, 0, b"track", vec![seg(20.0)]),
+                graded(3, 0, b"path", b"alpine_hiking", vec![seg(30.0)]),
+            ],
+        )
+        .unwrap();
+        let tile = decode(&payload);
+        assert_eq!(tile.layers.len(), 1);
+        let layer = &tile.layers[0];
+
+        assert_eq!(
+            layer.keys,
+            vec![CLASS_KEY.to_string(), SAC_SCALE_KEY.to_string()]
+        );
+        // Value pool, first-seen: path, alpine_hiking, track — shared
+        // across both keys, deduped across features 1 and 3.
+        let values: Vec<Option<&str>> = layer
+            .values
+            .iter()
+            .map(|v| v.string_value.as_deref())
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some("path"), Some("alpine_hiking"), Some("track")]
+        );
+        let tags: Vec<&Vec<u32>> = layer.features.iter().map(|f| &f.tags).collect();
+        assert_eq!(
+            tags,
+            vec![&vec![0, 0, 1, 1], &vec![0, 2], &vec![0, 0, 1, 1]],
+            "graded features carry [class, sac_scale]; plain ones just [class]"
+        );
+    }
+
+    /// A layer with no graded features must stay byte-identical to its
+    /// P5.C2 shape: keys exactly ["class"], 2-element tags.
+    #[test]
+    fn grade_free_layers_stay_class_only() {
+        let seg = vec![merc_at(0.0, 5.0), merc_at(40.0, 5.0)];
+        let payload = encode_tile_mvt(Z, TX, TY, &[feat(9, 1, b"stream", vec![seg])]).unwrap();
+        let layer = &decode(&payload).layers[0];
+        assert_eq!(layer.keys, vec![CLASS_KEY.to_string()]);
+        assert_eq!(layer.features[0].tags, vec![0, 0]);
+    }
+
+    /// A class string and a grade string that coincide share one entry in
+    /// the layer's value pool (pools are per-layer, not per-key).
+    #[test]
+    fn class_and_sac_values_share_the_pool() {
+        let seg = vec![merc_at(0.0, 5.0), merc_at(40.0, 5.0)];
+        // Contrived but legal: class "hiking" + sac_scale "hiking".
+        let payload =
+            encode_tile_mvt(Z, TX, TY, &[graded(1, 0, b"hiking", b"hiking", vec![seg])]).unwrap();
+        let layer = &decode(&payload).layers[0];
+        assert_eq!(layer.values.len(), 1, "one pooled value serves both keys");
+        assert_eq!(layer.features[0].tags, vec![0, 0, 1, 0]);
     }
 }

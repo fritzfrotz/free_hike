@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 pbf = { workspace = true }
+# Real Finalize phase (P5.C1): MVT encode + PMTiles v3 assembly drivers.
+tiles = { workspace = true }
 
 [dev-dependencies]
 # Synthetic-PBF builders for the integrated Pass-1 engine tests.

@@ -14,13 +14,16 @@
 //!   one block even if the budget is already exhausted, so a runner passing
 //!   a too-small budget degrades to slow progress instead of livelocking.
 //!
-//! **Pass1Nodes and Pass2Ways are REAL** (P3.C3/C4): they drive
-//! `pbf::run_pass1_slice` / `pbf::run_pass2_slice` over the mmap'd input,
-//! each resuming from its own durable byte offset (`pbf_byte_offset` /
-//! `pass2_byte_offset`) and writing into the per-job redb index
-//! (`index_db_path`: Coordinates + Ways tables). The remaining phases
-//! (Terrain / Finalize) are still simulated block loops — placeholders for
-//! Phases 5-6 behind this same contract.
+//! **Pass1Nodes, Pass2Ways, Pass3Tiles and Finalize are REAL**
+//! (P3.C3/C4, P4.C2, P5.C1): the passes drive `pbf::run_pass{1,2,3}_slice`
+//! over the mmap'd input and the per-job redb index (`index_db_path`),
+//! each resuming from its own durable cursor (`pbf_byte_offset` /
+//! `pass2_byte_offset` / `pass3_last_way_id`); Finalize drives
+//! `tiles::run_finalize_encode_slice` (cursor `pass5_last_tile`) plus one
+//! idempotent `tiles::assemble_archive` block, producing
+//! `{job_id}.pmtiles` at `archive_path` BEFORE the index purge. Only
+//! Terrain remains a simulated block loop — the Phase 6 placeholder
+//! behind this same contract.
 
 use std::fmt;
 use std::fs;
@@ -100,7 +103,7 @@ pub struct JobSpec {
     pub output_dir: String,
 }
 
-/// Durable resume state (checkpoint format v4).
+/// Durable resume state (checkpoint format v5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub job_id: String,
@@ -119,6 +122,11 @@ pub struct Checkpoint {
     /// (0 = none yet). Not a byte offset — Pass 3 iterates the WAYS table,
     /// not the file.
     pub pass3_last_way_id: u64,
+    /// Finalize's encode cursor: the PMTiles tile ID of the last tile
+    /// fully encoded into the temporary data file (0 = none yet — no real
+    /// tile at our zooms has ID 0). Maps bijectively back to the
+    /// TileFeatures scan position on resume.
+    pub pass5_last_tile: u64,
     /// Total logical bytes written (node/way-index bytes + simulated output).
     pub bytes_written: u64,
     /// Blocks completed across ALL phases — feeds `RunSummary::blocks_total`
@@ -150,10 +158,9 @@ pub enum SliceOutcome {
 // Phase plan
 // ---------------------------------------------------------------------------
 
-// Simulated block counts for the not-yet-real phases (Phases 5-6 replace
-// these loops with the terrain/archive pipelines).
+// Simulated block count for the one not-yet-real phase (Phase 6 replaces
+// this loop with the terrain pipeline).
 const TERRAIN_BLOCKS: u32 = 12;
-const FINALIZE_BLOCKS: u32 = 2;
 /// Simulated cost of one block; stands in for real CPU work.
 const BLOCK_WORK: Duration = Duration::from_millis(2);
 /// Simulated bytes appended per completed block.
@@ -180,16 +187,15 @@ fn phase_plan(job: &JobSpec) -> Vec<Phase> {
     plan
 }
 
-/// Simulated block count for a phase (Passes 1/2/3 are real and dynamic → 0).
+/// Simulated block count for a phase (the real phases are dynamic → 0).
 fn sim_blocks(phase: Phase) -> u32 {
     match phase {
-        Phase::Pass1Nodes | Phase::Pass2Ways | Phase::Pass3Tiles => 0,
+        Phase::Pass1Nodes | Phase::Pass2Ways | Phase::Pass3Tiles | Phase::Finalize => 0,
         Phase::Terrain => TERRAIN_BLOCKS,
-        Phase::Finalize => FINALIZE_BLOCKS,
     }
 }
 
-/// One unit of simulated work (Phases 4-6 placeholders).
+/// One unit of simulated work (the Terrain placeholder).
 fn process_sim_block(cp: &mut Checkpoint) {
     std::thread::sleep(BLOCK_WORK);
     cp.bytes_written += BLOCK_OUTPUT_BYTES;
@@ -197,20 +203,32 @@ fn process_sim_block(cp: &mut Checkpoint) {
     cp.blocks_done += 1;
 }
 
-/// The per-job redb index (Coordinates + Ways tables). Lives beside the
-/// checkpoint; purged together with it on finish/cancel.
+/// The per-job redb index (Coordinates + Ways + TileFeatures + Finalize
+/// bookkeeping tables). Lives beside the checkpoint; purged together with
+/// it on finish/cancel.
 pub fn index_db_path(output_dir: &str, job_id: &str) -> PathBuf {
     Path::new(output_dir).join(format!("{job_id}.index.redb"))
+}
+
+/// The job's compiled output — the one artifact that SURVIVES the purge.
+pub fn archive_path(output_dir: &str, job_id: &str) -> PathBuf {
+    Path::new(output_dir).join(format!("{job_id}.pmtiles"))
+}
+
+/// Finalize's temporary payload store (encode-stage appends); purged with
+/// the rest of the job state.
+fn tile_data_tmp_path(output_dir: &str, job_id: &str) -> PathBuf {
+    Path::new(output_dir).join(format!("{job_id}.tiledata.tmp"))
 }
 
 // ---------------------------------------------------------------------------
 // Durable checkpoint persistence (std-only; becomes a redb table in Phase 7)
 // ---------------------------------------------------------------------------
 
-// v4: added pass3_last_way_id (P4.C2). Any format change bumps the version —
+// v5: added pass5_last_tile (P5.C1). Any format change bumps the version —
 // that discipline is what keeps kill-resume honest; older versions are
 // rejected as corrupt rather than guessed at (no shipped users yet).
-const CHECKPOINT_VERSION: u32 = 4;
+const CHECKPOINT_VERSION: u32 = 5;
 
 fn checkpoint_path(output_dir: &str, job_id: &str) -> PathBuf {
     Path::new(output_dir).join(format!("{job_id}.checkpoint"))
@@ -223,13 +241,14 @@ fn save_checkpoint(output_dir: &str, cp: &Checkpoint) -> Result<(), String> {
     let tmp_path = final_path.with_extension("checkpoint.tmp");
 
     let body = format!(
-        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\npass2_byte_offset={}\npass3_last_way_id={}\nbytes_written={}\nblocks_done={}\n",
+        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\npass2_byte_offset={}\npass3_last_way_id={}\npass5_last_tile={}\nbytes_written={}\nblocks_done={}\n",
         cp.job_id,
         cp.phase,
         cp.next_block,
         cp.pbf_byte_offset,
         cp.pass2_byte_offset,
         cp.pass3_last_way_id,
+        cp.pass5_last_tile,
         cp.bytes_written,
         cp.blocks_done,
     );
@@ -264,6 +283,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
     let mut pbf_byte_offset = None;
     let mut pass2_byte_offset = None;
     let mut pass3_last_way_id = None;
+    let mut pass5_last_tile = None;
     let mut bytes_written = None;
     let mut blocks_done = None;
 
@@ -279,6 +299,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             "pbf_byte_offset" => pbf_byte_offset = v.parse::<u64>().ok(),
             "pass2_byte_offset" => pass2_byte_offset = v.parse::<u64>().ok(),
             "pass3_last_way_id" => pass3_last_way_id = v.parse::<u64>().ok(),
+            "pass5_last_tile" => pass5_last_tile = v.parse::<u64>().ok(),
             "bytes_written" => bytes_written = v.parse::<u64>().ok(),
             "blocks_done" => blocks_done = v.parse::<u32>().ok(),
             other => return Err(format!("corrupted checkpoint: unknown key '{other}'")),
@@ -293,6 +314,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
         pbf_byte_offset,
         pass2_byte_offset,
         pass3_last_way_id,
+        pass5_last_tile,
         bytes_written,
         blocks_done,
     ) {
@@ -304,6 +326,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             Some(po),
             Some(p2o),
             Some(p3w),
+            Some(p5t),
             Some(bw),
             Some(bd),
         ) => {
@@ -319,6 +342,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
                 pbf_byte_offset: po,
                 pass2_byte_offset: p2o,
                 pass3_last_way_id: p3w,
+                pass5_last_tile: p5t,
                 bytes_written: bw,
                 blocks_done: bd,
             }))
@@ -330,13 +354,19 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
     }
 }
 
-/// Removes all durable state for a job: the checkpoint AND the redb index.
-/// Used by Finished (Blueprint step 8: "temporary redb files are purged")
-/// and by cancel/purge. Returns true if anything existed and was removed.
+/// Removes all durable TEMPORARY state for a job: the checkpoint, the redb
+/// index, Finalize's tile-data scratch file, and any half-written archive
+/// temp. The finished `.pmtiles` archive is deliberately NOT touched —
+/// it is the job's product, not its state. Used by Finished (Blueprint
+/// step 8: "temporary redb files are purged") and by cancel/purge.
+/// Returns true if anything existed and was removed.
 pub fn purge_job_state(output_dir: &str, job_id: &str) -> bool {
     let checkpoint_gone = fs::remove_file(checkpoint_path(output_dir, job_id)).is_ok();
     let index_gone = fs::remove_file(index_db_path(output_dir, job_id)).is_ok();
-    checkpoint_gone || index_gone
+    let tiledata_gone = fs::remove_file(tile_data_tmp_path(output_dir, job_id)).is_ok();
+    let archive_tmp_gone =
+        fs::remove_file(archive_path(output_dir, job_id).with_extension("pmtiles.tmp")).is_ok();
+    checkpoint_gone || index_gone || tiledata_gone || archive_tmp_gone
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +411,7 @@ pub fn run_slice(
             pbf_byte_offset: 0,
             pass2_byte_offset: 0,
             pass3_last_way_id: 0,
+            pass5_last_tile: 0,
             bytes_written: 0,
             blocks_done: 0,
         },
@@ -546,8 +577,98 @@ pub fn run_slice(
                 }
                 cp.next_block = 0;
             }
-            // ---- Simulated phases (Phases 5-6 placeholders) --------------
-            _ => {
+            // ---- REAL Finalize: TileFeatures → MVT → PMTiles v3 ----------
+            Phase::Finalize => {
+                let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
+                    Ok(db) => db,
+                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                };
+                let data_path = tile_data_tmp_path(&job.output_dir, &job.job_id);
+                let total_rows = match tiles::tile_feature_row_count(&db) {
+                    Ok(n) => n,
+                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                };
+
+                // Stage 1: budget-yieldable MVT encode of every tile.
+                let sub = match tiles::run_finalize_encode_slice(
+                    &db,
+                    &data_path,
+                    cp.pass5_last_tile,
+                    &mut || started.elapsed() >= budget,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                };
+
+                cp.pass5_last_tile = sub.last_tile_id;
+                cp.next_block += sub.features_drained;
+                cp.blocks_done += sub.tiles_encoded;
+                cp.bytes_written += sub.payload_bytes_written;
+                slice_blocks += sub.tiles_encoded;
+
+                // Encode spans the first 90% of this phase's progress; the
+                // assembly block is the final 10%.
+                let frac = if total_rows == 0 {
+                    0.9
+                } else {
+                    0.9 * (cp.next_block as f32 / total_rows as f32)
+                };
+                let pct = ((idx as f32 + frac) / n_phases) * 100.0;
+                on_progress(
+                    pct,
+                    format!(
+                        "{} ({}/{total_rows} features packed)",
+                        phase.label(),
+                        cp.next_block
+                    ),
+                );
+
+                if !sub.finished {
+                    return match save_checkpoint(&job.output_dir, &cp) {
+                        Ok(()) => SliceOutcome::Yielded(cp),
+                        Err(e) => SliceOutcome::Failed(e),
+                    };
+                }
+                // Encode complete. Assembly is one atomic, idempotent block;
+                // if this slice already spent its budget, yield first and
+                // let the next slice own it (min-progress covers a fresh
+                // slice whose budget is already zero).
+                if slice_blocks > 0 && started.elapsed() >= budget {
+                    return match save_checkpoint(&job.output_dir, &cp) {
+                        Ok(()) => SliceOutcome::Yielded(cp),
+                        Err(e) => SliceOutcome::Failed(e),
+                    };
+                }
+
+                // Stage 2: assemble the archive at its final destination —
+                // BEFORE the loop exit purges the index this data lives in.
+                let bounds = (job.bbox.west, job.bbox.south, job.bbox.east, job.bbox.north);
+                let out_path = archive_path(&job.output_dir, &job.job_id);
+                let info = match tiles::assemble_archive(&db, &data_path, &out_path, bounds) {
+                    Ok(i) => i,
+                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                };
+
+                // Encode already accounted the data section (payload
+                // appends); assembly adds the header + directories +
+                // metadata, so a clean run's total equals the archive size.
+                cp.bytes_written += info.archive_bytes - info.tile_data_bytes;
+                cp.blocks_done += 1;
+                slice_blocks += 1;
+                let pct = ((idx as f32 + 1.0) / n_phases) * 100.0;
+                on_progress(
+                    pct,
+                    format!(
+                        "{} ({} tiles, {} bytes)",
+                        phase.label(),
+                        info.tile_entries,
+                        info.archive_bytes
+                    ),
+                );
+                cp.next_block = 0;
+            }
+            // ---- Simulated phase (Phase 6 placeholder) -------------------
+            Phase::Terrain => {
                 let blocks = sim_blocks(phase);
                 while cp.next_block < blocks {
                     // Budget check BEFORE each block, except when this slice
@@ -617,15 +738,27 @@ mod tests {
     /// Way 500 fits inside one z14 tile, clear of the buffer zone.
     const FIXTURE_TILE_FEATURES: u64 = 1;
 
+    /// Finalize's dynamic block count for the fixture: one encoded tile
+    /// (the single binned feature's tile) + the assembly block.
+    const FIXTURE_FINALIZE_BLOCKS: u32 = FIXTURE_TILE_FEATURES as u32 + 1;
+
     fn sim_total(dem: bool) -> u32 {
-        (if dem { TERRAIN_BLOCKS } else { 0 }) + FINALIZE_BLOCKS
+        if dem {
+            TERRAIN_BLOCKS
+        } else {
+            0
+        }
     }
 
     fn expected_blocks(dem: bool) -> u32 {
-        FIXTURE_BLOCKS * 2 + FIXTURE_WAYS as u32 + sim_total(dem)
+        FIXTURE_BLOCKS * 2 + FIXTURE_WAYS as u32 + sim_total(dem) + FIXTURE_FINALIZE_BLOCKS
     }
 
-    fn expected_bytes(dem: bool) -> u64 {
+    /// Static part of the byte accounting. A finished job's total is this
+    /// plus the real archive size (encode counts the data section, assembly
+    /// counts header + directories + metadata) — callers measure that from
+    /// disk, since gzip output length isn't worth hand-deriving.
+    fn expected_bytes_before_finalize(dem: bool) -> u64 {
         FIXTURE_NODES * NODE_INDEX_BYTES
             + FIXTURE_WAYS * WAY_INDEX_BYTES
             + FIXTURE_TILE_FEATURES * TILE_FEATURE_BYTES
@@ -670,13 +803,20 @@ mod tests {
         match out {
             SliceOutcome::Finished(s) => {
                 assert_eq!(s.blocks_total, expected_blocks(true));
-                assert_eq!(s.bytes_written, expected_bytes(true));
+                let archive_len = fs::metadata(archive_path(&job.output_dir, &job.job_id))
+                    .unwrap()
+                    .len();
+                assert_eq!(
+                    s.bytes_written,
+                    expected_bytes_before_finalize(true) + archive_len,
+                    "a clean run's finalize accounting must equal the archive size"
+                );
             }
             other => panic!("expected Finished, got {other:?}"),
         }
         // 1 event per real-pass sub-slice (whole file/table each) + 1 per
-        // sim block.
-        assert_eq!(ticks, 3 + sim_total(true));
+        // sim block + 2 finalize events (encode slice + assembly).
+        assert_eq!(ticks, 3 + sim_total(true) + 2);
         assert!(
             load_checkpoint(&job.output_dir, &job.job_id)
                 .unwrap()
@@ -1027,30 +1167,112 @@ mod tests {
             assert!(slices < 10_000, "runaway");
         };
 
-        // 265 real PBF blocks walked by passes 1 AND 2, one Pass-3 "block"
-        // per indexed way, + simulated placeholders. Solve for the two
-        // dynamic counts from the two summary totals.
-        let ways = u64::from(summary.blocks_total) - 265 * 2 - u64::from(sim_total(true));
-        let known = 1_900_652 * NODE_INDEX_BYTES
-            + ways * WAY_INDEX_BYTES
-            + u64::from(sim_total(true)) * BLOCK_OUTPUT_BYTES;
-        let features = (summary.bytes_written - known) / TILE_FEATURE_BYTES;
-        // The Innsbruck fixture holds 29,558 highway paths alone (research
-        // md); our filter adds waterway/natural/ele ways on top.
+        // 265 real PBF blocks walked by passes 1 AND 2, one Pass-3 block
+        // per indexed way, one Finalize block per encoded tile + 1 assembly
+        // block, + the simulated Terrain placeholder. Ways and tiles are no
+        // longer separable from the block count alone, so plausibility-gate
+        // against the REAL archive the run must now produce.
+        let archive = fs::read(archive_path(&job.output_dir, &job.job_id)).unwrap();
+        assert_eq!(&archive[0..7], b"PMTiles");
+        assert_eq!(archive[7], 3);
+        let entries = u64::from_le_bytes(archive[80..88].try_into().unwrap());
+        let data_off = u64::from_le_bytes(archive[56..64].try_into().unwrap());
+        let data_len = u64::from_le_bytes(archive[64..72].try_into().unwrap());
+        assert_eq!(data_off + data_len, archive.len() as u64);
+
+        // dynamic = ways + tiles_encoded. The Innsbruck fixture holds
+        // 29,558 highway paths alone (research md), and every archive entry
+        // implies an encoded tile — both floors must hold together. The
+        // extract's 97,619 features concentrate ~96 per tile (dense city
+        // core + valley corridors), so the DISTINCT-tile count is in the
+        // ~1,000 range, not the feature range.
+        let dynamic = u64::from(summary.blocks_total) - 265 * 2 - u64::from(sim_total(true)) - 1;
         assert!(
-            ways > 29_000,
-            "implausibly few renderable ways: {ways} (blocks {})",
-            summary.blocks_total
+            (500..20_000).contains(&entries),
+            "archive tile count outside the plausible band: {entries}"
         );
-        // Nearly every assemblable way bins into at least one z14 tile.
         assert!(
-            features > ways / 2,
-            "implausibly few tile features: {features} for {ways} ways"
+            dynamic > 29_000 + entries,
+            "implausibly few renderable ways: dynamic={dynamic}, entries={entries}"
         );
+        assert!(summary.bytes_written > archive.len() as u64);
         println!(
-            "real end-to-end: {} blocks / {ways} ways / {features} tile features / {slices} yields",
-            summary.blocks_total
+            "real end-to-end: {} blocks / {entries} archive tiles / {} archive bytes / {slices} yields",
+            summary.blocks_total,
+            archive.len()
         );
+    }
+
+    /// The P5.C1 contract line: the archive is written to its final
+    /// destination BEFORE the purge deletes the index it was built from,
+    /// and it is the ONLY artifact that survives.
+    #[test]
+    fn finalize_writes_archive_before_purge() {
+        let dir = tmp_dir("archive");
+        let job = test_job(&dir, false);
+        let out = run_slice(&job, BIG, &mut |_, _| {});
+        assert!(matches!(out, SliceOutcome::Finished(_)), "got {out:?}");
+
+        let archive = archive_path(&job.output_dir, &job.job_id);
+        let bytes = fs::read(&archive).expect("archive must exist after finish");
+        assert_eq!(&bytes[0..7], b"PMTiles", "magic");
+        assert_eq!(bytes[7], 3, "spec version");
+        assert_eq!(
+            u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
+            FIXTURE_TILE_FEATURES,
+            "directory must hold exactly the fixture's single tile"
+        );
+        let data_off = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
+        let data_len = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+        assert_eq!(
+            data_off + data_len,
+            bytes.len() as u64,
+            "tile data section must end exactly at EOF"
+        );
+
+        // Everything temporary is gone; the archive remains.
+        assert!(load_checkpoint(&job.output_dir, &job.job_id)
+            .unwrap()
+            .is_none());
+        assert!(!index_db_path(&job.output_dir, &job.job_id).exists());
+        assert!(!tile_data_tmp_path(&job.output_dir, &job.job_id).exists());
+        assert!(archive.exists());
+    }
+
+    /// Finalize must yield mid-phase with a durable `pass5_last_tile`
+    /// cursor and still converge to a valid archive — the kill-resume
+    /// contract extended to the fifth phase.
+    #[test]
+    fn finalize_yields_mid_phase_with_durable_tile_cursor() {
+        let dir = tmp_dir("p5cursor");
+        let job = test_job(&dir, false);
+        let mut saw_finalize_cursor = false;
+        for _ in 0..1_000 {
+            match run_slice(&job, Duration::ZERO, &mut |_, _| {}) {
+                SliceOutcome::Yielded(cp) => {
+                    if cp.phase == Phase::Finalize && cp.pass5_last_tile > 0 {
+                        let disk = load_checkpoint(&job.output_dir, &job.job_id)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            disk.pass5_last_tile, cp.pass5_last_tile,
+                            "the tile cursor must be durable, not just returned"
+                        );
+                        saw_finalize_cursor = true;
+                    }
+                }
+                SliceOutcome::Finished(_) => {
+                    assert!(
+                        saw_finalize_cursor,
+                        "zero-budget run never exposed a finalize cursor"
+                    );
+                    assert!(archive_path(&job.output_dir, &job.job_id).exists());
+                    return;
+                }
+                SliceOutcome::Failed(e) => panic!("{e}"),
+            }
+        }
+        panic!("did not finish");
     }
 
     #[test]

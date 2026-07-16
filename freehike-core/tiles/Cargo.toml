@@ -6,3 +6,8 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+pbf = { workspace = true }
+geom = { workspace = true }
+redb = { workspace = true }
+prost = { workspace = true }
+flate2 = { workspace = true }

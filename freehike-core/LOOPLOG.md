@@ -1029,3 +1029,131 @@ grid traversal.
 format, and MVT-buffer math all accepted. Committed with this entry per
 operator instruction. **The Rust backend is FROZEN at this commit per
 operator directive** — no further core chunks; work halts here.
+
+---
+
+## P5.C1 — Out-of-core Finalize: MVT encode + PMTiles v3 assembly
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-16
+**Operator context:** core freeze (P4.C2) lifted 2026-07-16 for Phase 5. Directive
+approves MVT/gzip dependency additions in-band (§1.5): `flate2` chosen (pure-Rust
+miniz_oxide backend — same inflate library Pass 1 already ships, gains a correct
+gzip wrapper + CRC32); MVT wire format via HAND-DERIVED prost structs in `tiles`
+(house pattern from pbf/src/proto.rs — no protoc, no new tree); PMTiles v3 writer
+hand-rolled (127-byte header + varint directories; the `pmtiles` crate is
+async/reader-shaped, wrong fit for a sequential mobile writer).
+
+**Goal:** replace the simulated `Finalize` arm with a real two-stage driver:
+(1) ENCODE — drain `TileFeatures` per tile → MVT (extent 4096, tile-local
+quantization matching Pass 3's 64/4096 buffer) → gzip → dedup → append to a tmp
+data file, yieldable per tile with cursor `pass5_last_tile` (checkpoint v5);
+(2) ASSEMBLE — Hilbert-ordered clustered data section + root directory +
+gzip'd metadata + exact-offset header, atomic tmp+rename to `{job_id}.pmtiles`,
+written BEFORE the index purge.
+
+**Files declared:** freehike-core/Cargo.toml (+flate2), tiles/Cargo.toml,
+tiles/src/{lib,hilbert,mvt,pmtiles,finalize}.rs (crate becomes real),
+compiler/Cargo.toml (+tiles), compiler/src/engine.rs (Finalize arm, checkpoint
+v5, purge of tiledata tmp), ffi/src/lib.rs (test expectation only — NO surface
+change), LOOPLOG.
+
+**Durability design (the load-bearing part):**
+- Encode slice = one read txn over TILE_FEATURES + ONE write txn holding
+  `FinalizeTileEntries` (tile_id → (offset,len) in tmp data file) and
+  `FinalizePayloadHashes` (FNV-1a64 → (offset,len), byte-verified on hit so a
+  hash collision can never alias a wrong tile). Payload bytes fsync'd BEFORE
+  the entry txn commits; cursor reported after both — checkpoint never runs
+  ahead of durable data. Torn tail from a crash mid-append is truncated on
+  resume to the entries' high-water mark. Re-encoding after a stale checkpoint
+  is idempotent (identical payload → dedup hit → identical entry row).
+- Assembly is a single idempotent block (atomic tmp+rename); if killed between
+  rename and purge, the resume re-assembles identical bytes. Yield honored
+  BETWEEN encode-exhaustion and assembly so a spent budget never overruns.
+- Data section re-ordered at assembly into ascending-tile_id (Hilbert) order →
+  `clustered=1` per spec; dedup'd entries point back at first occurrence.
+- KNOWN SIMPLIFICATIONS (logged): root-directory-only layout (spec-valid; leaf
+  splitting when entry counts demand it is a follow-up chunk); run_length
+  coalescing not implemented (all run_length=1); single MVT layer "features"
+  with way_id as feature id and NO attributes — TileFeatures stores geometry
+  only; persisting the matched tag class through Pass 2/3 for styled layers is
+  flagged as required follow-up work.
+
+**Proof tests (named up front):**
+- tiles::hilbert: z0/z1/z2 ids match the PMTiles reference values (1..4, 5, 7),
+  zoom base offsets, exhaustive xy2d↔d2xy roundtrip z≤5 + spot z14.
+- tiles::mvt: exact MoveTo/LineTo/zigzag command stream for a known geometry,
+  tile-local scaling, buffered vertices beyond extent survive, degenerate
+  segments dropped, all-degenerate tile → None, payload prost-decodes.
+- tiles::pmtiles: header is byte-exact 127 with fields at spec offsets,
+  directory varint roundtrip incl. offset-0 continuation encoding.
+- tiles::finalize: **archive_from_dummy_rows_validates_header** (the directive's
+  integration test: dummy TILE_FEATURES rows → encode → assemble → header magic/
+  version/offset arithmetic + root-dir readback + gunzip + prost decode + dedup
+  contents<entries), yield-every-tile resume with zero duplication, torn-tail
+  truncation, empty-table → valid empty archive.
+- compiler::engine: suite updated to checkpoint v5 + real finalize accounting;
+  new finalize_writes_archive_before_purge (archive exists + magic bytes after
+  Finished; checkpoint/index/tmp all gone) and mid-encode yield exposing
+  pass5_last_tile > 0; determinism (sliced==single) now covers real Finalize.
+- ffi: blocks_total expectation updated (finalize = tiles + 1 assembly block).
+- Ladder: L1 ×2 green-lock + `cargo ndk -t arm64-v8a build -p ffi`.
+
+**Attempts:**
+- A1: `flate2` (default-features off, `rust_backend` only) added to workspace;
+  tree audit confirms pure miniz_oxide underneath — zero C in the mobile path.
+  `tiles` crate rebuilt from Phase-0 stub into hilbert/mvt/pmtiles/finalize
+  modules; compiler gains the `tiles` dep; `Phase::Finalize` arm made real;
+  checkpoint v4→v5 (+`pass5_last_tile`); purge extended to the tiledata tmp +
+  half-written archive tmp (final `.pmtiles` explicitly survives).
+- A2: first `cargo test -p tiles`: Hilbert rotate panicked on debug-build
+  subtract overflow — the classic algorithm's `s-1-x` reflection relies on
+  wrapping when unprocessed high bits are present. FIX: mask processed bits
+  (`x &= s-1`) before rotating; equivalent modulo the bits ever read again.
+  Spec-example IDs (z0/z1/z2 published values), exhaustive z≤5 roundtrip, and
+  curve-adjacency tests all green after.
+- A3: one test-side assertion bug self-caught: asserted the encode cursor
+  monotonic in HILBERT id space; it is monotonic in (z,x,y) SCAN order (the
+  ids deliberately jump around the row-major scan; resume maps id→(z,x,y)
+  bijectively, so the contract was never at risk). Assertion fixed to the
+  real invariant.
+- A4: clippy -D warnings: type_complexity (encode_tile_mvt signature → reuse
+  `pbf::tile::TileFeature`) + map_identity (test) — both fixed; fmt applied.
+- A5: workspace 118/118 green (24 compiler / 20 tiles / 36 pbf / 18 geom /
+  7 ffi / 13 fetcher; 3 ignored L2s). Green-lock ×2 (tests + clippy + fmt).
+- A6 **L2 real-data:** integrated engine over the real 19.5MB Innsbruck
+  extract, 250ms budget, release: **82,957 blocks / 1,019 archive tiles /
+  2,419,611-byte basemap.pmtiles / 12 yields / 3.37s** all five phases.
+  Block algebra cross-checks exactly: 530 (passes 1+2) + 81,395 ways + 12
+  terrain-sim + 1,019 tiles + 1 assembly = 82,957. One plausibility floor in
+  the L2 test was MINE not the code's: guessed >10k distinct tiles, but
+  97,619 features concentrate ~96/tile → 1,019 tiles (~6,000km² at z14) —
+  floor corrected to a defensible band.
+- A7 **Independent reference-reader proof (beyond the declared ladder):**
+  the archive validated with the app's own `pmtiles` JS package (4.4.1,
+  the exact reader the client uses): header parses (v3, MVT, clustered,
+  bounds exact, 1019/1019/1019 counts), metadata JSON parses with
+  vector_layers, and `getZxy(14, 8710, 5744)` (Innsbruck centre) returns a
+  56,897-byte de-gzipped tile opening with the MVT `layers` field tag
+  (0x1A). Writer proven against the reference parser, not just our own.
+- A8: `cargo ndk -t arm64-v8a build -p ffi` CLEAN — full shipping chain
+  (ffi→compiler→tiles→pbf/geom + flate2) cross-compiles.
+
+**Outcome:** CLOSED. Pivots: 1 (Hilbert debug-overflow fix; A3/A6 were
+test-side corrections). The pipeline is now END-TO-END REAL for a flat
+basemap: PBF → nodes → ways → tile binning → MVT+gzip → PMTiles v3 at
+`archive_path`, all under the budget-yield/kill-resume contract. Terrain
+remains the only simulated phase (Phase 6, deferred per operator).
+FFI surface UNCHANGED (no HITL gate triggered).
+**Follow-ups logged:** tag/class persistence through Pass 2/3 for styled MVT
+layers (currently single anonymous "features" layer); leaf-directory split
+for large entry counts; run_length coalescing; client wiring of the produced
+archive (Phase 5 exit criterion — render in the FreeHike app — is the NEXT
+chunk's proof).
+
+**Operator review:** APPROVED — hand-rolled prost structs and FNV-1a64 dedup
+accepted as aligned with the zero-dependency, mobile-first constraints.
+Committed with this entry per operator instruction. **The Rust backend is
+LOCKED at this commit per operator directive** — Phase 5 compiler work
+complete; next work is client integration of the produced `.pmtiles`
+archive (the Phase 5 exit criterion: render in the FreeHike app).

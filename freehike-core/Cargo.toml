@@ -18,6 +18,10 @@ memmap2 = "0.9"
 # in pbf/src/proto.rs — no protoc/build.rs in the mobile cross-compile path.
 prost = "0.14"
 miniz_oxide = "0.9"
+# Gzip for MVT payloads + PMTiles internal compression (Phase 5): pure-Rust
+# backend (miniz_oxide — the same inflate core Pass 1 already ships), no
+# zlib-sys in the mobile cross-compile path.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 compiler = { path = "compiler" }
 pbf = { path = "pbf" }
 terrain = { path = "terrain" }

@@ -303,8 +303,9 @@ mod tests {
         match status {
             CompilationStatus::Finished { summary } => {
                 // Fixture: 2 blocks (header + 1 node data) walked by each
-                // real pass + simulated terrain/finalize (12 + 2).
-                assert_eq!(summary.blocks_total, 2 * 2 + 14);
+                // real pass + simulated terrain (12) + real finalize on a
+                // nodes-only extract (0 ways → 0 tiles + 1 assembly block).
+                assert_eq!(summary.blocks_total, 2 * 2 + 12 + 1);
                 assert!(summary.bytes_written > 0);
             }
             other => panic!("expected Finished, got {other:?}"),

@@ -135,6 +135,65 @@ function getGlobalProtocol(): Protocol {
 }
 
 // ---------------------------------------------------------------------------
+// mapData worker teardown gate
+//
+// React 18 StrictMode double-invokes the boot effect in dev (mount → cleanup
+// → remount). Each mount spawns its own mapData worker and asks it to
+// createSyncAccessHandle() the same OPFS files. Worker.terminate() kills the
+// old worker's thread immediately but does NOT guarantee its OPFS handle
+// locks are released synchronously with that call — the browser's release of
+// an implicitly-abandoned handle can lag terminate() by a tick or more. If
+// the new mount's worker tries to open the same files before that lag
+// clears, createSyncAccessHandle() throws "Access Handles cannot be created
+// if there is another open Access Handle...".
+//
+// Fix: an explicit handle.close() (which the worker's MAP_CLOSE handler
+// performs) *is* synchronous and guaranteed. So cleanup asks the outgoing
+// worker to MAP_CLOSE, awaits its acknowledgment, *then* terminates it — and
+// chains that whole sequence into this module-level promise. The next
+// mount's MAP_INIT send awaits this same promise before firing, so it always
+// runs strictly after the previous worker's handles are actually closed.
+// ---------------------------------------------------------------------------
+
+let pendingWorkerTeardown: Promise<void> = Promise.resolve();
+
+/**
+ * Asks a mapData worker to close its open OPFS SyncAccessHandles and waits
+ * for its acknowledgment (or a timeout, in case the worker is already wedged
+ * / unresponsive) before resolving. Callers should terminate() the worker
+ * only after this resolves.
+ */
+function closeWorkerHandles(worker: Worker, timeoutMs = 1500): Promise<void> {
+  return new Promise((resolve) => {
+    const closeId = `close-${Math.random().toString(36).substring(2, 9)}`;
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      worker.removeEventListener('message', onMessage);
+      clearTimeout(timer);
+      resolve();
+    };
+
+    const onMessage = (event: MessageEvent<WorkerResponseMessage>) => {
+      if (event.data.id !== closeId) return;
+      finish();
+    };
+
+    worker.addEventListener('message', onMessage);
+    const timer = setTimeout(finish, timeoutMs);
+
+    try {
+      worker.postMessage({ id: closeId, type: 'MAP_CLOSE', payload: null } satisfies WorkerRequestMessage);
+    } catch {
+      // Worker already terminated/unresponsive — nothing to wait for.
+      finish();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Blank DEM tile placeholder (for contour-generation neighbors that fall
 // outside our clipped terrain coverage — see demSource.manager.getTile below)
 // ---------------------------------------------------------------------------
@@ -694,26 +753,31 @@ export default function MapView({
 
     mapDataWorker.addEventListener('message', handleInitMessage);
     setStatusMessage('Syncing binary file buffers to OPFS…');
-    // Send the two default filenames so the worker opens SyncAccessHandles
-    // for both OPFS files during init.  Subsequent MAP_READ_BYTES requests
-    // will find the handles ready without an extra round-trip.
-    mapDataWorker.postMessage({
-      id:      initId,
-      type:    'MAP_INIT',
-      payload: { filenames: [DEFAULT_BASEMAP, DEFAULT_TERRAIN] },
-    } satisfies WorkerRequestMessage);
+    // Wait for the previous mount's worker (if any) to fully close its OPFS
+    // handles before asking this worker to open the same files — see the
+    // pendingWorkerTeardown comment above. On a normal first mount this
+    // promise is already resolved, so the send fires on the next microtask
+    // with no perceptible delay.
+    // Wait for the previous mount's worker (if any) to fully close its OPFS
+    // handles before asking this worker to open the same files — see the
+    // pendingWorkerTeardown comment above. On a normal first mount this
+    // promise is already resolved, so the send fires on the next microtask
+    // with no perceptible delay.
+    pendingWorkerTeardown.then(() => {
+      if (!active) return; // unmounted again before this mount's init could fire
+      // Send the two default filenames so the worker opens SyncAccessHandles
+      // for both OPFS files during init.  Subsequent MAP_READ_BYTES requests
+      // will find the handles ready without an extra round-trip.
+      mapDataWorker.postMessage({
+        id:      initId,
+        type:    'MAP_INIT',
+        payload: { filenames: [DEFAULT_BASEMAP, DEFAULT_TERRAIN] },
+      } satisfies WorkerRequestMessage);
+    });
 
     return () => {
       active = false;
-      try {
-        mapDataWorker.postMessage({
-          id:      'close-id',
-          type:    'MAP_CLOSE',
-          payload: null,
-        } satisfies WorkerRequestMessage);
-      } catch {
-        // Ignored if worker is already terminated/unresponsive
-      }
+      mapDataWorker.removeEventListener('message', handleInitMessage);
 
       // Clear the global protocol tiles registry to release any references/handles
       // to offline files on map unmount
@@ -728,7 +792,14 @@ export default function MapView({
       mapRef.current?.remove();
       mapRef.current = null;
 
-      mapDataWorker.terminate();
+      // Ask the worker to close its OPFS handles and wait for confirmation
+      // before terminating it — terminate() alone doesn't guarantee the
+      // underlying file locks are released before the next mount's worker
+      // tries to open the same files. The next mount's MAP_INIT send (above)
+      // chains off this same promise, so it can never race this close.
+      pendingWorkerTeardown = closeWorkerHandles(mapDataWorker).then(() => {
+        mapDataWorker.terminate();
+      });
     };
   // onMapDataWorkerReady, onRegionSwitcherReady, and onMapDataError are
   // intentionally omitted: the mapData worker and MapLibre map are

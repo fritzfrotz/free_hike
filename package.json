@@ -22,7 +22,8 @@
     "maplibre-gl": "^5.24.0",
     "pmtiles": "^4.4.1",
     "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "react-dom": "^19.2.6",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.4.1",

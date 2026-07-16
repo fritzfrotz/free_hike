@@ -6,6 +6,8 @@ import type { WorkerRequestMessage, WorkerResponseMessage, MapInitSuccessPayload
 import 'maplibre-gl/dist/maplibre-gl.css';
 import mlcontour from 'maplibre-contour';
 import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
+import { useMapStore } from '../../store/mapStore';
+import DownloadProgressBar, { type DownloadProgressHandle } from './DownloadProgressBar';
 
 // ---------------------------------------------------------------------------
 // Telemetry (OPFS byte-range reads from the mapData worker)
@@ -245,14 +247,18 @@ export interface MapViewProps {
   onPositionUpdate?: (pos: { lng: number; lat: number; accuracy: number }) => void;
   /** Called when the user confirms a region download; receives the current bounds. */
   onRegionDownload?: (bounds: maplibregl.LngLatBounds) => void;
-  /** Current state of an in-progress download (drives the confirm panel). */
-  downloadStatus?: 'idle' | 'fetching' | 'writing' | 'done' | 'error';
-  /** Progress label to show inside the panel while fetching/writing. */
-  downloadProgressLabel?: string;
+  /**
+   * Called once the download progress bar mounts with its imperative byte
+   * sink, so the parent's fetch loop can push chunk counts without routing
+   * them through props/state (see DownloadProgressBar).
+   */
+  onDownloadProgressReady?: (handle: DownloadProgressHandle) => void;
   /**
    * Called once after the map finishes loading with an imperative switcher
    * object.  The parent can store it in a ref and call
    * switcher.loadOfflineRegion() whenever the user selects a new region.
+   * Note: MapView also self-wires this internally via useMapStore's
+   * activeRegion — this callback remains for external consumers only.
    */
   onRegionSwitcherReady?: (switcher: OfflineRegionSwitcher) => void;
 }
@@ -268,12 +274,17 @@ export default function MapView({
   onMapDataError,
   onPositionUpdate,
   onRegionDownload,
-  downloadStatus        = 'idle',
-  downloadProgressLabel = '',
+  onDownloadProgressReady,
   onRegionSwitcherReady,
 }: MapViewProps) {
   const mapContainerRef  = useRef<HTMLDivElement>(null);
   const mapRef           = useRef<maplibregl.Map | null>(null);
+  const regionSwitcherRef = useRef<OfflineRegionSwitcher | null>(null);
+  /** Filenames the live MapLibre sources are currently bound to — lets
+   *  loadOfflineRegion() skip re-registering a source that hasn't changed
+   *  (re-registering an already-active PMTiles source duplicates its worker
+   *  reader and corrupts in-flight tile transfers). */
+  const activeFilesRef = useRef<{ basemap: string; terrain: string }>({ basemap: '', terrain: '' });
   const mapDataWorkerRef = useRef<Worker | null>(null);   // OPFS / PMTiles worker
   const spatialWorkerRef = useRef<Worker | null>(null);   // Spatial index worker
   const throttleRef      = useRef(makeThrottle(120));     // 120 ms proximity throttle
@@ -308,11 +319,12 @@ export default function MapView({
   // Phase 9: Live GPS location tracking
   // ---------------------------------------------------------------------------
 
-  /** Whether the map camera should auto-follow the GPS position. */
-  const [isTrackingCamera, setIsTrackingCamera] = useState(false);
-  /** Ref mirror of isTrackingCamera so the long-lived GPS watcher closure
-   *  always reads the current value without needing to re-register. */
-  const isTrackingCameraRef = useRef(false);
+  // Whether the map camera should auto-follow the GPS position. Lives in
+  // useMapStore rather than local state — the long-lived GPS watcher closure
+  // below reads it via useMapStore.getState() (no ref-mirror needed; that's
+  // exactly the point of a store that lives outside the component tree).
+  const isTrackingCamera = useMapStore((s) => s.isTrackingCamera);
+  const setTrackingCamera = useMapStore((s) => s.setTrackingCamera);
   /** Stores the active tracker handle so we can stop it on unmount.
    *  TrackerHandle is a tagged union — kind:'native' holds a string watcher
    *  ID from the Capacitor plugin; kind:'web' holds a number from the
@@ -327,6 +339,16 @@ export default function MapView({
 
   /** Whether the download zone overlay and confirm panel are visible. */
   const [isDownloadMode, setIsDownloadMode] = useState(false);
+
+  // Coarse download state (idle/fetching/writing/done/error) — read directly
+  // from useMapStore instead of via props. App.tsx writes to it during the
+  // fetch pipeline; the byte-level counter never touches this store (see
+  // DownloadProgressBar's own ref-based sink).
+  const regionDownloadStatus = useMapStore((s) => s.regionDownloadStatus);
+  const regionDownloadLabel  = useMapStore((s) => s.regionDownloadLabel);
+  /** The offline region bound to the live MapLibre sources — hot-swapped via
+   *  loadOfflineRegion() below whenever this changes, without a style reload. */
+  const activeRegion = useMapStore((s) => s.activeRegion);
 
   // Start and end coordinates for routing clicks
   const [startPt, setStartPt] = useState<[number, number] | null>(null);
@@ -355,6 +377,7 @@ export default function MapView({
     //   pmtiles://local/alps_terrain.pmtiles  → terrain-local MapLibre source
     const DEFAULT_BASEMAP  = 'alps_basemap.pmtiles';
     const DEFAULT_TERRAIN  = 'alps_terrain.pmtiles';
+    activeFilesRef.current = { basemap: DEFAULT_BASEMAP, terrain: DEFAULT_TERRAIN };
 
     const protocol = getGlobalProtocol();
     let   map: maplibregl.Map | null = null;
@@ -441,16 +464,33 @@ export default function MapView({
               exaggeration: 1.3,
             });
 
-            // ── Expose imperative region-switcher to the parent ───────────
-            // loadOfflineRegion() lets App (or a future download manager UI)
-            // hot-swap both tile sources without a full style reload.
-            if (onRegionSwitcherReady) {
+            // ── Build the imperative region-switcher ──────────────────────
+            // loadOfflineRegion() hot-swaps both tile sources without a full
+            // style reload. Stored in a ref so the activeRegion effect below
+            // can invoke it directly; also handed to onRegionSwitcherReady
+            // for any external caller that still wants it.
+            {
               const switcher: OfflineRegionSwitcher = {
                 async loadOfflineRegion(basemapFile: string, terrainFile: string) {
                   const worker = mapDataWorkerRef.current;
                   if (!worker) throw new Error('[loadOfflineRegion] mapData worker not ready.');
 
-                  // 1. Ask the worker to open SyncAccessHandles for both new files.
+                  // Only touch sources whose filename actually changed —
+                  // re-registering an already-active PMTiles source spins up
+                  // a second WorkerPMTilesSource/PMTiles pair for the same
+                  // file, which corrupts in-flight tile transfers on the
+                  // pre-existing source (surfaces as MapLibre "ArrayBuffer
+                  // already detached" postMessage errors).
+                  const basemapChanged = basemapFile !== activeFilesRef.current.basemap;
+                  const terrainChanged = terrainFile !== activeFilesRef.current.terrain;
+                  if (!basemapChanged && !terrainChanged) return;
+
+                  const changedFilenames = [
+                    ...(basemapChanged ? [basemapFile] : []),
+                    ...(terrainChanged ? [terrainFile] : []),
+                  ];
+
+                  // 1. Ask the worker to open SyncAccessHandles for the new files.
                   const loadId  = Math.random().toString(36).substring(2, 9);
                   await new Promise<void>((resolve, reject) => {
                     const onMsg = (ev: MessageEvent<WorkerResponseMessage>) => {
@@ -463,28 +503,32 @@ export default function MapView({
                     worker.postMessage({
                       id:      loadId,
                       type:    'LOAD_OFFLINE_REGION',
-                      payload: { filenames: [basemapFile, terrainFile] },
+                      payload: { filenames: changedFilenames },
                     } satisfies WorkerRequestMessage);
                   });
 
-                  // 2. Register new WorkerPMTilesSource + PMTiles instances.
-                  registerSource(basemapFile);
-                  registerSource(terrainFile);
+                  // 2. Register new WorkerPMTilesSource + PMTiles instances
+                  //    only for the files that changed.
+                  if (basemapChanged) registerSource(basemapFile);
+                  if (terrainChanged) registerSource(terrainFile);
 
                   // 3. Swap the live MapLibre sources to the new pmtiles:// URLs.
                   //    setUrl() updates the source in-place — no layer teardown.
                   const bSrc = activeMap.getSource('basemap-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
                   const tSrc = activeMap.getSource('terrain-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
 
-                  if (bSrc?.setUrl) bSrc.setUrl(`pmtiles://local/${basemapFile}`);
-                  if (tSrc?.setUrl) tSrc.setUrl(`pmtiles://local/${terrainFile}`);
+                  if (basemapChanged && bSrc?.setUrl) bSrc.setUrl(`pmtiles://local/${basemapFile}`);
+                  if (terrainChanged && tSrc?.setUrl) tSrc.setUrl(`pmtiles://local/${terrainFile}`);
+
+                  activeFilesRef.current = { basemap: basemapFile, terrain: terrainFile };
 
                   console.log(
                     `[MapView] Offline region swapped → basemap: ${basemapFile}, terrain: ${terrainFile}`,
                   );
                 },
               };
-              onRegionSwitcherReady(switcher);
+              regionSwitcherRef.current = switcher;
+              onRegionSwitcherReady?.(switcher);
             }
 
             // Instantiate demSource for dynamic contours, sourcing raw DEM
@@ -685,6 +729,24 @@ export default function MapView({
   // instantiated exactly once on mount; re-running on prop changes would
   // spawn duplicate workers/map instances and re-trigger MAP_INIT.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---------------------------------------------------------------------------
+  // Hot-swap the active PMTiles source whenever useMapStore's activeRegion
+  // changes. This is the only thing that re-touches the WebGL sources — the
+  // download panel's byte-level state (regionDownloadStatus/Label) never
+  // reaches this effect, satisfying the "insulate the map from the download
+  // panel" requirement. loadOfflineRegion() swaps sources in place; the map
+  // instance itself is never torn down or remounted.
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    if (!activeRegion) return;
+    const switcher = regionSwitcherRef.current;
+    if (!switcher) return;
+    switcher.loadOfflineRegion(activeRegion.basemapFile, activeRegion.terrainFile).catch((err) => {
+      console.error('[MapView] Failed to hot-swap offline region:', err);
+    });
+  }, [activeRegion]);
 
   // ---------------------------------------------------------------------------
   // Boot: spatial worker + its global message dispatcher
@@ -1143,8 +1205,10 @@ export default function MapView({
           ],
         });
 
-        // Auto-follow camera only when tracking is active.
-        if (isTrackingCameraRef.current) {
+        // Auto-follow camera only when tracking is active. Read straight off
+        // the store (outside the React tree) — no ref-mirror needed since
+        // useMapStore.getState() always returns the latest value.
+        if (useMapStore.getState().isTrackingCamera) {
           map.flyTo({ center: [lng, lat], zoom: 15, essential: true });
         }
       },
@@ -1171,23 +1235,20 @@ export default function MapView({
       stopTracking(gpsWatchIdRef.current);
       gpsWatchIdRef.current = null;
     };
-  // isTrackingCamera is read via isTrackingCameraRef to avoid stale closures;
-  // re-registering the watcher on every tracking toggle would create duplicate
-  // watchers and drain battery.
+  // isTrackingCamera is read via useMapStore.getState() to avoid stale
+  // closures; re-registering the watcher on every tracking toggle would
+  // create duplicate watchers and drain battery.
   }, [onLocationPermissionDenied, onPositionUpdate]);
-
-  // Keep the ref in sync with state so the watcher closure stays current.
-  useEffect(() => { isTrackingCameraRef.current = isTrackingCamera; }, [isTrackingCamera]);
 
   // Dragstart → disengage camera tracking so the user can freely pan.
   useEffect(() => {
     if (initStatus !== 'ready') return;
     const map = mapRef.current;
     if (!map) return;
-    const onDragStart = () => setIsTrackingCamera(false);
+    const onDragStart = () => setTrackingCamera(false);
     map.on('dragstart', onDragStart);
     return () => { map.off('dragstart', onDragStart); };
-  }, [initStatus]);
+  }, [initStatus, setTrackingCamera]);
 
   /** Snap camera to current GPS fix and engage auto-follow. */
   const handleCenterOnMe = useCallback(() => {
@@ -1197,8 +1258,8 @@ export default function MapView({
     if (loc) {
       map.flyTo({ center: [loc.lng, loc.lat], zoom: 15, essential: true });
     }
-    setIsTrackingCamera(true);
-  }, []);
+    setTrackingCamera(true);
+  }, [setTrackingCamera]);
 
   // ---------------------------------------------------------------------------
   // Location selector handler
@@ -1554,19 +1615,27 @@ export default function MapView({
               </p>
 
               {/* Progress display (visible when fetch/write is in progress) */}
-              {(downloadStatus === 'fetching' || downloadStatus === 'writing') && (
-                <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-blue-950/50 border border-blue-500/25">
-                  <svg className="h-3.5 w-3.5 text-blue-400 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                  <span className="text-[10px] text-blue-300 font-mono truncate">
-                    {downloadProgressLabel || (downloadStatus === 'fetching' ? 'Fetching files…' : 'Writing to OPFS…')}
-                  </span>
+              {(regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing') && (
+                <div className="flex flex-col gap-2 px-3 py-2 rounded-xl bg-blue-950/50 border border-blue-500/25">
+                  <div className="flex items-center gap-2">
+                    <svg className="h-3.5 w-3.5 text-blue-400 animate-spin flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    <span className="text-[10px] text-blue-300 font-mono truncate">
+                      {regionDownloadLabel || (regionDownloadStatus === 'fetching' ? 'Fetching files…' : 'Writing to OPFS…')}
+                    </span>
+                  </div>
+                  {/* Byte-level fill — driven entirely by refs + rAF, never by
+                      React state, so this can update 50-100x/sec with zero
+                      re-renders (see DownloadProgressBar). */}
+                  <DownloadProgressBar
+                    ref={(handle) => { if (handle) onDownloadProgressReady?.(handle); }}
+                  />
                 </div>
               )}
 
               {/* Success flash */}
-              {downloadStatus === 'done' && (
+              {regionDownloadStatus === 'done' && (
                 <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-950/50 border border-emerald-500/25">
                   <svg className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
@@ -1576,7 +1645,7 @@ export default function MapView({
               )}
 
               {/* Error flash */}
-              {downloadStatus === 'error' && (
+              {regionDownloadStatus === 'error' && (
                 <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-rose-950/50 border border-rose-500/25">
                   <svg className="h-3.5 w-3.5 text-rose-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -1589,7 +1658,7 @@ export default function MapView({
               <div className="flex gap-2 pt-1">
                 <button
                   id="download-confirm-btn"
-                  disabled={downloadStatus === 'fetching' || downloadStatus === 'writing'}
+                  disabled={regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing'}
                   onClick={() => {
                     const map = mapRef.current;
                     if (!map) return;
@@ -1600,16 +1669,16 @@ export default function MapView({
                     'text-xs font-bold tracking-wide transition-all active:scale-95',
                     'focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400',
                     'disabled:opacity-40 disabled:pointer-events-none cursor-pointer',
-                    downloadStatus === 'done'
+                    regionDownloadStatus === 'done'
                       ? 'bg-emerald-600/70 border border-emerald-500/40 text-white'
                       : 'bg-blue-600/80 border border-blue-500/40 text-white hover:bg-blue-500/90',
                   ].join(' ')}
                 >
-                  {downloadStatus === 'fetching' || downloadStatus === 'writing' ? (
+                  {regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing' ? (
                     <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                     </svg>
-                  ) : downloadStatus === 'done' ? (
+                  ) : regionDownloadStatus === 'done' ? (
                     <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                     </svg>
@@ -1618,12 +1687,12 @@ export default function MapView({
                       <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                     </svg>
                   )}
-                  {downloadStatus === 'done' ? 'Saved!' : 'Confirm'}
+                  {regionDownloadStatus === 'done' ? 'Saved!' : 'Confirm'}
                 </button>
 
                 <button
                   id="download-cancel-btn"
-                  disabled={downloadStatus === 'fetching' || downloadStatus === 'writing'}
+                  disabled={regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing'}
                   onClick={() => setIsDownloadMode(false)}
                   className="flex-1 py-2.5 rounded-xl text-xs font-semibold text-slate-400 border border-slate-700/60 bg-slate-900/50 hover:bg-slate-800/60 hover:text-slate-200 transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
                 >

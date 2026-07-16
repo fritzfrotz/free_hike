@@ -40,6 +40,9 @@ import { saveRoute, deleteRoute } from '../shared/db';
 import type { SavedRoute } from '../shared/db';
 import { requestPersistentStorage } from './services/storageGuard';
 import { MapCompiler } from '../plugins/MapCompiler';
+import { useMapStore } from '../store/mapStore';
+import { useCompilerStore } from '../store/compilerStore';
+import type { DownloadProgressHandle } from './components/DownloadProgressBar';
 
 /** Great-circle distance between two lng/lat points, in meters (haversine). */
 function haversineMeters(a: { lng: number; lat: number }, b: { lng: number; lat: number }): number {
@@ -51,6 +54,41 @@ function haversineMeters(a: { lng: number; lat: number }, b: { lng: number; lat:
   const lat2 = toRad(b.lat);
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+/**
+ * Reads a fetch Response body to completion, reporting each chunk's byte
+ * length via onChunk. Used to drive DownloadProgressBar's ref-based sink
+ * with real network progress instead of a single opaque arrayBuffer() await.
+ */
+async function readResponseWithProgress(
+  res: Response,
+  onChunk: (bytes: number) => void,
+): Promise<ArrayBuffer> {
+  if (!res.body) {
+    const buffer = await res.arrayBuffer();
+    onChunk(buffer.byteLength);
+    return buffer;
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      total += value.byteLength;
+      onChunk(value.byteLength);
+    }
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return merged.buffer;
 }
 
 /** Formats a whole-second duration as HH:MM:SS. */
@@ -66,6 +104,11 @@ export default function App() {
   // ── Background worker health (drives the header status pill) ────────────────
   const [workerReady, setWorkerReady] = useState(false);
   const workerRef = useRef<Worker | null>(null);
+
+  // ── Native compiler state (granular selectors — App only re-renders when
+  // these specific fields change, not on every compilerStore update) ─────────
+  const isCompiling  = useCompilerStore((s) => s.isCompiling);
+  const currentPhase = useCompilerStore((s) => s.currentPhase);
 
   // ── Cloud sync state ─────────────────────────────────────────────────────────
   const [syncProvider, setSyncProvider] = useState<SyncProvider>('none');
@@ -88,9 +131,12 @@ export default function App() {
   const spatialWorkerRef = useRef<Worker | null>(null);
 
   // ── Phase 10: Offline Download Manager state ───────────────────────────────
-  type DownloadStatus = 'idle' | 'fetching' | 'writing' | 'done' | 'error';
-  const [downloadStatus,        setDownloadStatus]        = useState<DownloadStatus>('idle');
-  const [downloadProgressLabel, setDownloadProgressLabel] = useState('');
+  // The coarse status/label live in useMapStore (App never subscribes to
+  // them — it only writes via getState(), so a fetch/writing transition
+  // re-renders MapView, which reads them directly, not App). Byte-level
+  // progress never touches React or Zustand state at all; it's pushed
+  // straight into DownloadProgressBar's ref via this imperative handle.
+  const downloadProgressHandleRef = useRef<DownloadProgressHandle | null>(null);
   /** Ref to the mapData worker — needed to send DOWNLOAD_REGION_REQUEST. */
   const mapDataWorkerRef = useRef<Worker | null>(null);
 
@@ -366,10 +412,16 @@ export default function App() {
   useEffect(() => {
     const progressPromise = MapCompiler.addListener('compilationProgress', (event) => {
       appendNativeDebugLine(`◈ ${event.percentage.toFixed(0)}% — ${event.status}`);
+      // Low-frequency phase label — fine as Zustand state (one update per
+      // processed block, not per byte).
+      useCompilerStore.getState().setPhase(event.status);
     }).catch(() => null);
 
     const statusPromise = MapCompiler.addListener('compilationStatus', (event) => {
       appendNativeDebugLine(`◌ slice ${event.slices}: ${event.state}`);
+      if (event.state !== 'yielded') {
+        useCompilerStore.getState().setCompiling(false);
+      }
     }).catch(() => null);
 
     return () => {
@@ -383,6 +435,9 @@ export default function App() {
   // exercises checkpoint-write → re-invoke → resume several times before
   // the terminal Finished envelope resolves.
   const handleDebugNativeCompile = useCallback(async () => {
+    if (useCompilerStore.getState().isCompiling) return;
+    useCompilerStore.getState().setCompiling(true);
+
     const bbox = '11.1,47.1,11.6,47.45';
     try {
       // Cold-start resume detection: if a durable checkpoint survives (e.g.
@@ -408,6 +463,8 @@ export default function App() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       appendNativeDebugLine(`✕ ${message} — native shell required (web has no Rust core)`);
+    } finally {
+      useCompilerStore.getState().setCompiling(false);
     }
   }, [appendNativeDebugLine]);
 
@@ -435,35 +492,59 @@ export default function App() {
       console.error('[Download] mapData worker not available.');
       return;
     }
-    if (downloadStatus === 'fetching' || downloadStatus === 'writing') return;
+    const {
+      regionDownloadStatus,
+      setRegionDownloadStatus,
+      setRegionDownloadLabel,
+      setActiveRegion,
+    } = useMapStore.getState();
+    if (regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing') return;
 
-    setDownloadStatus('fetching');
-    setDownloadProgressLabel('Fetching hike.pmtiles…');
+    setRegionDownloadStatus('fetching');
+    setRegionDownloadLabel('Fetching hike.pmtiles…');
 
     try {
-      // ── Step 1: Fetch both files ───────────────────────────────────────
+      // ── Step 1: Open both fetches ───────────────────────────────────────
       // In a production build these URLs would be parametrised from the bbox;
-      // here we always fetch our Andorra sandbox files.
+      // here we always fetch our Andorra sandbox files. fetch() resolves as
+      // soon as headers arrive, so opening both up front lets us size the
+      // progress bar's total before streaming either body.
       const PMTILES_URL = '/hike.pmtiles';       // served by Vite from /public
       const ROUTING_URL = '/test_graph.tar';     // served by Vite from /public
 
       const pmRes = await fetch(PMTILES_URL, { cache: 'no-store' });
       if (!pmRes.ok) throw new Error(`PMTiles fetch failed: ${pmRes.statusText}`);
-      const pmtilesBuffer = await pmRes.arrayBuffer();
 
-      setDownloadProgressLabel('Fetching test_graph.tar…');
-      let routingBuffer = new ArrayBuffer(0);
+      let tarRes: Response | null = null;
       try {
-        const tarRes = await fetch(ROUTING_URL, { cache: 'no-store' });
-        if (tarRes.ok) routingBuffer = await tarRes.arrayBuffer();
+        const r = await fetch(ROUTING_URL, { cache: 'no-store' });
+        if (r.ok) tarRes = r;
       } catch {
         // Routing tar is optional — continue with empty buffer if absent.
         console.warn('[Download] test_graph.tar unavailable; routing skipped.');
       }
 
+      const pmTotal  = Number(pmRes.headers.get('content-length'))  || 0;
+      const tarTotal = tarRes ? Number(tarRes.headers.get('content-length')) || 0 : 0;
+      // Byte-level progress bypasses React/Zustand entirely — pushed
+      // straight into DownloadProgressBar's ref sink (see Task 2).
+      downloadProgressHandleRef.current?.reset(pmTotal + tarTotal);
+
+      const pmtilesBuffer = await readResponseWithProgress(pmRes, (n) => {
+        downloadProgressHandleRef.current?.addBytes(n);
+      });
+
+      let routingBuffer = new ArrayBuffer(0);
+      if (tarRes) {
+        setRegionDownloadLabel('Fetching test_graph.tar…');
+        routingBuffer = await readResponseWithProgress(tarRes, (n) => {
+          downloadProgressHandleRef.current?.addBytes(n);
+        });
+      }
+
       // ── Step 2: Hand buffers to the worker (zero-copy transfer) ──────────
-      setDownloadStatus('writing');
-      setDownloadProgressLabel('Writing to OPFS…');
+      setRegionDownloadStatus('writing');
+      setRegionDownloadLabel('Writing to OPFS…');
 
       const reqId = Math.random().toString(36).substring(2, 9);
       const req: WorkerRequestMessage = {
@@ -484,15 +565,24 @@ export default function App() {
 
         if (type === 'DOWNLOAD_REGION_SUCCESS') {
           const result = payload as DownloadRegionSuccessPayload;
-          setDownloadStatus('done');
-          setDownloadProgressLabel('');
+          setRegionDownloadStatus('done');
+          setRegionDownloadLabel('');
           console.log(
             '%c[Download] DOWNLOAD_REGION_SUCCESS',
             'color:#10b981;font-weight:bold;',
             result,
           );
+          // Hot-swap the live PMTiles source — MapView observes this and
+          // calls loadOfflineRegion() without tearing down the map/WebGL
+          // context. No region-specific terrain is fetched by this pipeline
+          // yet, so the default terrain source is kept as-is.
+          setActiveRegion({
+            regionLabel: result.regionLabel,
+            basemapFile: 'active_map.pmtiles',
+            terrainFile: 'alps_terrain.pmtiles',
+          });
           // Auto-reset to idle after 3 s so the panel can be re-used.
-          setTimeout(() => setDownloadStatus('idle'), 3_000);
+          setTimeout(() => setRegionDownloadStatus('idle'), 3_000);
         } else {
           throw new Error(error ?? 'DOWNLOAD_REGION_ERROR from worker');
         }
@@ -504,12 +594,12 @@ export default function App() {
 
     } catch (err) {
       console.error('[Download] Region download failed:', err);
-      setDownloadStatus('error');
-      setDownloadProgressLabel('');
+      setRegionDownloadStatus('error');
+      setRegionDownloadLabel('');
       // Auto-reset to idle after 4 s.
-      setTimeout(() => setDownloadStatus('idle'), 4_000);
+      setTimeout(() => setRegionDownloadStatus('idle'), 4_000);
     }
-  }, [downloadStatus]);
+  }, []);
 
   // ── Phase 11: Route State Management actions ──────────────────────────────
   const handleSaveHike = useCallback(async (title: string) => {
@@ -857,8 +947,9 @@ export default function App() {
           onMapDataError={handleMapDataError}
           onPositionUpdate={handlePositionUpdate}
           onRegionDownload={handleRegionDownload}
-          downloadStatus={downloadStatus}
-          downloadProgressLabel={downloadProgressLabel}
+          onDownloadProgressReady={(handle) => {
+            downloadProgressHandleRef.current = handle;
+          }}
         />
         {elevationProfileData && (
           <ElevationProfile
@@ -957,10 +1048,11 @@ export default function App() {
         <div className="mt-3 flex flex-col items-center gap-2">
           <button
             onClick={handleDebugNativeCompile}
-            className="px-2.5 py-1 rounded border border-slate-800 bg-slate-900/40 hover:bg-slate-800/60 text-[10px] font-mono uppercase tracking-widest text-slate-500 hover:text-slate-300 transition-all cursor-pointer"
+            disabled={isCompiling}
+            className="px-2.5 py-1 rounded border border-slate-800 bg-slate-900/40 hover:bg-slate-800/60 text-[10px] font-mono uppercase tracking-widest text-slate-500 hover:text-slate-300 transition-all cursor-pointer disabled:opacity-40 disabled:pointer-events-none"
             title="Fires MapCompiler.startJob + emitTestProgress through the native Rust bridge"
           >
-            Debug Native Compile
+            {isCompiling ? `Compiling… ${currentPhase}` : 'Debug Native Compile'}
           </button>
           {nativeDebugLines.length > 0 && (
             <div className="w-full max-w-xl text-left bg-slate-950/70 border border-slate-900 rounded-lg p-3 font-mono text-[10px] leading-relaxed text-slate-400 space-y-0.5">

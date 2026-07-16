@@ -1375,3 +1375,111 @@ retired.
 run-length coalescing; Terrain (Phase 6) deferred.
 Uncommitted (P5.C3 diff): pbf (lib/scan/tile), tiles (mvt/finalize),
 compiler test fixture, LOOPLOG — awaiting operator.
+
+
+---
+
+## P5.C4 — Basemap enrichment: `name` as a third feature attribute
+
+**Status:** IN PROGRESS
+**Date:** 2026-07-16
+**Operator context:** approved continuation of the tagging pipeline. Goal:
+persist OSM `name` end-to-end for text labels, on ALL FOUR layers (unlike
+sac_scale's highway-only scope), same 50MB out-of-core posture.
+
+**Design (locked before code):**
+- **Schema:** [`WAY_TAGS`] widens again → `(u8 layer, class, sac_scale,
+  name)`, empty slice = absent (unnamed ways cost ~1 byte). Same loud
+  table-type-mismatch failure for a pre-P5.C4 index resumed on new code.
+  WAYS ONLY: this pipeline has no POI-node extraction (peaks etc. are
+  node-tagged; a node-POI layer is a future chunk, logged), so the
+  directive's node-table clause is N/A by construction.
+- **TileFeatures format v4:** third length-prefixed slot
+  `layer | class | sac_scale | name | segments`; truncated/hostile name
+  lengths are typed rejects like the other slots.
+- **Extraction:** the existing single key sweep also notes `name`'s value
+  index; resolved for EVERY kept way regardless of layer, through the same
+  shared bounds+UTF-8 resolver (names are where non-ASCII actually lives —
+  Tirol's ß/ä/ö/ü — so the UTF-8 validation finally earns its keep).
+- **MVT encoder — the real refactor of this chunk:** with TWO lazy keys
+  (sac_scale, name) the P5.C3 "keys.len()==1 → push at index 1" special
+  case is wrong (key indices depend on which optional attribute a layer
+  sees first). Replaced by a per-layer KEY pool mirroring the value pool:
+  `HashMap<(layer, key), idx>` + lazy append to `Layer.keys`, with "class"
+  pooled first by construction. Key order per layer = first-seen order —
+  deterministic given deterministic feature order (way order), which the
+  payload dedup + determinism proofs already rely on. Attribute-free
+  layers stay byte-stable at `["class"]`.
+- **Metadata:** all four vector_layers declare `"name":"String"` (per the
+  directive); highway keeps `sac_scale` additionally.
+- **Unchanged:** keep-filter (`name` alone keeps nothing — it's not a
+  layer key), block prefilter (name-only blocks stay prefiltered: a named
+  way with no layer key is dropped anyway), checkpoint v5, FFI surface,
+  engine accounting.
+
+**Proof tests (named up front):**
+- pbf::scan: named highway (class+sac+name all extracted), named waterway
+  (name on a NON-highway layer — the scope difference vs sac), unnamed way
+  (empty sentinel); name value-index OOB and non-UTF-8 name rejected.
+- pbf::lib: roundtrip covers the widened 4-slot record.
+- pbf::tile: v4 roundtrip incl. name/UTF-8 umlauts, truncated-name reject,
+  boundary-split binning carries name into both tiles.
+- tiles::mvt: named non-highway feature → keys [class,name], tags
+  [0,c,1,n]; **the key-index regression test**: one layer that sees a
+  named-only feature FIRST and a graded-only feature SECOND must yield
+  keys [class,name,sac_scale] with tags [0,c,1,n] and [0,c,2,s]
+  respectively; attribute-free layers stay ["class"]; a fully-attributed
+  feature carries [0,c,1,s,2,n]-shaped tags per its layer's pool order.
+- tiles::finalize: seeded dedup pair gains identical names (payloads still
+  dedup); waterway named; archive readback asserts per-layer keys/tags;
+  metadata declares "name":"String" exactly 4 times (all layers) and
+  sac_scale still exactly once.
+- compiler::engine: fixture TileFeature literal gains the empty name.
+- Ladder: L1 ×2 green-lock + cargo ndk + L2 real-Innsbruck (way/tile
+  counts must AGAIN be unchanged; archive grows by name strings — the
+  largest enrichment yet, street names are common) + reference-reader
+  proof that real UTF-8 names (»…straße«) reach the MVT wire.
+
+**Attempts:**
+- A1: schema + extraction: WAY_TAGS → `(layer, class, sac_scale, name)`
+  (named `RawWayTagsValue` alias — clippy type_complexity — with the
+  standard redb 'static-schema-marker note), IndexedWay.name,
+  4-slot WayTagRecord; the single key sweep now notes `name`'s value index
+  and resolves it for EVERY layer through the shared bounds+UTF-8 resolver.
+- A2: TileFeatures v4 (third length-prefixed slot), TileFeature.name,
+  bin_way/pass3 denormalization (+ #[allow(too_many_arguments)] — the
+  signature mirrors the v4 slot order verbatim). New decode rejects:
+  hostile/truncated name lengths.
+- A3 **the refactor:** encode_tile_mvt's P5.C3 "keys.len()==1" special case
+  is WRONG with two lazy keys (indices depend on which attribute a layer
+  sees first) — replaced with a per-layer KEY pool mirroring the value
+  pool; "class" pools first for every feature → index 0 by construction.
+  Metadata: name declared on ALL FOUR vector_layers (directive), sac_scale
+  still highway-only.
+- A4: workspace 131/131 first complete run (42 pbf / 27 tiles / 24
+  compiler / 18 geom / 13 fetcher / 7 ffi); green-lock ×2; fmt/clippy
+  clean; `cargo ndk -t arm64-v8a build -p ffi` CLEAN. The new
+  `lazy_key_indices_follow_first_seen_order` test pins the refactor's
+  exact regression risk (named-first layer → keys [class,name,sac_scale],
+  per-feature tags re-indexed accordingly).
+- A5 **L2 real-data — the fingerprint holds a third time:** 93,085 blocks /
+  1,030 tiles, both IDENTICAL to P5.C2/C3 (keep-filter untouched); archive
+  3,242,090 → 3,400,009 bytes (+157,919 of label text — the largest
+  enrichment yet, as street names should be); 13 yields / 3.61s.
+- A6 **Reference-reader proof:** all four vector_layers declare
+  "name":"String" (highway: class+sac_scale+name); 220 of 221
+  Innsbruck-region z14 tiles carry the name key; real UTF-8 labels on the
+  decompressed wire — »straße« (ß), »Höhe« (ö), Inn, gasse, weg.
+
+**Outcome:** CLOSED. Pivots: 0. `name` persists raw-PBF → WayTags →
+TileFeatures v4 → MVT features on every layer; attribute-free layers stay
+byte-stable at ["class"]. Keep-filter, block prefilter, checkpoint v5, FFI
+surface, engine accounting all UNCHANGED. The Phase 5 tagging pipeline is
+COMPLETE: class + sac_scale + name.
+**Follow-ups (carried):** frontend labeling (style has no symbol/text
+layers yet AND no glyphs assets populated — both needed before names
+render); node-POI extraction (peak names are node-tagged, out of this
+ways-only pipeline); leaf directories + run-length coalescing; Terrain
+(Phase 6) deferred.
+Uncommitted (P5.C4 diff): pbf (lib/scan/tile), tiles (mvt/finalize),
+compiler test fixture, LOOPLOG — awaiting operator.

@@ -83,21 +83,27 @@ pub const COORDINATES: TableDefinition<u64, (f64, f64)> = TableDefinition::new("
 /// refs against [`COORDINATES`] at encode time.
 pub const WAYS: TableDefinition<u64, &[u8]> = TableDefinition::new("Ways");
 
-/// Pass-2 tag index (P5.C2, widened P5.C3): OSM way ID →
-/// `(layer, class, sac_scale)` where `layer` indexes [`LAYER_KEYS`],
-/// `class` is that tag's raw value bytes, and `sac_scale` is the trail
-/// difficulty grade for highway-layer ways (EMPTY SLICE = absent — OSM
-/// sac_scale values are never empty, so the sentinel is unambiguous; other
-/// layers never carry one). Both strings are UTF-8-validated at extraction.
-/// Written in the SAME write transactions as [`WAYS`] — one
-/// crash-consistency domain; a way either has both rows or neither.
+/// Pass-2 tag index (P5.C2, widened P5.C3/P5.C4): OSM way ID →
+/// `(layer, class, sac_scale, name)` where `layer` indexes [`LAYER_KEYS`],
+/// `class` is that tag's raw value bytes, `sac_scale` is the trail
+/// difficulty grade for highway-layer ways, and `name` is the feature's
+/// label text (any layer). EMPTY SLICE = absent for both optional slots —
+/// OSM never has empty values for these tags, so the sentinel is
+/// unambiguous. All strings are UTF-8-validated at extraction. Written in
+/// the SAME write transactions as [`WAYS`] — one crash-consistency domain;
+/// a way either has both rows or neither.
 ///
-/// Widening the value type (rather than adding a sparse side table) keeps
-/// Pass 3 at one point lookup per way; the cost is ~1 byte per sac-less
-/// way. A pre-P5.C3 index resumed against this code fails loudly with
+/// Widening the value type (rather than adding sparse side tables) keeps
+/// Pass 3 at one point lookup per way; the cost is ~1 byte per absent
+/// slot. A pre-P5.C4 index resumed against this code fails loudly with
 /// redb's table-type mismatch — refuse rather than guess, same posture as
 /// the checkpoint version gate.
-pub const WAY_TAGS: TableDefinition<u64, (u8, &[u8], &[u8])> = TableDefinition::new("WayTags");
+pub const WAY_TAGS: TableDefinition<u64, RawWayTagsValue> = TableDefinition::new("WayTags");
+
+/// Raw [`WAY_TAGS`] row shape: `(layer, class, sac_scale, name)`. The
+/// `'static` lifetimes are only the redb schema marker — reads and writes
+/// borrow at their own lifetimes through redb's `SelfType` mapping.
+pub type RawWayTagsValue = (u8, &'static [u8], &'static [u8], &'static [u8]);
 
 /// Rendering layer keys, in match-priority order. A way's layer is the FIRST
 /// of these tag keys it carries; its class is that tag's value (e.g.
@@ -132,6 +138,8 @@ pub struct IndexedWay {
     pub class: Vec<u8>,
     /// Trail difficulty grade (highway-layer ways only; empty = absent).
     pub sac_scale: Vec<u8>,
+    /// Label text — the OSM `name` tag, any layer (empty = absent).
+    pub name: Vec<u8>,
     pub refs: Vec<u64>,
 }
 
@@ -435,7 +443,12 @@ where
                 tags_table
                     .insert(
                         way.id,
-                        (way.layer, way.class.as_slice(), way.sac_scale.as_slice()),
+                        (
+                            way.layer,
+                            way.class.as_slice(),
+                            way.sac_scale.as_slice(),
+                            way.name.as_slice(),
+                        ),
                     )
                     .map_err(db_err)?;
                 in_chunk += 1;
@@ -454,9 +467,9 @@ where
     Ok(total)
 }
 
-/// A way's decoded tag metadata: `(layer, class, sac_scale)` — sac_scale
-/// empty = absent.
-pub type WayTagRecord = (u8, Vec<u8>, Vec<u8>);
+/// A way's decoded tag metadata: `(layer, class, sac_scale, name)` — the
+/// two optional slots use empty = absent.
+pub type WayTagRecord = (u8, Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Point lookup of a way's tag metadata. `Ok(None)` for an absent way or a
 /// not-yet-created table.
@@ -469,8 +482,13 @@ pub fn get_way_tags(db: &Database, way_id: u64) -> Result<Option<WayTagRecord>, 
     };
     match table.get(way_id).map_err(db_err)? {
         Some(guard) => {
-            let (layer, class, sac_scale) = guard.value();
-            Ok(Some((layer, class.to_vec(), sac_scale.to_vec())))
+            let (layer, class, sac_scale, name) = guard.value();
+            Ok(Some((
+                layer,
+                class.to_vec(),
+                sac_scale.to_vec(),
+                name.to_vec(),
+            )))
         }
         None => Ok(None),
     }
@@ -794,10 +812,16 @@ mod tests {
                 id: w,
                 layer: (w % 4) as u8,
                 class: format!("class-{w}").into_bytes(),
-                // Highway-layer ways carry a grade; the rest the empty
-                // sentinel — both shapes roundtrip through the same triple.
+                // Highway-layer ways carry a grade, every third way a name
+                // (with real UTF-8) — all sentinel combinations roundtrip
+                // through the same 4-slot record.
                 sac_scale: if w % 4 == 0 {
                     b"hiking".to_vec()
+                } else {
+                    Vec::new()
+                },
+                name: if w % 3 == 0 {
+                    format!("Höhenweg {w}").into_bytes()
                 } else {
                     Vec::new()
                 },
@@ -814,13 +838,18 @@ mod tests {
         );
         assert_eq!(
             get_way_tags(&db, 24).unwrap(),
-            Some((0, b"class-24".to_vec(), b"hiking".to_vec())),
+            Some((
+                0,
+                b"class-24".to_vec(),
+                b"hiking".to_vec(),
+                "Höhenweg 24".as_bytes().to_vec()
+            )),
             "tags row commits in the same chunk as the refs row"
         );
         assert_eq!(
             get_way_tags(&db, 23).unwrap(),
-            Some((3, b"class-23".to_vec(), Vec::new())),
-            "absent grade roundtrips as the empty sentinel"
+            Some((3, b"class-23".to_vec(), Vec::new(), Vec::new())),
+            "absent grade/name roundtrip as the empty sentinel"
         );
         assert_eq!(get_way_refs(&db, 99).unwrap(), None);
         assert_eq!(get_way_tags(&db, 99).unwrap(), None);

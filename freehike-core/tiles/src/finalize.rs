@@ -248,12 +248,13 @@ pub fn run_finalize_encode_slice(
             let (z, x, y, first_way) = key.value();
             let decode_feature =
                 |way_id: u64, bytes: &[u8]| -> Result<TileFeature, FinalizeError> {
-                    let (layer, class, sac_scale, segments) = decode_tile_segments(bytes)?;
+                    let (layer, class, sac_scale, name, segments) = decode_tile_segments(bytes)?;
                     Ok(TileFeature {
                         way_id,
                         layer,
                         class,
                         sac_scale,
+                        name,
                         segments,
                     })
                 };
@@ -424,13 +425,14 @@ pub fn assemble_archive(
     let vector_layers = (0..pbf::LAYER_KEYS.len() as u8)
         .map(|i| {
             let name = pbf::layer_name(i).expect("taxonomy index");
-            // Only highway features can carry the sac_scale grade (P5.C3) —
-            // extraction never attaches it to another layer, so declaring
-            // it elsewhere would be a lie.
+            // Every layer can carry `name` (P5.C4); only highway features
+            // can carry the sac_scale grade (P5.C3) — extraction never
+            // attaches a grade to another layer, so declaring it elsewhere
+            // would be a lie.
             let fields = if i == 0 {
-                r#"{"class":"String","sac_scale":"String"}"#
+                r#"{"class":"String","sac_scale":"String","name":"String"}"#
             } else {
-                r#"{"class":"String"}"#
+                r#"{"class":"String","name":"String"}"#
             };
             format!(
                 r#"{{"id":"{name}","fields":{fields},"minzoom":{min_zoom},"maxzoom":{max_zoom}}}"#
@@ -544,10 +546,11 @@ mod tests {
 
     /// Seeds the dummy rows the directive's integration test requires:
     /// three z14 tiles; tiles A and B carry highway-way 42 (graded
-    /// `sac_scale=hiking`, P5.C3) at identical tile-local geometry AND
-    /// identical tags (dedup pair — identical grades keep the payloads
-    /// byte-identical), tile C carries waterway-way 7 — a second, grade-free
-    /// MVT layer, proving the per-layer readback.
+    /// `sac_scale=hiking`, named `Höttinger Steig` — real UTF-8) at
+    /// identical tile-local geometry AND identical tags (dedup pair —
+    /// identical attributes keep the payloads byte-identical), tile C
+    /// carries waterway-way 7 named `Inn` — a second, grade-free MVT layer,
+    /// proving the per-layer readback.
     fn seed_dummy_rows(db: &Database) -> [(u8, u32, u32); 3] {
         let a = (BASE_TILE_ZOOM, 8703u32, 5747u32);
         let b = (BASE_TILE_ZOOM, 8704u32, 5747u32);
@@ -561,6 +564,7 @@ mod tests {
                     0,
                     b"path",
                     b"hiking",
+                    "Höttinger Steig".as_bytes(),
                     &[local_segment(a.0, a.1, a.2, &line)],
                 ),
             ),
@@ -570,12 +574,19 @@ mod tests {
                     0,
                     b"path",
                     b"hiking",
+                    "Höttinger Steig".as_bytes(),
                     &[local_segment(b.0, b.1, b.2, &line)],
                 ),
             ),
             (
                 (c.0, c.1, c.2, 7u64),
-                encode_tile_segments(1, b"stream", b"", &[local_segment(c.0, c.1, c.2, &other)]),
+                encode_tile_segments(
+                    1,
+                    b"stream",
+                    b"",
+                    b"Inn",
+                    &[local_segment(c.0, c.1, c.2, &other)],
+                ),
             ),
         ];
         insert_tile_features_batched(db, rows, 100).unwrap();
@@ -716,20 +727,35 @@ mod tests {
             );
             assert!(!layer.features.is_empty());
             if e.tile_id == c_id {
-                // Grade-free waterway: byte-stable P5.C2 shape.
-                assert_eq!(layer.keys, vec!["class".to_string()]);
+                // Grade-free but NAMED waterway (P5.C4).
+                assert_eq!(layer.keys, vec!["class".to_string(), "name".to_string()]);
+                assert_eq!(layer.values[1].string_value.as_deref(), Some("Inn"));
                 for f in &layer.features {
-                    assert_eq!(f.tags, vec![0, 0], "class attribute via tags");
+                    assert_eq!(f.tags, vec![0, 0, 1, 1], "class + name via tags");
                 }
             } else {
-                // Graded highway: class + sac_scale (P5.C3).
+                // Graded AND named highway (P5.C3 + P5.C4); attribute emit
+                // order is class, sac_scale, name → pool indices 0/1/2.
                 assert_eq!(
                     layer.keys,
-                    vec!["class".to_string(), "sac_scale".to_string()]
+                    vec![
+                        "class".to_string(),
+                        "sac_scale".to_string(),
+                        "name".to_string()
+                    ]
                 );
                 assert_eq!(layer.values[1].string_value.as_deref(), Some("hiking"));
+                assert_eq!(
+                    layer.values[2].string_value.as_deref(),
+                    Some("Höttinger Steig"),
+                    "UTF-8 label survives to the wire"
+                );
                 for f in &layer.features {
-                    assert_eq!(f.tags, vec![0, 0, 1, 1], "class + sac_scale via tags");
+                    assert_eq!(
+                        f.tags,
+                        vec![0, 0, 1, 1, 2, 2],
+                        "class + sac_scale + name via tags"
+                    );
                 }
             }
         }
@@ -761,9 +787,16 @@ mod tests {
             1,
             "sac_scale declared exactly once (the highway layer): {meta}"
         );
+        assert_eq!(
+            meta.matches(r#""name":"String""#).count(),
+            4,
+            "name declared on ALL four layers (P5.C4): {meta}"
+        );
         assert!(
-            meta.contains(r#""id":"highway","fields":{"class":"String","sac_scale":"String"}"#),
-            "sac_scale must sit on the highway layer: {meta}"
+            meta.contains(
+                r#""id":"highway","fields":{"class":"String","sac_scale":"String","name":"String"}"#
+            ),
+            "highway declares all three fields: {meta}"
         );
     }
 

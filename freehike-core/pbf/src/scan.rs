@@ -435,10 +435,10 @@ pub fn run_pass1_slice(
 /// Extracts renderable ways from a pre-filter-surviving block: keeps a way
 /// iff one of its tag keys resolves (via the StringTable) to a member of
 /// [`crate::LAYER_KEYS`], resolving the way's `(layer, class)` from the
-/// highest-priority matching key — plus, for highway-layer ways, the
-/// optional `sac_scale` difficulty grade (P5.C3) — then delta-decodes its
-/// node refs. Degenerate ways (< 2 refs) are dropped — they cannot form
-/// geometry.
+/// highest-priority matching key — plus the optional `sac_scale`
+/// difficulty grade for highway-layer ways (P5.C3) and the optional
+/// `name` label for ANY layer (P5.C4) — then delta-decodes its node refs.
+/// Degenerate ways (< 2 refs) are dropped — they cannot form geometry.
 ///
 /// `keys`/`vals` are parallel arrays per the OSM wire spec; a length
 /// mismatch, an index outside the StringTable, or a non-UTF-8 class value
@@ -463,11 +463,13 @@ pub fn extract_relevant_ways(
             }
 
             // Highest-priority layer key wins (e.g. highway over natural on
-            // a way carrying both). sac_scale's value index is noted in the
-            // same sweep — resolved below only when the way turns out to be
-            // a highway (the only layer the grade applies to).
+            // a way carrying both). sac_scale's and name's value indices
+            // are noted in the same sweep — sac_scale resolved below only
+            // when the way turns out to be a highway (the only layer the
+            // grade applies to); name resolved for EVERY layer (P5.C4).
             let mut best: Option<(u8, u32)> = None; // (layer idx, val idx)
             let mut sac_val_idx: Option<u32> = None;
+            let mut name_val_idx: Option<u32> = None;
             for (&key_idx, &val_idx) in way.keys.iter().zip(&way.vals) {
                 let key = st.s.get(key_idx as usize).ok_or_else(|| {
                     IndexError::InvalidInput(format!(
@@ -483,6 +485,8 @@ pub fn extract_relevant_ways(
                     }
                 } else if key.as_slice() == b"sac_scale" {
                     sac_val_idx = Some(val_idx);
+                } else if key.as_slice() == b"name" {
+                    name_val_idx = Some(val_idx);
                 }
             }
             let Some((layer, val_idx)) = best else {
@@ -516,6 +520,10 @@ pub fn extract_relevant_ways(
                 Some(idx) if layer == 0 => resolve(idx, "sac_scale")?.clone(),
                 _ => Vec::new(), // absent, or a grade on a non-highway way
             };
+            let name = match name_val_idx {
+                Some(idx) => resolve(idx, "name")?.clone(),
+                None => Vec::new(),
+            };
 
             let way_id = u64::try_from(way.id).map_err(|_| {
                 IndexError::InvalidInput(format!("corrupted way: negative id {}", way.id))
@@ -539,6 +547,7 @@ pub fn extract_relevant_ways(
                 layer,
                 class: class.clone(),
                 sac_scale,
+                name,
                 refs,
             });
             extracted += 1;
@@ -988,18 +997,117 @@ mod tests {
         assert_eq!(get_way_refs(&db, 600).unwrap(), None, "block prefiltered");
 
         // Tag metadata persisted in the same transaction as the refs
-        // (single-tag fixture ways: no sac_scale → empty slot).
+        // (single-tag fixture ways: no sac_scale/name → empty slots).
         assert_eq!(
             crate::get_way_tags(&db, 500).unwrap(),
-            Some((0, b"path".to_vec(), Vec::new())),
+            Some((0, b"path".to_vec(), Vec::new(), Vec::new())),
             "highway=path"
         );
         assert_eq!(
             crate::get_way_tags(&db, 502).unwrap(),
-            Some((1, b"stream".to_vec(), Vec::new())),
+            Some((1, b"stream".to_vec(), Vec::new(), Vec::new())),
             "waterway=stream"
         );
         assert_eq!(crate::get_way_tags(&db, 501).unwrap(), None);
+    }
+
+    /// P5.C4: `name` is extracted for EVERY layer (the scope difference vs
+    /// sac_scale) and coexists with the other attributes; unnamed ways keep
+    /// the empty sentinel.
+    #[test]
+    fn pass2_extracts_name_on_all_layers() {
+        use crate::proto::{Way, WayGroup};
+        let block = WayBlock {
+            stringtable: Some(StringTable {
+                s: vec![
+                    b"".to_vec(),
+                    b"highway".to_vec(),
+                    b"path".to_vec(),
+                    b"sac_scale".to_vec(),
+                    b"alpine_hiking".to_vec(),
+                    b"name".to_vec(),
+                    "Goetheweg".as_bytes().to_vec(),
+                    b"waterway".to_vec(),
+                    b"river".to_vec(),
+                    "Inn".as_bytes().to_vec(),
+                ],
+            }),
+            primitivegroup: vec![WayGroup {
+                ways: vec![
+                    // Fully-attributed trail: class + grade + name.
+                    Way {
+                        id: 1,
+                        keys: vec![1, 3, 5],
+                        vals: vec![2, 4, 6],
+                        refs: vec![10, 1],
+                    },
+                    // Named river — name on a NON-highway layer.
+                    Way {
+                        id: 2,
+                        keys: vec![7, 5],
+                        vals: vec![8, 9],
+                        refs: vec![20, 1],
+                    },
+                    // Unnamed path.
+                    Way {
+                        id: 3,
+                        keys: vec![1],
+                        vals: vec![2],
+                        refs: vec![30, 1],
+                    },
+                ],
+            }],
+        };
+        let mut out = Vec::new();
+        assert_eq!(extract_relevant_ways(&block, &mut out).unwrap(), 3);
+        assert_eq!(
+            (out[0].sac_scale.as_slice(), out[0].name.as_slice()),
+            (&b"alpine_hiking"[..], "Goetheweg".as_bytes()),
+        );
+        assert_eq!(
+            (out[1].layer, out[1].name.as_slice()),
+            (1, "Inn".as_bytes()),
+            "name extracted on the waterway layer"
+        );
+        assert_eq!(out[2].name, Vec::<u8>::new());
+    }
+
+    /// name corruption is typed like every other tag failure.
+    #[test]
+    fn corrupted_name_rejected() {
+        use crate::proto::{Way, WayGroup};
+        let mut bad = WayBlock {
+            stringtable: Some(StringTable {
+                s: vec![
+                    b"".to_vec(),
+                    b"highway".to_vec(),
+                    b"path".to_vec(),
+                    b"name".to_vec(),
+                    b"Weg".to_vec(),
+                ],
+            }),
+            primitivegroup: vec![WayGroup {
+                ways: vec![Way {
+                    id: 1,
+                    keys: vec![1, 3],
+                    vals: vec![2, 9], // name value index outside the StringTable
+                    refs: vec![10, 1],
+                }],
+            }],
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            extract_relevant_ways(&bad, &mut out),
+            Err(IndexError::InvalidInput(_))
+        ));
+
+        // Non-UTF-8 name.
+        bad.primitivegroup[0].ways[0].vals = vec![2, 4];
+        bad.stringtable.as_mut().unwrap().s[4] = vec![0xff, 0xfe];
+        assert!(matches!(
+            extract_relevant_ways(&bad, &mut out),
+            Err(IndexError::InvalidInput(_))
+        ));
     }
 
     /// P5.C3: sac_scale rides along on highway ways; on a non-highway way
@@ -1197,6 +1305,7 @@ mod tests {
             layer: 0,
             class: b"path".to_vec(),
             sac_scale: Vec::new(),
+            name: Vec::new(),
             refs,
         };
         insert_ways_batched(

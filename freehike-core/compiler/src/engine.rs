@@ -955,6 +955,7 @@ mod tests {
                 layer: 0,
                 class: b"path".to_vec(),
                 sac_scale: Vec::new(),
+                name: Vec::new(),
                 segments: vec![want_line],
             }]
         );

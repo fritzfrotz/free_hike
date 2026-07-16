@@ -54,14 +54,14 @@ pub fn tile_clip_bounds(zoom: u8, tx: u32, ty: u32) -> (f64, f64, f64, f64) {
 // Segment serialization (the TILE_FEATURES value format)
 // ---------------------------------------------------------------------------
 
-/// Encodes a feature's tag metadata + clipped disjoint segments (format v3,
-/// P5.C3) as
+/// Encodes a feature's tag metadata + clipped disjoint segments (format v4,
+/// P5.C4) as
 /// `u8 layer | varint(class_len) class-bytes |
-///  varint(sac_len) sac_scale-bytes |
+///  varint(sac_len) sac_scale-bytes | varint(name_len) name-bytes |
 ///  varint(n_segments) [varint(n_vertices) (x: f64 LE, y: f64 LE)...]...`.
 /// The tag metadata is denormalized from `WayTags` into every row (bytes on
-/// disk, not RAM) so the Finalize drain stays a single-table scan; an empty
-/// sac_scale slot means "absent" (same sentinel as `WayTags`).
+/// disk, not RAM) so the Finalize drain stays a single-table scan; empty
+/// sac_scale/name slots mean "absent" (same sentinel as `WayTags`).
 /// Coordinates stay full-precision f64 Web Mercator meters — quantization
 /// to the tile-local integer grid belongs to the MVT encode stage, not the
 /// index.
@@ -69,17 +69,20 @@ pub fn encode_tile_segments(
     layer: u8,
     class: &[u8],
     sac_scale: &[u8],
+    name: &[u8],
     segments: &[Vec<(f64, f64)>],
 ) -> Vec<u8> {
     let n_vertices: usize = segments.iter().map(Vec::len).sum();
     let mut out = Vec::with_capacity(
-        6 + class.len() + sac_scale.len() + 2 * segments.len() + 16 * n_vertices,
+        8 + class.len() + sac_scale.len() + name.len() + 2 * segments.len() + 16 * n_vertices,
     );
     out.push(layer);
     push_varint(&mut out, class.len() as u64);
     out.extend_from_slice(class);
     push_varint(&mut out, sac_scale.len() as u64);
     out.extend_from_slice(sac_scale);
+    push_varint(&mut out, name.len() as u64);
+    out.extend_from_slice(name);
     push_varint(&mut out, segments.len() as u64);
     for seg in segments {
         push_varint(&mut out, seg.len() as u64);
@@ -91,9 +94,9 @@ pub fn encode_tile_segments(
     out
 }
 
-/// Decoded [`TILE_FEATURES`] value: `(layer, class, sac_scale, disjoint
-/// segments)` — sac_scale empty = absent.
-pub type DecodedTileSegments = (u8, Vec<u8>, Vec<u8>, Vec<Vec<(f64, f64)>>);
+/// Decoded [`TILE_FEATURES`] value: `(layer, class, sac_scale, name,
+/// disjoint segments)` — sac_scale/name empty = absent.
+pub type DecodedTileSegments = (u8, Vec<u8>, Vec<u8>, Vec<u8>, Vec<Vec<(f64, f64)>>);
 
 /// Decodes a [`TILE_FEATURES`] value back into tag metadata + disjoint
 /// segments. Truncated or trailing bytes, an out-of-range layer index, and
@@ -121,6 +124,7 @@ pub fn decode_tile_segments(bytes: &[u8]) -> Result<DecodedTileSegments, IndexEr
     };
     let class = read_slot("class", &mut pos)?;
     let sac_scale = read_slot("sac_scale", &mut pos)?;
+    let name = read_slot("name", &mut pos)?;
 
     let n_segments = read_varint(bytes, &mut pos)?;
     // Each declared segment costs at least 1 length byte: a count larger
@@ -151,7 +155,7 @@ pub fn decode_tile_segments(bytes: &[u8]) -> Result<DecodedTileSegments, IndexEr
     if pos != bytes.len() {
         return Err(corrupt("trailing bytes after last segment"));
     }
-    Ok((layer, class, sac_scale, segments))
+    Ok((layer, class, sac_scale, name, segments))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +218,8 @@ pub struct TileFeature {
     pub class: Vec<u8>,
     /// Trail difficulty grade (highway features only; empty = absent).
     pub sac_scale: Vec<u8>,
+    /// Label text — the OSM `name` tag, any layer (empty = absent).
+    pub name: Vec<u8>,
     pub segments: Vec<Vec<(f64, f64)>>,
 }
 
@@ -238,12 +244,13 @@ pub fn get_tile_features(
     for entry in range {
         let (key, value) = entry.map_err(db_err)?;
         let (_, _, _, way_id) = key.value();
-        let (layer, class, sac_scale, segments) = decode_tile_segments(value.value())?;
+        let (layer, class, sac_scale, name, segments) = decode_tile_segments(value.value())?;
         out.push(TileFeature {
             way_id,
             layer,
             class,
             sac_scale,
+            name,
             segments,
         });
     }
@@ -275,13 +282,15 @@ pub struct Pass3Slice {
 /// continent-diagonal bounding-box blowup), dilates by one ring so tiles
 /// whose *buffer* the way merely grazes are also considered, then clips to
 /// each candidate's buffered box. Tiles where the clip degenerates to
-/// nothing produce no row. The way's `(layer, class, sac_scale)` tag
-/// metadata is denormalized into every row written (format v3).
+/// nothing produce no row. The way's `(layer, class, sac_scale, name)` tag
+/// metadata is denormalized into every row written (format v4).
+#[allow(clippy::too_many_arguments)] // mirrors the v4 slot order verbatim
 fn bin_way(
     way_id: u64,
     layer: u8,
     class: &[u8],
     sac_scale: &[u8],
+    name: &[u8],
     simplified: &[(f64, f64)],
     sink: &mut Vec<PendingFeature>,
 ) {
@@ -314,7 +323,7 @@ fn bin_way(
         if !clipped.is_empty() {
             sink.push((
                 (BASE_TILE_ZOOM, tx, ty, way_id),
-                encode_tile_segments(layer, class, sac_scale, &clipped),
+                encode_tile_segments(layer, class, sac_scale, name, &clipped),
             ));
         }
     }
@@ -374,14 +383,22 @@ pub fn run_pass3_slice(
             // row without a tags row means the index predates P5.C2 —
             // refuse rather than emit un-layered geometry (same posture as
             // an unsupported checkpoint version).
-            let (layer, class, sac_scale) = get_way_tags(db, way_id)?.ok_or_else(|| {
+            let (layer, class, sac_scale, name) = get_way_tags(db, way_id)?.ok_or_else(|| {
                 IndexError::InvalidInput(format!(
                     "way {way_id} has refs but no tag record — index written by an \
                      incompatible pipeline version"
                 ))
             })?;
             let simplified = geom::simplify_rdp(&line, epsilon);
-            bin_way(way_id, layer, &class, &sac_scale, &simplified, &mut buffer);
+            bin_way(
+                way_id,
+                layer,
+                &class,
+                &sac_scale,
+                &name,
+                &simplified,
+                &mut buffer,
+            );
         }
         last_way_id = way_id;
         ways_binned += 1;
@@ -425,14 +442,15 @@ mod tests {
         d
     }
 
-    /// A default-tagged (`highway=path`, no grade) way for binning tests
-    /// that don't exercise tag variety themselves.
+    /// A default-tagged (`highway=path`, no grade/name) way for binning
+    /// tests that don't exercise tag variety themselves.
     fn hw(id: u64, refs: Vec<u64>) -> IndexedWay {
         IndexedWay {
             id,
             layer: 0,
             class: b"path".to_vec(),
             sac_scale: Vec::new(),
+            name: Vec::new(),
             refs,
         }
     }
@@ -441,21 +459,37 @@ mod tests {
 
     #[test]
     fn tile_segments_roundtrip() {
-        type Case = (u8, &'static [u8], &'static [u8], Vec<Vec<(f64, f64)>>);
+        type Case = (
+            u8,
+            &'static [u8],
+            &'static [u8],
+            &'static [u8],
+            Vec<Vec<(f64, f64)>>,
+        );
         let cases: Vec<Case> = vec![
-            (0, b"path", b"", vec![]),
+            (0, b"path", b"", b"", vec![]),
             (
                 0,
                 b"path",
                 b"demanding_mountain_hiking",
+                // Real-world UTF-8: umlauts + sharp s must survive the
+                // byte-slice slot verbatim.
+                "Höttinger Höhenstraße".as_bytes(),
                 vec![vec![(0.0, 0.0), (1.5, -2.5)]],
             ),
-            (1, b"stream", b"", vec![vec![(0.0, 0.0), (1.5, -2.5)]]),
-            // Empty class + empty grade both survive.
-            (3, b"", b"", vec![vec![(0.0, 0.0), (1.0, 1.0)]]),
+            (
+                1,
+                b"river",
+                b"",
+                b"Inn",
+                vec![vec![(0.0, 0.0), (1.5, -2.5)]],
+            ),
+            // All-empty optional slots survive.
+            (3, b"", b"", b"", vec![vec![(0.0, 0.0), (1.0, 1.0)]]),
             (
                 2,
                 b"wood",
+                b"",
                 b"",
                 vec![
                     vec![(1_268_000.25, 5_988_000.75), (1_268_100.0, 5_988_100.0)],
@@ -463,12 +497,18 @@ mod tests {
                 ],
             ),
         ];
-        for (layer, class, sac, segments) in cases {
-            let encoded = encode_tile_segments(layer, class, sac, &segments);
+        for (layer, class, sac, name, segments) in cases {
+            let encoded = encode_tile_segments(layer, class, sac, name, &segments);
             assert_eq!(
                 decode_tile_segments(&encoded).unwrap(),
-                (layer, class.to_vec(), sac.to_vec(), segments.clone()),
-                "roundtrip layer={layer} class={class:?} sac={sac:?} {segments:?}"
+                (
+                    layer,
+                    class.to_vec(),
+                    sac.to_vec(),
+                    name.to_vec(),
+                    segments.clone()
+                ),
+                "roundtrip layer={layer} class={class:?} sac={sac:?} name={name:?}"
             );
         }
     }
@@ -476,7 +516,13 @@ mod tests {
     #[test]
     fn tile_segments_reject_garbage() {
         // Truncated mid-vertex.
-        let full = encode_tile_segments(0, b"path", b"hiking", &[vec![(1.0, 2.0), (3.0, 4.0)]]);
+        let full = encode_tile_segments(
+            0,
+            b"path",
+            b"hiking",
+            b"Goetheweg",
+            &[vec![(1.0, 2.0), (3.0, 4.0)]],
+        );
         assert!(matches!(
             decode_tile_segments(&full[..full.len() - 5]),
             Err(IndexError::InvalidInput(_))
@@ -505,16 +551,21 @@ mod tests {
             decode_tile_segments(&[0, 0, 0xff, 0xff, 0xff, 0x7f]),
             Err(IndexError::InvalidInput(_))
         ));
-        // Value truncated inside the sac_scale slot itself.
-        let mut short = encode_tile_segments(0, b"p", b"hiking", &[]);
-        short.truncate(5); // layer + class slot + partial sac bytes
+        // Hostile name length with no bytes behind it (valid class+sac).
+        assert!(matches!(
+            decode_tile_segments(&[0, 0, 0, 0xff, 0xff, 0xff, 0x7f]),
+            Err(IndexError::InvalidInput(_))
+        ));
+        // Value truncated inside the name slot itself.
+        let mut short = encode_tile_segments(0, b"p", b"", b"Goetheweg", &[]);
+        short.truncate(6); // layer + class slot + empty sac + partial name
         assert!(matches!(
             decode_tile_segments(&short),
             Err(IndexError::InvalidInput(_))
         ));
-        // Hostile segment count with no data behind it (valid layer+class+sac).
+        // Hostile segment count with no data behind it (all slots valid).
         assert!(matches!(
-            decode_tile_segments(&[0, 0, 0, 0xff, 0xff, 0xff, 0x7f]),
+            decode_tile_segments(&[0, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f]),
             Err(IndexError::InvalidInput(_))
         ));
         // Empty input (not even a layer byte).
@@ -554,10 +605,11 @@ mod tests {
         let a = (-0.4 * e, -0.5 * e);
         let z = (0.4 * e, -0.5 * e);
         insert_coords_batched(&db, [(1u64, a), (2u64, z)], DEFAULT_BATCH_SIZE).unwrap();
-        // Grade-bearing trail: sac_scale must survive the clip into BOTH
-        // tiles alongside layer/class (P5.C3).
+        // Fully-attributed trail: sac_scale AND name must survive the clip
+        // into BOTH tiles alongside layer/class (P5.C3/P5.C4).
         let way = IndexedWay {
             sac_scale: b"alpine_hiking".to_vec(),
+            name: "Goetheweg".as_bytes().to_vec(),
             ..hw(77, vec![1, 2])
         };
         insert_ways_batched(&db, [way], DEFAULT_BATCH_SIZE).unwrap();
@@ -585,6 +637,7 @@ mod tests {
         assert_eq!(left[0].way_id, 77);
         assert_eq!((left[0].layer, left[0].class.as_slice()), (0, &b"path"[..]));
         assert_eq!(left[0].sac_scale, b"alpine_hiking".to_vec());
+        assert_eq!(left[0].name, "Goetheweg".as_bytes().to_vec());
         assert_eq!(
             left[0].segments.len(),
             1,
@@ -605,6 +658,7 @@ mod tests {
             (0, &b"path"[..])
         );
         assert_eq!(right[0].sac_scale, b"alpine_hiking".to_vec());
+        assert_eq!(right[0].name, "Goetheweg".as_bytes().to_vec());
         assert_eq!(
             right[0].segments.len(),
             1,
@@ -657,6 +711,7 @@ mod tests {
                 layer: 0,
                 class: b"path".to_vec(),
                 sac_scale: Vec::new(),
+                name: Vec::new(),
                 segments: vec![pts.to_vec()],
             }]
         );

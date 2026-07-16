@@ -32,11 +32,16 @@ pub const MVT_EXTENT: u32 = 4096;
 /// tag's value). Client styles filter on `["get", "class"]`.
 pub const CLASS_KEY: &str = "class";
 
-/// Optional second attribute on highway features: the trail difficulty
-/// grade (P5.C3). Appended to a layer's key pool only when at least one of
-/// its features carries a grade. Client styles color on
+/// Optional attribute on highway features: the trail difficulty grade
+/// (P5.C3). Appended to a layer's key pool only when at least one of its
+/// features carries a grade. Client styles color on
 /// `["get", "sac_scale"]`.
 pub const SAC_SCALE_KEY: &str = "sac_scale";
+
+/// Optional attribute on ANY layer's features: the label text (P5.C4).
+/// Appended to a layer's key pool only when at least one of its features
+/// is named. Client styles label on `["get", "name"]`.
+pub const NAME_KEY: &str = "name";
 
 const GEOM_TYPE_LINESTRING: i32 = 2;
 const CMD_MOVE_TO: u32 = 1;
@@ -155,17 +160,20 @@ fn encode_geometry(segments: &[Vec<(f64, f64)>], origin: (f64, f64), scale: f64)
 /// `features` come straight from the `TileFeatures` index decode. They are
 /// grouped by layer index into one named MVT layer each (ascending index —
 /// deterministic output, which payload dedup and the engine's determinism
-/// proof rely on). Attributes per feature (P5.C3):
-/// - `class` (always): `tags` starts `[0, c]` — `keys[0] = "class"`.
-/// - `sac_scale` (optional): `tags` continues `[1, s]`. The `"sac_scale"`
-///   key is appended to the layer's key pool lazily, on the first grade-
-///   bearing feature — layers without any stay byte-identical to their
-///   P5.C2 form at exactly `["class"]`.
+/// proof rely on). Attributes per feature (P5.C3/P5.C4):
+/// - `class` (always) — pooled first for every feature, so it always
+///   lands at key index 0.
+/// - `sac_scale` (optional, highway) and `name` (optional, any layer) —
+///   each key is appended to its layer's KEY pool lazily, on the first
+///   feature that carries it; a layer's key order is therefore first-seen
+///   order (deterministic given the deterministic feature order), and
+///   attribute-free layers stay byte-stable at exactly `["class"]`.
 ///
-/// The per-layer VALUE pool is shared across keys (valid MVT — a class
-/// string and a grade string that coincide share one entry), deduped in
-/// first-seen order. Returns `None` when nothing survives quantization —
-/// the caller writes no archive entry for such a tile.
+/// Per-layer VALUE pools are shared across keys (valid MVT — coinciding
+/// strings share one entry), deduped in first-seen order. `tags` is the
+/// concatenation of the feature's `[key_idx, value_idx]` pairs. Returns
+/// `None` when nothing survives quantization — the caller writes no
+/// archive entry for such a tile.
 pub fn encode_tile_mvt(
     zoom: u8,
     tile_x: u32,
@@ -178,8 +186,9 @@ pub fn encode_tile_mvt(
 
     // Grouped by layer index; BTreeMap gives ascending-index layer order.
     let mut layers: BTreeMap<u8, Layer> = BTreeMap::new();
-    // Per-layer value-string → value-pool index (first-seen order, so the
-    // pool itself stays deterministic). Shared across keys within a layer.
+    // Per-layer pools, both first-seen-ordered: key string → key index and
+    // value string → value index (values shared across keys in a layer).
+    let mut key_pool: HashMap<(u8, &'static str), u32> = HashMap::new();
     let mut value_pool: HashMap<(u8, Vec<u8>), u32> = HashMap::new();
 
     for feature in features {
@@ -197,36 +206,41 @@ pub fn encode_tile_mvt(
             version: 2,
             name: name.to_string(),
             features: Vec::new(),
-            keys: vec![CLASS_KEY.to_string()],
+            keys: Vec::new(), // grown lazily through key_pool below
             values: Vec::new(),
             extent: MVT_EXTENT,
         });
 
-        let mut pool_value = |layer: &mut Layer, layer_idx: u8, value: &[u8]| -> u32 {
-            let pool_key = (layer_idx, value.to_vec());
-            match value_pool.get(&pool_key) {
-                Some(&idx) => idx,
-                None => {
-                    let idx = layer.values.len() as u32;
-                    layer.values.push(Value {
-                        string_value: Some(String::from_utf8_lossy(value).into_owned()),
-                    });
-                    value_pool.insert(pool_key, idx);
-                    idx
-                }
-            }
-        };
+        // Appends one `[key_idx, value_idx]` pair to `tags`, growing the
+        // layer's key/value pools on first sight of either string.
+        let layer_idx = feature.layer;
+        let mut push_attr =
+            |layer: &mut Layer, tags: &mut Vec<u32>, key: &'static str, value: &[u8]| {
+                let k = *key_pool.entry((layer_idx, key)).or_insert_with(|| {
+                    layer.keys.push(key.to_string());
+                    (layer.keys.len() - 1) as u32
+                });
+                let v = match value_pool.get(&(layer_idx, value.to_vec())) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = layer.values.len() as u32;
+                        layer.values.push(Value {
+                            string_value: Some(String::from_utf8_lossy(value).into_owned()),
+                        });
+                        value_pool.insert((layer_idx, value.to_vec()), idx);
+                        idx
+                    }
+                };
+                tags.extend_from_slice(&[k, v]);
+            };
 
-        let class_value = pool_value(layer, feature.layer, &feature.class);
-        let mut tags = vec![0, class_value];
+        let mut tags = Vec::with_capacity(6);
+        push_attr(layer, &mut tags, CLASS_KEY, &feature.class);
         if !feature.sac_scale.is_empty() {
-            let sac_value = pool_value(layer, feature.layer, &feature.sac_scale);
-            // Key pool grows lazily: "sac_scale" lands at index 1 on the
-            // first grade-bearing feature of this layer.
-            if layer.keys.len() == 1 {
-                layer.keys.push(SAC_SCALE_KEY.to_string());
-            }
-            tags.extend_from_slice(&[1, sac_value]);
+            push_attr(layer, &mut tags, SAC_SCALE_KEY, &feature.sac_scale);
+        }
+        if !feature.name.is_empty() {
+            push_attr(layer, &mut tags, NAME_KEY, &feature.name);
         }
 
         layer.features.push(Feature {
@@ -257,13 +271,14 @@ mod tests {
     const TX: u32 = 8703;
     const TY: u32 = 5747;
 
-    /// TileFeature shorthand for encoder tests (no grade).
+    /// TileFeature shorthand for encoder tests (no grade, no name).
     fn feat(way_id: u64, layer: u8, class: &[u8], segments: Vec<Vec<(f64, f64)>>) -> TileFeature {
         TileFeature {
             way_id,
             layer,
             class: class.to_vec(),
             sac_scale: Vec::new(),
+            name: Vec::new(),
             segments,
         }
     }
@@ -278,6 +293,20 @@ mod tests {
     ) -> TileFeature {
         TileFeature {
             sac_scale: sac.to_vec(),
+            ..feat(way_id, layer, class, segments)
+        }
+    }
+
+    /// Name-bearing variant of [`feat`].
+    fn named(
+        way_id: u64,
+        layer: u8,
+        class: &[u8],
+        name: &str,
+        segments: Vec<Vec<(f64, f64)>>,
+    ) -> TileFeature {
+        TileFeature {
+            name: name.as_bytes().to_vec(),
             ..feat(way_id, layer, class, segments)
         }
     }
@@ -549,5 +578,78 @@ mod tests {
         let layer = &decode(&payload).layers[0];
         assert_eq!(layer.values.len(), 1, "one pooled value serves both keys");
         assert_eq!(layer.features[0].tags, vec![0, 0, 1, 0]);
+    }
+
+    /// P5.C4: a named feature on a NON-highway layer carries the name
+    /// attribute — keys grow to ["class","name"] with tags [0,c,1,n], and
+    /// UTF-8 label text survives to the wire.
+    #[test]
+    fn name_encodes_on_any_layer() {
+        let seg = vec![merc_at(0.0, 5.0), merc_at(40.0, 5.0)];
+        let payload =
+            encode_tile_mvt(Z, TX, TY, &[named(1, 1, b"river", "Inn", vec![seg])]).unwrap();
+        let layer = &decode(&payload).layers[0];
+        assert_eq!(layer.name, "waterway");
+        assert_eq!(
+            layer.keys,
+            vec![CLASS_KEY.to_string(), NAME_KEY.to_string()]
+        );
+        assert_eq!(layer.values[1].string_value.as_deref(), Some("Inn"));
+        assert_eq!(layer.features[0].tags, vec![0, 0, 1, 1]);
+    }
+
+    /// THE key-pool regression test for the P5.C4 refactor: with two lazy
+    /// keys, a layer that sees a named-only feature FIRST and a graded-only
+    /// feature SECOND must assign key indices in first-seen order — and
+    /// every feature's tags must point at the right key.
+    #[test]
+    fn lazy_key_indices_follow_first_seen_order() {
+        let seg = |y: f64| vec![merc_at(0.0, y), merc_at(50.0, y)];
+        let payload = encode_tile_mvt(
+            Z,
+            TX,
+            TY,
+            &[
+                named(1, 0, b"path", "Höhenweg", vec![seg(10.0)]),
+                graded(2, 0, b"path", b"alpine_hiking", vec![seg(20.0)]),
+                // Fully-attributed: tags are emitted class, sac, name — but
+                // the key INDICES come from the layer's first-seen pool.
+                TileFeature {
+                    sac_scale: b"alpine_hiking".to_vec(),
+                    ..named(3, 0, b"path", "Höhenweg", vec![seg(30.0)])
+                },
+            ],
+        )
+        .unwrap();
+        let layer = &decode(&payload).layers[0];
+
+        // name was seen before sac_scale → keys [class, name, sac_scale].
+        assert_eq!(
+            layer.keys,
+            vec![
+                CLASS_KEY.to_string(),
+                NAME_KEY.to_string(),
+                SAC_SCALE_KEY.to_string()
+            ]
+        );
+        // Values first-seen: path, Höhenweg, alpine_hiking.
+        let values: Vec<Option<&str>> = layer
+            .values
+            .iter()
+            .map(|v| v.string_value.as_deref())
+            .collect();
+        assert_eq!(
+            values,
+            vec![Some("path"), Some("Höhenweg"), Some("alpine_hiking")]
+        );
+        let tags: Vec<&Vec<u32>> = layer.features.iter().map(|f| &f.tags).collect();
+        assert_eq!(
+            tags,
+            vec![
+                &vec![0, 0, 1, 1],       // class=path, name=Höhenweg
+                &vec![0, 0, 2, 2],       // class=path, sac_scale=alpine_hiking
+                &vec![0, 0, 2, 2, 1, 1], // all three, indices per pool order
+            ],
+        );
     }
 }

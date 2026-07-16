@@ -20,6 +20,8 @@
       "tileSize": 512
     }
   },
+  "glyphs": "/glyphs/{fontstack}/{range}.pbf",
+  "sprite": "/sprites/outdoor",
   "terrain": {
     "source": "terrain-local",
     "exaggeration": 1.3
@@ -33,45 +35,74 @@
       }
     },
     {
-      "id": "forest-cover",
+      "id": "landuse-forest",
       "type": "fill",
       "source": "basemap-local",
       "source-layer": "landuse",
-      "filter": ["==", ["get", "landuse"], "forest"],
+      "minzoom": 4,
+      "filter": ["match", ["get", "class"], ["forest", "wood"], true, false],
       "paint": {
         "fill-color": "#1B4D3E",
         "fill-opacity": 1.0
       }
     },
     {
-      "id": "meadow-scrub",
+      "id": "landuse-vegetation",
       "type": "fill",
       "source": "basemap-local",
       "source-layer": "landuse",
-      "filter": ["match", ["get", "landuse"], ["scrub", "grass"], true, false],
+      "minzoom": 4,
+      "filter": ["match", ["get", "class"], ["grass", "meadow", "scrub", "farmland", "orchard", "vineyard"], true, false],
       "paint": {
         "fill-color": "#A3B899",
         "fill-opacity": 1.0
       }
     },
     {
-      "id": "barren-rock",
+      "id": "landuse-other",
+      "type": "fill",
+      "source": "basemap-local",
+      "source-layer": "landuse",
+      "minzoom": 6,
+      "filter": ["!", ["match", ["get", "class"], ["forest", "wood", "grass", "meadow", "scrub", "farmland", "orchard", "vineyard"], true, false]],
+      "paint": {
+        "fill-color": "#D8CFC0",
+        "fill-opacity": 0.8
+      }
+    },
+    {
+      "id": "natural-water",
       "type": "fill",
       "source": "basemap-local",
       "source-layer": "natural",
-      "filter": ["==", ["get", "natural"], "rock"],
+      "minzoom": 4,
+      "filter": ["match", ["get", "class"], ["water", "wetland"], true, false],
       "paint": {
-        "fill-color": "#D3D3D3",
+        "fill-color": "#005F73",
         "fill-opacity": 1.0
       }
     },
     {
-      "id": "water-bodies",
+      "id": "natural-glacier",
       "type": "fill",
       "source": "basemap-local",
-      "source-layer": "water",
+      "source-layer": "natural",
+      "minzoom": 4,
+      "filter": ["==", ["get", "class"], "glacier"],
       "paint": {
-        "fill-color": "#005F73",
+        "fill-color": "#DCEEF2",
+        "fill-opacity": 1.0
+      }
+    },
+    {
+      "id": "natural-rock",
+      "type": "fill",
+      "source": "basemap-local",
+      "source-layer": "natural",
+      "minzoom": 6,
+      "filter": ["match", ["get", "class"], ["bare_rock", "scree", "cliff", "shingle"], true, false],
+      "paint": {
+        "fill-color": "#D3D3D3",
         "fill-opacity": 1.0
       }
     },
@@ -89,67 +120,149 @@
       }
     },
     {
-      "id": "dynamic-hiking-trails",
+      "id": "waterway-major",
       "type": "line",
       "source": "basemap-local",
-      "source-layer": "transportation",
-      "filter": ["has", "sac_scale"],
+      "source-layer": "waterway",
+      "minzoom": 7,
+      "filter": ["==", ["get", "class"], "river"],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
       "paint": {
-        "line-width": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          12, 1.5,
-          15, 3.5,
-          18, 5.0
-        ],
-        "line-color": [
-          "match",
-          ["coalesce", ["get", "sac_scale"], "hiking"],
-          "strolling", "#2ECC71",
-          "hiking", "#2ECC71",
-          "mountain_hiking", "#3498DB",
-          "demanding_mountain_hiking", "#F39C12",
-          "alpine_hiking", "#E67E22",
-          "demanding_alpine_hiking", "#E74C3C",
-          "#2ECC71"
-        ],
-        "line-dasharray": [
-          "match",
-          ["coalesce", ["get", "sac_scale"], "hiking"],
-          "strolling", ["literal", [1, 0]],
-          "hiking", ["literal", [1, 0]],
-          "mountain_hiking", ["literal", [8, 3]],
-          "demanding_mountain_hiking", ["literal", [6, 4]],
-          "alpine_hiking", ["literal", [3, 3]],
-          "demanding_alpine_hiking", ["literal", [1, 3]],
-          ["literal", [1, 0]]
-        ]
+        "line-color": "#0A84A8",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 7, 0.8, 12, 2.5, 18, 6.0]
       }
     },
     {
-      "id": "peak-labels",
-      "type": "symbol",
+      "id": "waterway-minor",
+      "type": "line",
       "source": "basemap-local",
-      "source-layer": "poi",
-      "filter": ["==", ["get", "class"], "peak"],
+      "source-layer": "waterway",
+      "minzoom": 9,
+      "filter": ["!", ["==", ["get", "class"], "river"]],
       "layout": {
-        "text-field": ["get", "name"],
-        "text-size": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          10, 10,
-          15, 14
-        ],
-        "text-variable-anchor": ["top", "bottom", "left", "right"],
-        "text-radial-offset": 0.8
+        "line-cap": "round",
+        "line-join": "round"
       },
       "paint": {
-        "text-color": "#2B2D42",
-        "text-halo-color": "#FFFFFF",
-        "text-halo-width": 2.5,
-        "text-halo-blur": 0.5
+        "line-color": "#0A84A8",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 0.5, 14, 1.5, 18, 3.0]
+      }
+    },
+    {
+      "id": "trail-path",
+      "type": "line",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 10,
+      "filter": ["match", ["get", "class"], ["path", "footway"], true, false],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#2ECC71",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.5, 18, 5.0]
+      }
+    },
+    {
+      "id": "trail-track",
+      "type": "line",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 10,
+      "filter": ["==", ["get", "class"], "track"],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#E67E22",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.5, 18, 5.0],
+        "line-dasharray": [4, 2]
+      }
+    },
+    {
+      "id": "trail-bridleway",
+      "type": "line",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 10,
+      "filter": ["==", ["get", "class"], "bridleway"],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#8E44AD",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.0, 18, 4.5],
+        "line-dasharray": [1, 2]
+      }
+    },
+    {
+      "id": "trail-steps",
+      "type": "line",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 12,
+      "filter": ["==", ["get", "class"], "steps"],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#E74C3C",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.5, 18, 5.5],
+        "line-dasharray": [1, 1]
+      }
+    },
+    {
+      "id": "trail-cycleway",
+      "type": "line",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 10,
+      "filter": ["==", ["get", "class"], "cycleway"],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#3498DB",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.0, 18, 4.5],
+        "line-dasharray": [6, 2]
+      }
+    },
+    {
+      "id": "roads-other",
+      "type": "line",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 9,
+      "filter": ["!", ["match", ["get", "class"], ["path", "footway", "track", "bridleway", "steps", "cycleway"], true, false]],
+      "layout": {
+        "line-cap": "round",
+        "line-join": "round"
+      },
+      "paint": {
+        "line-color": "#7A7A7A",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 0.5, 14, 2.0, 18, 4.0]
+      }
+    },
+    {
+      "id": "natural-peak",
+      "type": "circle",
+      "source": "basemap-local",
+      "source-layer": "natural",
+      "minzoom": 10,
+      "filter": ["==", ["get", "class"], "peak"],
+      "paint": {
+        "circle-radius": 4,
+        "circle-color": "#2B2D42",
+        "circle-stroke-color": "#FFFFFF",
+        "circle-stroke-width": 1.5
       }
     }
   ]

@@ -29,7 +29,7 @@
 use std::time::Duration;
 
 use compiler::engine::{self, JobSpec, SliceOutcome};
-use compiler::BBox;
+use compiler::{thermal, BBox};
 
 uniffi::setup_scaffolding!("freehike");
 
@@ -122,6 +122,50 @@ pub enum CompilationStatus {
     Yielded { checkpoint: CheckpointState },
     /// A fatal error occurred (e.g. disk full, corrupted payload).
     Failed { reason: String },
+}
+
+/// Device thermal pressure, reported by the native shells so the compiler
+/// can throttle itself before the OS terminates the process (P8.C1).
+///
+/// Suggested platform mapping (the shells own this; Rust never polls):
+/// - iOS `ProcessInfo.ThermalState`: `.nominal`/`.fair`/`.serious`/
+///   `.critical` map 1:1.
+/// - Android `PowerManager` thermal status: `NONE` → Nominal, `LIGHT` →
+///   Fair, `MODERATE` → Serious, `SEVERE` and above → Critical.
+///
+/// Effect inside the compiler: Nominal/Fair run at full duty cycle (Fair
+/// additionally halves parallel-section width); Serious halves the honored
+/// slice budget and injects cooling pauses between blocks; Critical makes
+/// the very next block boundary checkpoint and return `Yielded`, so the
+/// runner can go idle until the OS reports recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ThermalState {
+    Nominal,
+    Fair,
+    Serious,
+    Critical,
+}
+
+impl From<ThermalState> for thermal::ThermalState {
+    fn from(s: ThermalState) -> Self {
+        match s {
+            ThermalState::Nominal => thermal::ThermalState::Nominal,
+            ThermalState::Fair => thermal::ThermalState::Fair,
+            ThermalState::Serious => thermal::ThermalState::Serious,
+            ThermalState::Critical => thermal::ThermalState::Critical,
+        }
+    }
+}
+
+impl From<thermal::ThermalState> for ThermalState {
+    fn from(s: thermal::ThermalState) -> Self {
+        match s {
+            thermal::ThermalState::Nominal => ThermalState::Nominal,
+            thermal::ThermalState::Fair => ThermalState::Fair,
+            thermal::ThermalState::Serious => ThermalState::Serious,
+            thermal::ThermalState::Critical => ThermalState::Critical,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +272,26 @@ pub fn query_checkpoint(job_id: String, output_dir: String) -> Option<Checkpoint
 #[uniffi::export]
 pub fn purge_job(job_id: String, output_dir: String) -> bool {
     engine::purge_job_state(&output_dir, &job_id)
+}
+
+/// Publishes the OS-reported thermal level to the compiler core. Callable
+/// from ANY foreign thread at any time — including while `compile_chunk`
+/// is running on another thread; the write is a single atomic store and
+/// running loops pick it up at their next block boundary. The shells
+/// should call this from their thermal-notification observers
+/// (`thermalStateDidChangeNotification` / `OnThermalStatusChangedListener`)
+/// and once at scheduler-window start (notifications don't fire for a
+/// state that was already elevated when the process woke).
+#[uniffi::export]
+pub fn set_thermal_state(state: ThermalState) {
+    thermal::set_state(state.into());
+}
+
+/// The thermal level the compiler is currently governed by (Nominal until
+/// a shell reports otherwise). For smoke tests and telemetry/UI.
+#[uniffi::export]
+pub fn thermal_state() -> ThermalState {
+    thermal::current().into()
 }
 
 /// Version string for plugin smoke tests ("is the Rust core actually loaded?").

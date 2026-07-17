@@ -29,8 +29,9 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::thermal::SliceGovernor;
 use crate::BBox;
 
 // ---------------------------------------------------------------------------
@@ -418,7 +419,13 @@ pub fn run_slice(
         Err(e) => return SliceOutcome::Failed(e),
     };
 
-    let started = Instant::now();
+    // Every deadline check below routes through the thermal governor
+    // (P8.C1): under Nominal/Fair it degenerates to the plain
+    // elapsed-vs-budget comparison; under Serious it injects cooling pauses
+    // and halves the honored budget; under Critical it forces an immediate
+    // checkpoint-and-yield. The state is re-read at every block boundary,
+    // so a shell-reported change lands mid-slice.
+    let governor = SliceGovernor::new(budget);
     let n_phases = plan.len() as f32;
     // Minimum-forward-progress bookkeeping: once ANY block has been processed
     // in this slice, budget checks may yield.
@@ -449,7 +456,7 @@ pub fn run_slice(
                 };
 
                 let sub = match pbf::run_pass1_slice(&pbf, &db, resume_offset, &mut || {
-                    started.elapsed() >= budget
+                    governor.should_yield()
                 }) {
                     Ok(s) => s,
                     Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
@@ -501,7 +508,7 @@ pub fn run_slice(
                 };
 
                 let sub = match pbf::run_pass2_slice(&pbf, &db, resume_offset, &mut || {
-                    started.elapsed() >= budget
+                    governor.should_yield()
                 }) {
                     Ok(s) => s,
                     Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
@@ -540,7 +547,7 @@ pub fn run_slice(
                 };
 
                 let sub = match pbf::run_pass3_slice(&db, cp.pass3_last_way_id, &mut || {
-                    started.elapsed() >= budget
+                    governor.should_yield()
                 }) {
                     Ok(s) => s,
                     Err(e) => return SliceOutcome::Failed(format!("pass3: {e}")),
@@ -594,7 +601,7 @@ pub fn run_slice(
                     &db,
                     &data_path,
                     cp.pass5_last_tile,
-                    &mut || started.elapsed() >= budget,
+                    &mut || governor.should_yield(),
                 ) {
                     Ok(s) => s,
                     Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
@@ -633,7 +640,7 @@ pub fn run_slice(
                 // if this slice already spent its budget, yield first and
                 // let the next slice own it (min-progress covers a fresh
                 // slice whose budget is already zero).
-                if slice_blocks > 0 && started.elapsed() >= budget {
+                if slice_blocks > 0 && governor.should_yield() {
                     return match save_checkpoint(&job.output_dir, &cp) {
                         Ok(()) => SliceOutcome::Yielded(cp),
                         Err(e) => SliceOutcome::Failed(e),
@@ -673,7 +680,7 @@ pub fn run_slice(
                 while cp.next_block < blocks {
                     // Budget check BEFORE each block, except when this slice
                     // has done nothing yet (no-livelock guarantee).
-                    if slice_blocks > 0 && started.elapsed() >= budget {
+                    if slice_blocks > 0 && governor.should_yield() {
                         return match save_checkpoint(&job.output_dir, &cp) {
                             Ok(()) => SliceOutcome::Yielded(cp),
                             Err(e) => SliceOutcome::Failed(e),

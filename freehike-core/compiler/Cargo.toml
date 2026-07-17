@@ -9,6 +9,8 @@ license.workspace = true
 pbf = { workspace = true }
 # Real Finalize phase (P5.C1): MVT encode + PMTiles v3 assembly drivers.
 tiles = { workspace = true }
+# Thermal governance (P8.C1): governed custom ThreadPool in `thermal`.
+rayon = { workspace = true }
 
 [dev-dependencies]
 # Synthetic-PBF builders for the integrated Pass-1 engine tests.

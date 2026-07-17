@@ -31,6 +31,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # path.
 tiff = { version = "0.11", default-features = false, features = ["lzw"] }
 image = { version = "0.25", default-features = false, features = ["webp"] }
+# Thermal-governed parallelism (Phase 8): one custom capped ThreadPool +
+# wave-based admission in `compiler::thermal`. The GLOBAL rayon pool is
+# never initialized — pool width is fixed at construction, so governance
+# works by admission control, not pool resizing. Pure Rust, no C in the
+# mobile cross-compile path.
+rayon = "1"
 compiler = { path = "compiler" }
 pbf = { path = "pbf" }
 terrain = { path = "terrain" }

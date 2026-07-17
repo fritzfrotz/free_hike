@@ -1853,3 +1853,80 @@ error, L2 sliced test), main.rs (optional `budget_ms` CLI arg).
 **Outcome:** CLOSED. Remaining P6: frontend wiring (raster-dem source over
 the OPFS archive), contour bake-vs-runtime study, optional overview-quality
 trade study. Engine-table integration of the terrain phase lands with P9.
+
+## PHASE 8 — BACKGROUND SCHEDULERS & THERMAL GOVERNANCE (OPEN)
+
+## P8.C1 — Thermal governance: FFI ThermalState + governed throttling core
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** operator-directed Surface v1 ADDITION (new enum + two
+exported fns; no existing record/enum/callback touched) and one new
+dependency, `rayon = "1"` (pure Rust, workspace dep) — both explicitly
+directed in the Phase 8 kickoff task, so the §1.5 HITL gates are
+operator-signed by construction. Swift/Kotlin shells deliberately NOT
+written yet (P8.C2+).
+
+**Goal:** make the compiler survive mobile thermal policy: the shells
+report `ProcessInfo.thermalState` / `PowerManager` thermal status through
+the FFI, and every compilation loop actively listens and voluntarily
+throttles before the SoC kills the process.
+
+**Files:** compiler/src/thermal.rs (new), compiler/src/engine.rs (deadline
+checks re-routed), compiler/src/lib.rs (+mod), ffi/src/lib.rs (surface
+addition), compiler/tests/thermal_governance.rs (new),
+ffi/tests/thermal.rs (new), both Cargo.toml.
+
+**Design (the load-bearing parts):**
+- `ThermalState { Nominal, Fair, Serious, Critical }` in a single global
+  `AtomicU8` (`Relaxed` — advisory flag, no payload to publish; thermal
+  pressure is a DEVICE property, so global is correct and the FFI setter
+  is one lock-free store callable from any foreign thread mid-compile).
+  Unknown bytes decode as Critical (fail COOL — still makes minimum
+  progress, never bricks).
+- Policy table: Nominal/Fair = full budget, no pauses; Serious = budget
+  honored at 50% + 25ms cooling pause before every block; Critical =
+  budget scale 0 (yield NOW, no pause on the exit path).
+- `SliceGovernor` replaces the engine's raw `started.elapsed() >= budget`
+  closures at ALL SIX deadline sites (passes 1/2/3, finalize encode,
+  finalize assembly gate, terrain sim). State re-read at every block
+  boundary → a mid-slice downshift lands at the next block. Under
+  Critical the existing minimum-forward-progress guarantee degrades a
+  still-invoking runner to one block per slice (no livelock); the durable
+  checkpoint machinery is untouched — thermal yield IS a normal yield.
+- Rayon: the GLOBAL pool is never initialized (one-shot init hazard
+  avoided entirely). One custom `ThreadPool` (`pool_width()` = logical
+  cores − 2, floor 1 — the spec's "P-cores − 2–3"; P/E distinction is not
+  portable, shells can refine later), built lazily via `OnceLock`.
+  Governance is ADMISSION, not resizing: `for_each_governed` feeds the
+  pool in bounded waves (`WAVE_FACTOR = 4` items/worker), re-reading
+  `effective_parallelism()` (Nominal=full, Fair=half, Serious/Critical=1)
+  before each wave; width 1 bypasses rayon and runs caller-thread with
+  the cooling pause between items. Index claims are CAS-bounded
+  (`claim()`) so a wave boundary can never swallow items. This is the
+  execution substrate for the upcoming parallel encode stages; the
+  sequential engine passes throttle via `SliceGovernor` today.
+
+**Verification:**
+- L1: 5 new pure unit tests in thermal.rs (policy table, severity order,
+  fail-cool decode, pool headroom, claim boundary). Global-state behavior
+  isolated in `compiler/tests/thermal_governance.rs` (own process, mutex
+  + Nominal-reset guard): FFI-shaped roundtrip, Critical → immediate
+  yield with no sleep on the exit path, Serious → half budget honored +
+  pause injected, engine trickles exactly 1 block/slice under Critical
+  then resumes to Finished on recovery, executor exactly-once over 200
+  items, strict serialism under Serious (peak concurrency == 1),
+  mid-batch downshift completes, effective-width table.
+- L3-shaped FFI boundary: `ffi/tests/thermal.rs` (own process): enum
+  roundtrip across the boundary; end-to-end Critical forces
+  `compile_chunk` (300s budget) to `Yielded`, Nominal resumes the same
+  job to `Finished`.
+- Workspace: **178/178 green ×2 consecutive** (162 prior + 16 new), fmt
+  clean, clippy `-D warnings` clean.
+- L4: `cargo check -p ffi --lib --target aarch64-linux-android` clean
+  (rayon cross-compiles pure-Rust).
+
+**Outcome:** CLOSED. Remaining Phase 8: Swift `BGProcessingTask` +
+`thermalStateDidChangeNotification` observer, Kotlin WorkManager FGS +
+`OnThermalStatusChangedListener` (P8.C2/C3); first parallel consumer of
+`for_each_governed` lands with the terrain engine-table integration (P9).

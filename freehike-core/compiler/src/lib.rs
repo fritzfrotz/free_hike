@@ -9,6 +9,7 @@
 //! Architecture, and Implementation Plan.md`).
 
 pub mod engine;
+pub mod thermal;
 
 use std::fmt;
 

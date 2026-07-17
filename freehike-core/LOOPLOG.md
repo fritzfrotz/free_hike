@@ -2084,3 +2084,49 @@ variables.gradle, vendored freehike.kt.
 both in place; remaining Phase-8 tail: iOS + Android device smokes, JS
 listener for `backgroundCompile` + OPFS import call (Phase 9 product
 integration territory).
+
+## P8.C4 — MainActivity: eager JNI init + boot-time thermal hook
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** operator-directed wiring chunk. Two spec corrections
+applied (flagged to operator): the directed snippet loaded
+`System.loadLibrary("freehike")` — the actual artifact is
+`libfreehike_ffi.so`, and the wrong name would abort class load
+(ExceptionInInitializerError) before onCreate, boot-looping the app; and
+`static {}` is Java — Kotlin uses `init {}` in the companion. MainActivity
+was converted Java → Kotlin to host both (no root Application class
+exists; the activity is the root UI entry point).
+
+**Files:** MainActivity.java DELETED, MainActivity.kt NEW (same package;
+manifest reference `.MainActivity` is language-agnostic).
+
+**Design (the load-bearing parts):**
+- Companion `init`: eager `System.loadLibrary("freehike_ffi")` at class
+  load, try/caught — a broken ABI split degrades to a map-only app with a
+  clear log line, never a boot-loop (same fail-soft posture as the
+  plugin's existing early load, which stays as a second net for
+  plugin-first entry paths).
+- Boot order is load-bearing and documented in-file: class init links the
+  .so → `registerPlugin` before `super.onCreate` (Capacitor binds plugins
+  during bridge init) → `ThermalStateBridge.start(applicationContext)`
+  BEFORE `super.onCreate`, so governance is armed before the heavy
+  WebView/bridge spin-up rather than after it. The start call is
+  try/caught for the missing-.so case (JNA links lazily; the thermal push
+  is the first FFI touch on this path).
+- The bridge's idempotence (AtomicBoolean listener guard) makes the
+  plugin `load()` and worker start calls harmless re-arms; they still
+  cover process entries that never see MainActivity (headless WorkManager
+  starts).
+
+**Verification:**
+- `:app:assembleDebug` clean (JAVA_HOME=openjdk@21 per the P8.C3 env
+  note).
+- dexdump: `Lcom/freehike/app/MainActivity$Companion;` present in the APK
+  dex — the Kotlin replacement actually shipped; the manifest's
+  `.MainActivity` cannot resolve to a deleted class at runtime.
+
+**Outcome:** CLOSED. Phase 8 mobile infrastructure complete (C1 core,
+C2 iOS, C3 Android, C4 boot wiring). Remaining Phase-8 tail unchanged:
+device smokes on both platforms; JS `backgroundCompile` listener + OPFS
+import land with Phase 9.

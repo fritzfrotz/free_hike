@@ -1483,3 +1483,80 @@ ways-only pipeline); leaf directories + run-length coalescing; Terrain
 (Phase 6) deferred.
 Uncommitted (P5.C4 diff): pbf (lib/scan/tile), tiles (mvt/finalize),
 compiler test fixture, LOOPLOG — awaiting operator.
+*(Post-close note: committed as `cbb0e05` (sac_scale) / `01fed9f` (name) on
+operator instruction; see P5.SEAL below.)*
+
+---
+
+## P5.SEAL — Phase 5 closure: vector basemap complete, verified, sealed
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator directive:** workspace audit, doc consolidation, Phase 6 prep.
+
+**Phase 5 is COMPLETE, VERIFIED, and SEALED.** The full vector basemap path is
+production-real end-to-end: raw `.osm.pbf` → Pass 1 nodes → Pass 2 ways+tags →
+Pass 3 tile binning → per-layer MVT (class + sac_scale + name attributes) →
+gzip+dedup → Hilbert-clustered PMTiles v3 — all under the budget-yield /
+kill-resume contract, validated against the reference `pmtiles` JS reader down
+to UTF-8 labels and all six SAC grades on the wire. The frontend side of the
+exit criterion is equally done: offline style renders the four source-layers
+with T1–T6 trail difficulty colors, natural/forest fills, and Noto Sans labels
+from vendored offline glyphs — **visually verified live in the app.**
+Commits sealing the phase: `cbb0e05` (sac_scale pipeline), `01fed9f` (name
+pipeline + MVT key-pool refactor), `d3481de` (offline style: T1–T6 colors,
+forests, labels), `555207e` (vendored Noto Sans glyphs).
+
+**DOCUMENTATION CONSOLIDATION (operator directive, this session):**
+The root **`ARCHITECTURE.md` is now the single, definitive source of truth**
+for the master implementation plan, memory constraints, and core architectural
+pillars. **All older research files are hereby DEPRECATED** in its favor —
+retained only as historical/citation references:
+- `research/Geospatial App Architecture Research.pdf` (and its former root
+  text export `architecture.md`)
+- `research/Client-Side Map Compilation Feasibility.pdf`
+- `research/On-Device Map Compiler Blueprint.pdf`
+- `research/On-Device Map Compilation - Feasibility, Architecture, and
+  Implementation Plan.md`
+- `research/Offline Map App Architecture & Build Plan.pdf`
+- `implementation_plan_phase3.md`
+`agentic_operating_manual.md` (process contract) and this LOOPLOG (append-only
+history) remain in force alongside it.
+
+**Hygiene sweep (pre-Phase-6 foundation check):**
+- `cargo fmt --all`: zero diffs; `cargo fmt --check` clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: **zero warnings**
+  on a forced full recheck (sources touched to invalidate cache). Nothing
+  lingering from the sac_scale/name iteration.
+- `cargo test --workspace`: **131/131 green** (24 compiler / 13 fetcher /
+  7 ffi / 18 geom / 42 pbf / 27 tiles; 3 ignored L2 real-data tests).
+
+**Phase 6 fixture verification:** `offline_sandbox/raw_data/innsbruck_dem.tif`
+PRESENT — 3,554,463 bytes, magic bytes `49 49 2a 00` (`II*\0`, little-endian
+TIFF, GDAL-produced with striped layout). Ready to be parsed.
+
+**Outcome:** CLOSED. Workspace green, docs consolidated, fixture verified.
+Phase 5 sealed; no further changes to the vector pipeline outside its carried
+follow-ups (leaf directories, run-length coalescing, node-POI layer).
+
+---
+
+## PHASE 6 — TERRAIN PIPELINE (OPEN)
+
+**Opened:** 2026-07-17
+**Scope (per ARCHITECTURE.md §5, Phase 6):** replace the simulated `Terrain`
+engine phase with a real driver in the `terrain` crate:
+- Windowed GeoTIFF reads of `innsbruck_dem.tif` (never whole-raster — the P3
+  50MB posture applies unchanged).
+- Terrain-RGB encoding matching what the client already consumes (`mapbox`
+  encoding: base −10000, interval 0.1, the massif parameters, z5–12), WebP
+  tiles → `terrain.pmtiles` via the existing Phase-5 PMTiles writer.
+- Suspendable under the Surface-v1 budget-yield contract (new checkpoint
+  cursor ⇒ checkpoint version bump per house rule).
+- Decision point carried from the plan: bake Marching-Squares contours into
+  the basemap vs. keep runtime maplibre-contour generation.
+**Fixture:** verified present and valid (see P5.SEAL).
+**Exit criterion:** compiled terrain archive drives the existing 3D
+terrain/hillshade/contours indistinguishably from the massif-built one.
+
+*(Chunks P6.C1… follow below as work begins.)*

@@ -1687,3 +1687,87 @@ L2 test), main.rs (z/x/y CLI mode).
 cover the DEM extent per zoom), `terrain.pmtiles` assembly via the Phase-5
 writer, Surface-v1 budget-yield cursor (checkpoint version bump), contour
 bake-vs-runtime study.
+
+---
+
+## P6.C3 — Pyramid enumeration & terrain.pmtiles assembly
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** no new external dependencies — `terrain` gains the
+in-workspace `tiles` dep (Phase-5 PMTiles byte-level writer + Hilbert IDs),
+plus `flate2` as dev-only (archive-shape tests gunzip internal sections).
+One surgical, behavior-preserving edit to the sealed vector path:
+`tiles::pmtiles::Header` gains `tile_type`/`tile_compression` fields (the
+values were hardcoded MVT/gzip at header bytes 98–99); `finalize.rs` pins its
+existing values, golden header test byte-identical. New consts
+`COMPRESSION_NONE`, `TILE_TYPE_WEBP`.
+
+**Goal:** enumerate every (z,x,y) intersecting the DEM extent for z5–12,
+render each through the P6.C2 pipeline, and pack a spec-valid
+`terrain.pmtiles` through the shared writer.
+
+**Files:** tiles/src/pmtiles.rs (+2 header fields, +2 consts),
+tiles/src/finalize.rs (pin MVT/gzip), terrain/src/archive.rs (new),
+mercator.rs (+TileRange/tile_range_for_bounds), reader.rs (+geo_bounds),
+lib.rs (+Io error, L2 test), main.rs (.pmtiles CLI mode),
+terrain/Cargo.toml.
+
+**Design:**
+- `mercator::tile_range_for_bounds` — bbox → inclusive tile rectangle per
+  zoom; max-side edges exclusive (a box ending exactly on a tile boundary
+  does not pull in the zero-width neighbour), degenerate boxes yield one
+  tile, latitudes clamp to the Mercator limit.
+- `archive::tile_id_range_sorted` — whole-pyramid enumeration sorted by
+  Hilbert tile ID; ascending IDs order z5 before z12 for free (zoom-prefixed
+  ID space). Tiles are RENDERED in that order, so payloads stream
+  append-only into the data section (`clustered=1`, no shuffle pass); peak
+  memory = directory entries + one tile in flight + the sampler's 4MB chunk
+  cache.
+- Payloads are NOT gzipped (WebP is already entropy-coded): header declares
+  `tile_compression=none`, `tile_type=webp`; internal compression stays
+  gzip. No payload dedup (n_tile_contents = n_entries) — the 0m-fill
+  overview tiles are the only dedup candidates and the win is ~1KB; logged
+  alongside the P5 dedup/run-length follow-ups.
+- Metadata JSON: `format:"webp"`, `type:"baselayer"`, `encoding:"mapbox"`
+  (what maplibre raster-dem reads to pick the decode equation), zoom range,
+  bounds. Atomic write: data temp file → header+dirs+metadata+stream-copy →
+  fsync → rename.
+- **Precision correction en route:** the fixture's pixel scale is exactly
+  1 arcsec (0.0002777…78°), not the 0.000278 tiffinfo prints rounded. True
+  bounds: lon 11.099861…11.599861, lat 47.100139…47.450139. First test
+  expectation (68 tiles) was derived from the rounded scale and WRONG; the
+  exact bounds give **62 tiles** (2+2+2+2+2+4+12+36 for z5…z12), now pinned
+  in both L1 (mercator, from constants) and L2 (real tags end-to-end).
+
+**Verification:**
+- L1: 4 new tests, 27 total. Enumeration math per the task: world bounds at
+  z0/z3, fixture bounds consistent across z5–12 (corners inside range, every
+  enumerated tile intersects the box, known z12 extent 2174–2179 ×
+  1433–1438, 62-tile pyramid total), exact-boundary exclusivity + degenerate
+  boxes, pole/dateline clamps. Archive shape: L1 builds a z5–7 archive over
+  the synthetic Innsbruck-shaped DEM and parses it back (magic, spec 3,
+  webp/none declaration, e7 bounds, strictly-ascending IDs, gapless
+  append-only offsets, every payload RIFF/WEBP, IDs exactly the sorted
+  Hilbert enumeration, metadata keys). Workspace **158/158 green**; fmt
+  clean; clippy `-D warnings` clean.
+- L2 (`real_innsbruck_full_pyramid_assembles`, ignored): full z5–12 archive
+  from the real DEM — 62 tiles, header spec-shaped, and the archived z12
+  Innsbruck tile is byte-identical to a direct P6.C2 render.
+- CLI: `terrain-tile <dem> terrain.pmtiles` → 62 tiles, 4,143,672-byte
+  archive in ~4.3s release.
+- **Independent reader proof (the P5 validation pattern):** the app's own
+  `pmtiles` JS reader (4.4.1) opens the archive — spec 3, tileType 4,
+  tileCompression 1, z5–12, 62 addressed tiles, clustered, e7 bounds exact,
+  metadata JSON intact; `getZxy` returns RIFF/WEBP payloads for z12/z8/z5
+  probes (12/2177/1436 = the byte-identical 79,080-byte C2 render) and
+  `undefined` outside the bbox.
+- L4: aarch64-linux-android `cargo check -p terrain --lib` clean (tiles dep
+  cross-compiles — already in the ffi tree via compiler); `cargo ndk -t
+  arm64-v8a build -p ffi` stays clean.
+
+**Outcome:** CLOSED. The Phase-6 artifact exists end-to-end. Next chunks:
+Surface-v1 budget-yield cursor around the render loop (checkpoint version
+bump), frontend wiring (raster-dem source over the OPFS archive), contour
+bake-vs-runtime study, optional overview-quality trade study (bilinear
+aliasing at z5–8).

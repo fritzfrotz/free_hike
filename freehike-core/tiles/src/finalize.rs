@@ -466,6 +466,8 @@ pub fn assemble_archive(
         n_tile_entries: entries.len() as u64,
         n_tile_contents: copy_order.len() as u64,
         clustered: true,
+        tile_compression: crate::pmtiles::COMPRESSION_GZIP,
+        tile_type: crate::pmtiles::TILE_TYPE_MVT,
         min_zoom,
         max_zoom,
         bounds_deg,

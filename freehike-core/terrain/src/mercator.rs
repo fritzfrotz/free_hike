@@ -69,6 +69,58 @@ pub fn pixel_center_lat(t: TileCoord, j: usize) -> f64 {
     lat_of_normalized((f64::from(t.y) + (j as f64 + 0.5) / TILE_SIZE as f64) / n)
 }
 
+/// The inclusive tile-coordinate rectangle a bounding box intersects at one
+/// zoom level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileRange {
+    pub z: u8,
+    pub x_min: u32,
+    pub x_max: u32,
+    pub y_min: u32,
+    pub y_max: u32,
+}
+
+impl TileRange {
+    pub fn count(&self) -> u64 {
+        u64::from(self.x_max - self.x_min + 1) * u64::from(self.y_max - self.y_min + 1)
+    }
+
+    /// Row-major iteration over the range (rendering order is decided by the
+    /// caller — assembly re-sorts by Hilbert tile ID).
+    pub fn coords(&self) -> impl Iterator<Item = TileCoord> + '_ {
+        let z = self.z;
+        let xs = self.x_min..=self.x_max;
+        (self.y_min..=self.y_max).flat_map(move |y| xs.clone().map(move |x| TileCoord { z, x, y }))
+    }
+}
+
+/// Tiles intersecting a geographic bounding box (west, south, east, north)
+/// at zoom `z`. Edges are handled exclusively on the max side: a box whose
+/// east/south edge sits exactly on a tile boundary does NOT pull in the
+/// zero-width neighbour. Latitudes clamp to the Mercator limit.
+pub fn tile_range_for_bounds(bounds_deg: (f64, f64, f64, f64), z: u8) -> TileRange {
+    let (west, south, east, north) = bounds_deg;
+    let n = f64::from(1u32 << z);
+    let clamp_idx = |v: f64| v.clamp(0.0, n - 1.0) as u32;
+    // Normalized Mercator column/row of each edge.
+    let xn = |lon: f64| (lon + 180.0) / 360.0 * n;
+    let yn = |lat: f64| {
+        let rad = lat.clamp(-MAX_LATITUDE_DEG, MAX_LATITUDE_DEG).to_radians();
+        (1.0 - (rad.tan() + 1.0 / rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n
+    };
+    // Max side: step a hair inside the edge so exact-boundary boxes stay
+    // exclusive, then never below the min side (degenerate boxes → 1 tile).
+    let x_min = clamp_idx(xn(west).floor());
+    let y_min = clamp_idx(yn(north).floor());
+    TileRange {
+        z,
+        x_min,
+        x_max: clamp_idx((xn(east) - 1e-9).floor()).max(x_min),
+        y_min,
+        y_max: clamp_idx((yn(south) - 1e-9).floor()).max(y_min),
+    }
+}
+
 /// The tile containing a geographic point at zoom `z`. Latitude is clamped
 /// to the Mercator limit; indices clamp to the last tile on the east/south
 /// edges so `lon = 180` stays addressable.
@@ -140,6 +192,81 @@ mod tests {
         for j in 1..TILE_SIZE {
             assert!(pixel_center_lat(t, j) < pixel_center_lat(t, j - 1));
         }
+    }
+
+    /// Innsbruck fixture bounds: origin (11.099861…, 47.450139…), 1800×1260
+    /// px at exactly 1 arcsec (1/3600°) — the tag stores the full-precision
+    /// doubles, not the rounded 0.000278 that tiffinfo prints.
+    const DEM_BOUNDS: (f64, f64, f64, f64) = (
+        11.099_861_111_136_42,
+        47.100_138_888_887_18,
+        11.599_861_111_136_486,
+        47.450_138_888_887_224,
+    );
+
+    #[test]
+    fn world_bounds_cover_every_tile() {
+        let r = tile_range_for_bounds((-180.0, -85.06, 180.0, 85.06), 0);
+        assert_eq!((r.x_min, r.x_max, r.y_min, r.y_max), (0, 0, 0, 0));
+        assert_eq!(r.count(), 1);
+
+        let r = tile_range_for_bounds((-180.0, -85.06, 180.0, 85.06), 3);
+        assert_eq!((r.x_min, r.x_max, r.y_min, r.y_max), (0, 7, 0, 7));
+        assert_eq!(r.count(), 64);
+    }
+
+    #[test]
+    fn fixture_bounds_enumerate_consistently_across_zooms() {
+        for z in 5..=12 {
+            let r = tile_range_for_bounds(DEM_BOUNDS, z);
+            // Every corner of the box lands inside the range…
+            for (lon, lat) in [
+                (DEM_BOUNDS.0, DEM_BOUNDS.3),
+                (11.5998, 47.1002), // hair inside the east/south edges
+            ] {
+                let t = tile_containing(lon, lat, z);
+                assert!(
+                    r.x_min <= t.x && t.x <= r.x_max && r.y_min <= t.y && t.y <= r.y_max,
+                    "z{z}: corner tile {t} outside range {r:?}"
+                );
+            }
+            // …and every enumerated tile actually intersects the box.
+            for t in r.coords() {
+                let (lon_min, lat_min, lon_max, lat_max) = tile_bounds_deg(t);
+                assert!(
+                    lon_max > DEM_BOUNDS.0
+                        && lon_min < DEM_BOUNDS.2
+                        && lat_max > DEM_BOUNDS.1
+                        && lat_min < DEM_BOUNDS.3,
+                    "z{z}: tile {t} does not intersect the DEM box"
+                );
+            }
+        }
+        // Known z12 extent, cross-checked against the slippy formula.
+        let r = tile_range_for_bounds(DEM_BOUNDS, 12);
+        assert_eq!((r.x_min, r.x_max), (2174, 2179));
+        assert_eq!((r.y_min, r.y_max), (1433, 1438));
+        // Full z5–12 pyramid over the fixture: 62 tiles (2+2+2+2+2+4+12+36),
+        // the count the L2 assembly test pins against the real archive.
+        let total: u64 = (5..=12)
+            .map(|z| tile_range_for_bounds(DEM_BOUNDS, z).count())
+            .sum();
+        assert_eq!(total, 62);
+        // z5 collapses to the small known window.
+        let r = tile_range_for_bounds(DEM_BOUNDS, 5);
+        assert_eq!((r.x_min, r.x_max, r.y_min, r.y_max), (16, 17, 11, 11));
+    }
+
+    #[test]
+    fn exact_tile_boundaries_stay_exclusive_on_the_max_side() {
+        // The z1 tile (1,0) spans lon 0..180: a box ending exactly at lon 0
+        // must not include it.
+        let r = tile_range_for_bounds((-90.0, 10.0, 0.0, 40.0), 1);
+        assert_eq!((r.x_min, r.x_max), (0, 0));
+        // A degenerate (point) box still yields one tile.
+        let r = tile_range_for_bounds((11.39, 47.26, 11.39, 47.26), 12);
+        assert_eq!(r.count(), 1);
+        assert_eq!((r.x_min, r.y_min), (2177, 1436));
     }
 
     #[test]

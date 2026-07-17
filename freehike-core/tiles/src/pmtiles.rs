@@ -22,9 +22,11 @@ pub const MAGIC: &[u8; 7] = b"PMTiles";
 pub const SPEC_VERSION: u8 = 3;
 
 /// `compression` enum values (spec).
+pub const COMPRESSION_NONE: u8 = 1;
 pub const COMPRESSION_GZIP: u8 = 2;
 /// `tile_type` enum values (spec).
 pub const TILE_TYPE_MVT: u8 = 1;
+pub const TILE_TYPE_WEBP: u8 = 4;
 
 /// One directory entry. `offset`/`length` address the tile-data section
 /// (offset 0 = first data byte); `run_length` ≥ 1 means this payload serves
@@ -54,6 +56,11 @@ pub struct Header {
     pub n_tile_entries: u64,
     pub n_tile_contents: u64,
     pub clustered: bool,
+    /// Payload compression declared at byte 98 (P5 vector: gzip'd MVT;
+    /// P6 terrain: none — WebP is already entropy-coded and lossless-exact).
+    pub tile_compression: u8,
+    /// Payload format declared at byte 99 (`TILE_TYPE_*`).
+    pub tile_type: u8,
     pub min_zoom: u8,
     pub max_zoom: u8,
     /// (west, south, east, north) in degrees.
@@ -91,8 +98,8 @@ pub fn encode_header(h: &Header) -> [u8; HEADER_BYTES] {
 
     out[96] = u8::from(h.clustered);
     out[97] = COMPRESSION_GZIP; // internal (directory/metadata) compression
-    out[98] = COMPRESSION_GZIP; // tile compression
-    out[99] = TILE_TYPE_MVT;
+    out[98] = h.tile_compression;
+    out[99] = h.tile_type;
     out[100] = h.min_zoom;
     out[101] = h.max_zoom;
 
@@ -246,6 +253,8 @@ mod tests {
             n_tile_entries: 3,
             n_tile_contents: 2,
             clustered: true,
+            tile_compression: COMPRESSION_GZIP,
+            tile_type: TILE_TYPE_MVT,
             min_zoom: 14,
             max_zoom: 14,
             bounds_deg: (11.15, 47.05, 11.65, 47.45),

@@ -1372,8 +1372,10 @@ dependencies = [
 name = "terrain"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "image",
  "tiff",
+ "tiles",
 ]
 
 [[package]]

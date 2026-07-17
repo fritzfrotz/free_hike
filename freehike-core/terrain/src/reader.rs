@@ -250,6 +250,19 @@ impl<R: Read + Seek> WindowedDemReader<R> {
         self.geo_transform
     }
 
+    /// Full raster extent in model space (west, south, east, north): the
+    /// outer edges of the corner pixels (PixelIsArea), not their centers.
+    pub fn geo_bounds(&self) -> Option<(f64, f64, f64, f64)> {
+        self.geo_transform.map(|gt| {
+            (
+                gt.origin_x,
+                gt.origin_y - f64::from(self.height) * gt.scale_y,
+                gt.origin_x + f64::from(self.width) * gt.scale_x,
+                gt.origin_y,
+            )
+        })
+    }
+
     /// Decodes the single chunk at grid position (`col`, `row`).
     pub fn read_window(&mut self, col: u32, row: u32) -> Result<DemWindow, DemError> {
         if col >= self.cols || row >= self.rows {

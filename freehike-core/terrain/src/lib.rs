@@ -7,6 +7,7 @@
 //! chunks add `terrain.pmtiles` assembly through the Phase-5 writer and the
 //! Surface-v1 budget-yield cursor.
 
+pub mod archive;
 pub mod mercator;
 pub mod pyramid;
 pub mod reader;
@@ -21,11 +22,13 @@ use reader::{DemError, WindowedDemReader};
 /// Crate identity used by walking-skeleton diagnostics.
 pub const CRATE: &str = "terrain";
 
-/// Errors from the end-to-end window→WebP path.
+/// Errors from the end-to-end window→WebP path and archive assembly.
 #[derive(Debug)]
 pub enum TerrainError {
     Dem(DemError),
     Webp(image::ImageError),
+    /// Archive-side file I/O (temp data file, final `.pmtiles`).
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for TerrainError {
@@ -33,6 +36,7 @@ impl std::fmt::Display for TerrainError {
         match self {
             TerrainError::Dem(e) => write!(f, "terrain dem: {e}"),
             TerrainError::Webp(e) => write!(f, "terrain webp: {e}"),
+            TerrainError::Io(e) => write!(f, "terrain archive io: {e}"),
         }
     }
 }
@@ -48,6 +52,12 @@ impl From<DemError> for TerrainError {
 impl From<image::ImageError> for TerrainError {
     fn from(e: image::ImageError) -> Self {
         TerrainError::Webp(e)
+    }
+}
+
+impl From<std::io::Error> for TerrainError {
+    fn from(e: std::io::Error) -> Self {
+        TerrainError::Io(e)
     }
 }
 
@@ -161,5 +171,53 @@ mod tests {
                 "pixel ({i},{j}): sampler {direct}m vs tile {decoded_e}m"
             );
         }
+    }
+
+    /// L2 real-data proof for the P6.C3 assembly: the full z5–12 pyramid
+    /// over the real DEM packs into a spec-shaped terrain.pmtiles. Run:
+    ///   cargo test -p terrain --release -- --ignored --nocapture real_innsbruck
+    #[test]
+    #[ignore]
+    fn real_innsbruck_full_pyramid_assembles() {
+        use sample::DemSampler;
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../offline_sandbox/raw_data/innsbruck_dem.tif");
+        let dir = std::env::temp_dir().join(format!("terrain-l2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("terrain.pmtiles");
+
+        let mut sampler = DemSampler::open(&fixture).unwrap();
+        let report = archive::build_terrain_archive(
+            &mut sampler,
+            &out,
+            archive::MIN_ZOOM,
+            archive::MAX_ZOOM,
+        )
+        .unwrap();
+
+        // 62 tiles cover the fixture across z5–12 (2+2+2+2+2+4+12+36,
+        // independently computed from the slippy formula over the exact
+        // 1-arcsec DEM bounds; also pinned by the mercator L1 tests).
+        assert_eq!(report.tile_count, 62);
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(bytes.len() as u64, report.archive_bytes);
+        assert_eq!(&bytes[0..7], b"PMTiles");
+        assert_eq!(bytes[98], 1, "tile_compression none");
+        assert_eq!(bytes[99], 4, "tile_type webp");
+        assert_eq!((bytes[100], bytes[101]), (5, 12));
+
+        // The archived z12 Innsbruck tile is byte-identical to a direct
+        // render — assembly must not touch payloads.
+        let coord = mercator::TileCoord {
+            z: 12,
+            x: 2177,
+            y: 1436,
+        };
+        let direct = pyramid::render_tile(&mut sampler, coord).unwrap().webp;
+        let hay = bytes.windows(direct.len()).any(|w| w == &direct[..]);
+        assert!(hay, "direct render not found verbatim in the archive");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

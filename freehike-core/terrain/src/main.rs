@@ -1,9 +1,11 @@
-//! `terrain-tile` — dev CLI for P6.C1/C2: cut one Terrain-RGB WebP tile from
-//! a DEM GeoTIFF and write it to disk.
+//! `terrain-tile` — dev CLI for P6.C1–C3: cut Terrain-RGB WebP tiles from a
+//! DEM GeoTIFF, or assemble the full pyramid archive.
 //!
 //! Usage: terrain-tile <dem.tif> <out.webp> [col row | z/x/y]
+//!        terrain-tile <dem.tif> <out.pmtiles> [minzoom maxzoom]
 //!   col row — raw DEM chunk window (P6.C1 path); defaults to 0 0
 //!   z/x/y   — WebMercator pyramid tile, reprojected + bilinear-resampled
+//!   .pmtiles output — full z5–12 (or given range) archive assembly
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,9 +13,10 @@ use std::process::ExitCode;
 use terrain::mercator::{tile_bounds_deg, TileCoord};
 use terrain::reader::WindowedDemReader;
 use terrain::sample::DemSampler;
-use terrain::{pyramid, rgb, webp};
+use terrain::{archive, pyramid, rgb, webp};
 
-const USAGE: &str = "usage: terrain-tile <dem.tif> <out.webp> [col row | z/x/y]";
+const USAGE: &str =
+    "usage: terrain-tile <dem.tif> <out.webp> [col row | z/x/y]\n       terrain-tile <dem.tif> <out.pmtiles> [minzoom maxzoom]";
 
 fn main() -> ExitCode {
     match run() {
@@ -30,6 +33,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let dem: PathBuf = args.next().ok_or(USAGE)?.into();
     let out: PathBuf = args.next().ok_or(USAGE)?.into();
 
+    if out.extension().is_some_and(|e| e == "pmtiles") {
+        let min_zoom = args.next().map(|a| a.parse()).transpose()?;
+        let max_zoom = args.next().map(|a| a.parse()).transpose()?;
+        return run_archive(&dem, &out, min_zoom, max_zoom);
+    }
     let first = args.next();
     if let Some(zxy) = first.as_deref().filter(|a| a.contains('/')) {
         return run_pyramid(&dem, &out, zxy);
@@ -66,6 +74,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "wrote {} bytes of lossless 256×256 Terrain-RGB WebP → {}",
         tile.len(),
         out.display()
+    );
+    Ok(())
+}
+
+fn run_archive(
+    dem: &std::path::Path,
+    out: &std::path::Path,
+    min_zoom: Option<u8>,
+    max_zoom: Option<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (min_zoom, max_zoom) = (
+        min_zoom.unwrap_or(archive::MIN_ZOOM),
+        max_zoom.unwrap_or(archive::MAX_ZOOM),
+    );
+    let mut sampler = DemSampler::open(dem)?;
+    let (west, south, east, north) = sampler
+        .reader()
+        .geo_bounds()
+        .ok_or("DEM carries no georeferencing")?;
+    println!(
+        "dem {}: bounds lon {west:.4}…{east:.4}, lat {south:.4}…{north:.4}, pyramid z{min_zoom}–z{max_zoom}",
+        dem.display()
+    );
+
+    let report = archive::build_terrain_archive(&mut sampler, out, min_zoom, max_zoom)?;
+    println!(
+        "wrote {} tiles ({} tile-data bytes, {} archive bytes) → {}",
+        report.tile_count,
+        report.tile_data_bytes,
+        report.archive_bytes,
+        report.path.display()
     );
     Ok(())
 }

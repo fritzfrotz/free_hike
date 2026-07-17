@@ -29,6 +29,9 @@ pub enum TerrainError {
     Webp(image::ImageError),
     /// Archive-side file I/O (temp data file, final `.pmtiles`).
     Io(std::io::Error),
+    /// Non-resumable-as-is state: torn/foreign checkpoint, or a data temp
+    /// file that disagrees with it. Never silently restarted (house rule).
+    Corrupt(String),
 }
 
 impl std::fmt::Display for TerrainError {
@@ -37,6 +40,7 @@ impl std::fmt::Display for TerrainError {
             TerrainError::Dem(e) => write!(f, "terrain dem: {e}"),
             TerrainError::Webp(e) => write!(f, "terrain webp: {e}"),
             TerrainError::Io(e) => write!(f, "terrain archive io: {e}"),
+            TerrainError::Corrupt(what) => write!(f, "terrain corrupt state: {what}"),
         }
     }
 }
@@ -217,6 +221,60 @@ mod tests {
         let direct = pyramid::render_tile(&mut sampler, coord).unwrap().webp;
         let hay = bytes.windows(direct.len()).any(|w| w == &direct[..]);
         assert!(hay, "direct render not found verbatim in the archive");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// L2 real-data proof for the P6.C4 cursor: the full z5–12 pyramid over
+    /// the real DEM, rendered under a realistic slice budget with a FRESH
+    /// sampler per slice (process-death simulation), must yield at least
+    /// once and land byte-identical to the monolithic build. Run:
+    ///   cargo test -p terrain --release -- --ignored --nocapture real_innsbruck
+    #[test]
+    #[ignore]
+    fn real_innsbruck_sliced_run_matches_monolithic() {
+        use archive::SliceOutcome;
+        use sample::DemSampler;
+        use std::time::Duration;
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../offline_sandbox/raw_data/innsbruck_dem.tif");
+        let dir = std::env::temp_dir().join(format!("terrain-l2-slices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mono = dir.join("mono.pmtiles");
+        let sliced = dir.join("sliced.pmtiles");
+
+        let mut sampler = DemSampler::open(&fixture).unwrap();
+        archive::build_terrain_archive(&mut sampler, &mono, archive::MIN_ZOOM, archive::MAX_ZOOM)
+            .unwrap();
+
+        let budget = Duration::from_millis(50);
+        let mut yields = 0u32;
+        let report = loop {
+            // Fresh sampler per slice: nothing survives but disk state.
+            let mut fresh = DemSampler::open(&fixture).unwrap();
+            match archive::run_archive_slice(
+                &mut fresh,
+                &sliced,
+                archive::MIN_ZOOM,
+                archive::MAX_ZOOM,
+                budget,
+            )
+            .unwrap()
+            {
+                SliceOutcome::Yielded(_) => yields += 1,
+                SliceOutcome::Finished(r) => break r,
+            }
+            assert!(yields < 1000, "slices stopped making progress");
+        };
+        assert!(yields > 0, "50ms budget must interrupt a ~4s pyramid");
+        assert_eq!(report.tile_count, 62);
+        assert_eq!(
+            std::fs::read(&mono).unwrap(),
+            std::fs::read(&sliced).unwrap(),
+            "sliced real-DEM archive must equal the monolithic one"
+        );
+        println!("real-DEM sliced run: {yields} yields at {budget:?} budget");
 
         std::fs::remove_dir_all(&dir).ok();
     }

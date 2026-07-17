@@ -12,10 +12,20 @@
 //! already entropy-coded, so the header declares `tile_compression = none`,
 //! `tile_type = webp`. Internal compression (directories/metadata) stays
 //! gzip per the shared writer.
+//!
+//! P6.C4 wraps the render loop in the Surface-v1 budget-yield contract:
+//! [`run_archive_slice`] renders until the deadline, then persists a
+//! [`TerrainCheckpoint`] (engine-style `key=value` text, tmp+fsync+rename)
+//! and yields. Resume rebuilds the directory by walking the RIFF-delimited
+//! data temp file up to the checkpointed high-water mark — payload bytes are
+//! self-describing, so the checkpoint stays fixed-size no matter how large
+//! the pyramid grows. This cursor is terrain-local (its own version counter,
+//! starting at 1); the engine's redb-backed v5 checkpoint is untouched.
 
-use std::fs::File;
-use std::io::{BufWriter, Read, Seek, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tiles::hilbert::tile_id;
 use tiles::pmtiles::{
@@ -43,15 +53,229 @@ pub struct ArchiveReport {
     pub bounds_deg: (f64, f64, f64, f64),
 }
 
+/// Slice result, mirroring the engine's contract: `Yielded` means the
+/// budget expired with a durable checkpoint on disk — call again with the
+/// same arguments to resume; `Finished` means the archive is in place and
+/// all temporary state (data file, checkpoint) is purged.
+#[derive(Debug)]
+pub enum SliceOutcome {
+    Yielded(TerrainCheckpoint),
+    Finished(ArchiveReport),
+}
+
+/// Terrain's own cursor version — bump on ANY change to the checkpoint
+/// fields or the data-file recovery contract (house rule). Independent of
+/// the engine's redb checkpoint (v5).
+pub const TERRAIN_CHECKPOINT_VERSION: u32 = 1;
+
+/// Durable position inside a partially rendered pyramid. The identity
+/// fields (zoom range, bounds as exact f64 bit patterns) guard against
+/// resuming against a different DEM or parameter set — the enumeration must
+/// be the same one the checkpoint was cut from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainCheckpoint {
+    pub min_zoom: u8,
+    pub max_zoom: u8,
+    pub bounds_deg: (f64, f64, f64, f64),
+    /// Hilbert tile ID of the last durably written tile.
+    pub last_tile_id: u64,
+    pub tiles_written: u64,
+    /// Data-section high-water mark; everything beyond it is torn tail.
+    pub bytes_written: u64,
+}
+
+fn checkpoint_path(out_path: &Path) -> PathBuf {
+    out_path.with_extension("terrain.checkpoint")
+}
+
+/// Atomic, durable checkpoint write: temp file → fsync → rename (the
+/// engine's save_checkpoint pattern). Bounds are serialized as f64 bit
+/// patterns so the resume comparison is exact, not print-precision.
+fn save_checkpoint(path: &Path, cp: &TerrainCheckpoint) -> Result<(), TerrainError> {
+    let (w, s, e, n) = cp.bounds_deg;
+    let body = format!(
+        "version={TERRAIN_CHECKPOINT_VERSION}\nmin_zoom={}\nmax_zoom={}\nbounds_bits={:016x},{:016x},{:016x},{:016x}\nlast_tile_id={}\ntiles_written={}\nbytes_written={}\n",
+        cp.min_zoom,
+        cp.max_zoom,
+        w.to_bits(),
+        s.to_bits(),
+        e.to_bits(),
+        n.to_bits(),
+        cp.last_tile_id,
+        cp.tiles_written,
+        cp.bytes_written,
+    );
+    let tmp = path.with_extension("checkpoint.tmp");
+    let mut f = File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Loads a checkpoint if present. `Ok(None)` = fresh start. Malformed
+/// content is a hard error — a torn or foreign file must never silently
+/// restart (and thus duplicate or interleave) work.
+fn load_checkpoint(path: &Path) -> Result<Option<TerrainCheckpoint>, TerrainError> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let corrupt = |what: &str| TerrainError::Corrupt(format!("terrain checkpoint: {what}"));
+
+    let mut version = None;
+    let mut min_zoom = None;
+    let mut max_zoom = None;
+    let mut bounds = None;
+    let mut last_tile_id = None;
+    let mut tiles_written = None;
+    let mut bytes_written = None;
+    for line in raw.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(corrupt(&format!("malformed line '{line}'")));
+        };
+        match k {
+            "version" => version = v.parse::<u32>().ok(),
+            "min_zoom" => min_zoom = v.parse::<u8>().ok(),
+            "max_zoom" => max_zoom = v.parse::<u8>().ok(),
+            "bounds_bits" => {
+                let bits: Vec<u64> = v
+                    .split(',')
+                    .filter_map(|p| u64::from_str_radix(p, 16).ok())
+                    .collect();
+                if bits.len() == 4 {
+                    bounds = Some((
+                        f64::from_bits(bits[0]),
+                        f64::from_bits(bits[1]),
+                        f64::from_bits(bits[2]),
+                        f64::from_bits(bits[3]),
+                    ));
+                }
+            }
+            "last_tile_id" => last_tile_id = v.parse::<u64>().ok(),
+            "tiles_written" => tiles_written = v.parse::<u64>().ok(),
+            "bytes_written" => bytes_written = v.parse::<u64>().ok(),
+            other => return Err(corrupt(&format!("unknown key '{other}'"))),
+        }
+    }
+    match (
+        version,
+        min_zoom,
+        max_zoom,
+        bounds,
+        last_tile_id,
+        tiles_written,
+        bytes_written,
+    ) {
+        (Some(v), ..) if v != TERRAIN_CHECKPOINT_VERSION => Err(corrupt(&format!(
+            "version {v}, expected {TERRAIN_CHECKPOINT_VERSION}"
+        ))),
+        (
+            Some(_),
+            Some(min_zoom),
+            Some(max_zoom),
+            Some(bounds_deg),
+            Some(last),
+            Some(tiles),
+            Some(bytes),
+        ) => Ok(Some(TerrainCheckpoint {
+            min_zoom,
+            max_zoom,
+            bounds_deg,
+            last_tile_id: last,
+            tiles_written: tiles,
+            bytes_written: bytes,
+        })),
+        _ => Err(corrupt("missing field")),
+    }
+}
+
+/// Rebuilds directory entries from the data temp file up to `upto` bytes.
+/// WebP payloads are RIFF-delimited (bytes 4..8 = little-endian chunk size,
+/// total payload = size + 8), so offsets and lengths recover from the bytes
+/// themselves; tile IDs pair positionally with the deterministic sorted
+/// enumeration.
+fn rebuild_entries(
+    data: &mut File,
+    upto: u64,
+    coords: &[(u64, TileCoord)],
+) -> Result<Vec<DirEntry>, TerrainError> {
+    let corrupt = |what: String| TerrainError::Corrupt(format!("terrain data tmp: {what}"));
+    let mut entries = Vec::new();
+    let mut offset = 0u64;
+    while offset < upto {
+        data.seek(SeekFrom::Start(offset))?;
+        let mut header = [0u8; 8];
+        data.read_exact(&mut header)?;
+        if &header[0..4] != b"RIFF" {
+            return Err(corrupt(format!("no RIFF magic at offset {offset}")));
+        }
+        let length = u64::from(u32::from_le_bytes(header[4..8].try_into().unwrap())) + 8;
+        let (id, _) = *coords
+            .get(entries.len())
+            .ok_or_else(|| corrupt("more payloads than enumerated tiles".into()))?;
+        entries.push(DirEntry {
+            tile_id: id,
+            offset,
+            length: length as u32,
+            run_length: 1,
+        });
+        offset += length;
+    }
+    if offset != upto {
+        return Err(corrupt(format!(
+            "payload boundary {offset} overshoots high-water mark {upto}"
+        )));
+    }
+    Ok(entries)
+}
+
 /// Builds `terrain.pmtiles` at `out_path` covering the DEM's full extent for
-/// zooms `min_zoom..=max_zoom`. Atomic: written beside the target and
-/// renamed into place.
+/// zooms `min_zoom..=max_zoom`, in one uninterrupted run (no deadline). If a
+/// checkpoint from a killed sliced run exists, it resumes rather than
+/// re-rendering. Atomic: written beside the target and renamed into place.
 pub fn build_terrain_archive<R: Read + Seek>(
     sampler: &mut DemSampler<R>,
     out_path: &Path,
     min_zoom: u8,
     max_zoom: u8,
 ) -> Result<ArchiveReport, TerrainError> {
+    match run_slice_inner(sampler, out_path, min_zoom, max_zoom, None)? {
+        SliceOutcome::Finished(report) => Ok(report),
+        SliceOutcome::Yielded(_) => unreachable!("no deadline, cannot yield"),
+    }
+}
+
+/// One budget-bounded slice of archive assembly (Surface-v1 contract). At
+/// least one tile makes progress per slice regardless of budget; the budget
+/// is checked after each tile's render + disk write. Assembly itself runs
+/// only once every tile is durable — a spent budget yields BETWEEN render
+/// exhaustion and assembly, mirroring the P5 encode/assemble split.
+pub fn run_archive_slice<R: Read + Seek>(
+    sampler: &mut DemSampler<R>,
+    out_path: &Path,
+    min_zoom: u8,
+    max_zoom: u8,
+    budget: Duration,
+) -> Result<SliceOutcome, TerrainError> {
+    run_slice_inner(
+        sampler,
+        out_path,
+        min_zoom,
+        max_zoom,
+        Some(Instant::now() + budget),
+    )
+}
+
+fn run_slice_inner<R: Read + Seek>(
+    sampler: &mut DemSampler<R>,
+    out_path: &Path,
+    min_zoom: u8,
+    max_zoom: u8,
+    deadline: Option<Instant>,
+) -> Result<SliceOutcome, TerrainError> {
     assert!(min_zoom <= max_zoom, "inverted zoom range");
     let bounds = sampler
         .reader()
@@ -62,29 +286,112 @@ pub fn build_terrain_archive<R: Read + Seek>(
     // IDs order z5 before z12 for free (the ID space is zoom-prefixed).
     let coords = tile_id_range_sorted(bounds, min_zoom, max_zoom);
 
-    // Render in ID order, streaming payloads to a data temp file so peak
-    // memory is one tile regardless of pyramid size.
     let data_tmp = out_path.with_extension("data.tmp");
-    let mut dir: Vec<DirEntry> = Vec::with_capacity(coords.len());
-    let mut data_len = 0u64;
-    {
-        let mut data = BufWriter::new(File::create(&data_tmp)?);
-        for &(id, coord) in &coords {
-            let tile = render_tile(sampler, coord)?;
-            data.write_all(&tile.webp)?;
-            dir.push(DirEntry {
-                tile_id: id,
-                offset: data_len,
-                length: tile.webp.len() as u32,
-                run_length: 1,
-            });
-            data_len += tile.webp.len() as u64;
-        }
-        data.flush()?;
-        data.get_ref().sync_all()?;
-    }
+    let ckpt_path = checkpoint_path(out_path);
+    let corrupt = |what: &str| TerrainError::Corrupt(format!("terrain resume: {what}"));
 
-    let root_dir = gzip(&serialize_directory(&dir));
+    // Resume from a durable checkpoint, or start fresh. Resume validates
+    // the full identity (version, zoom range, exact bounds bits, cursor
+    // position inside today's enumeration) before touching the data file.
+    let (mut dir, mut data_len, data) = match load_checkpoint(&ckpt_path)? {
+        Some(cp) => {
+            if (cp.min_zoom, cp.max_zoom) != (min_zoom, max_zoom) {
+                return Err(corrupt("checkpoint zoom range differs from request"));
+            }
+            let (w, s, e, n) = cp.bounds_deg;
+            let (bw, bs, be, bn) = bounds;
+            if [w, s, e, n].map(f64::to_bits) != [bw, bs, be, bn].map(f64::to_bits) {
+                return Err(corrupt("checkpoint bounds differ from DEM"));
+            }
+            if cp.tiles_written > coords.len() as u64 {
+                return Err(corrupt("checkpoint cursor beyond enumeration"));
+            }
+            if cp.tiles_written > 0 && coords[cp.tiles_written as usize - 1].0 != cp.last_tile_id {
+                return Err(corrupt("checkpoint cursor disagrees with enumeration"));
+            }
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&data_tmp)
+                .map_err(|_| corrupt("checkpoint present but data file missing"))?;
+            if f.metadata()?.len() < cp.bytes_written {
+                return Err(corrupt("data file shorter than checkpoint high-water mark"));
+            }
+            // Torn tail from a crash mid-append: everything beyond the
+            // durable mark is discarded before appending resumes.
+            f.set_len(cp.bytes_written)?;
+            let entries = rebuild_entries(&mut f, cp.bytes_written, &coords)?;
+            if entries.len() as u64 != cp.tiles_written {
+                return Err(corrupt("recovered entry count disagrees with checkpoint"));
+            }
+            f.seek(SeekFrom::Start(cp.bytes_written))?;
+            (entries, cp.bytes_written, f)
+        }
+        None => (Vec::new(), 0u64, File::create(&data_tmp)?),
+    };
+
+    // Render in ID order, streaming payloads to the data temp file so peak
+    // memory is one tile regardless of pyramid size.
+    let mut writer = BufWriter::new(data);
+    for &(id, coord) in &coords[dir.len()..] {
+        let tile = render_tile(sampler, coord)?;
+        writer.write_all(&tile.webp)?;
+        dir.push(DirEntry {
+            tile_id: id,
+            offset: data_len,
+            length: tile.webp.len() as u32,
+            run_length: 1,
+        });
+        data_len += tile.webp.len() as u64;
+
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            // Payload bytes durable BEFORE the checkpoint that references
+            // them — the cursor never runs ahead of data (P5 house rule).
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            let cp = TerrainCheckpoint {
+                min_zoom,
+                max_zoom,
+                bounds_deg: bounds,
+                last_tile_id: id,
+                tiles_written: dir.len() as u64,
+                bytes_written: data_len,
+            };
+            save_checkpoint(&ckpt_path, &cp)?;
+            return Ok(SliceOutcome::Yielded(cp));
+        }
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+
+    let report = assemble(
+        out_path, &data_tmp, &dir, data_len, bounds, min_zoom, max_zoom,
+    )?;
+    // Purge order is load-bearing for kill-safety: checkpoint FIRST. A crash
+    // after the archive rename but before either purge leaves ckpt+data — a
+    // re-run resumes and reassembles idempotently. A crash between the two
+    // purges leaves only the orphan data file, which a fresh start truncates.
+    // The reverse order could strand a checkpoint without its data file,
+    // which resume (correctly) refuses as corrupt.
+    let _ = std::fs::remove_file(&ckpt_path);
+    let _ = std::fs::remove_file(&data_tmp);
+    Ok(SliceOutcome::Finished(report))
+}
+
+/// Final archive assembly from a complete directory + data temp file.
+/// Idempotent (atomic tmp + rename); the caller owns temp-state purging —
+/// in the crash-safe order documented at the call site.
+fn assemble(
+    out_path: &Path,
+    data_tmp: &Path,
+    dir: &[DirEntry],
+    data_len: u64,
+    bounds: (f64, f64, f64, f64),
+    min_zoom: u8,
+    max_zoom: u8,
+) -> Result<ArchiveReport, TerrainError> {
+    let root_dir = gzip(&serialize_directory(dir));
     let metadata = gzip(terrain_metadata_json(bounds, min_zoom, max_zoom).as_bytes());
 
     let root_dir_offset = HEADER_BYTES as u64;
@@ -120,13 +427,12 @@ pub fn build_terrain_archive<R: Read + Seek>(
     out.write_all(&encode_header(&header))?;
     out.write_all(&root_dir)?;
     out.write_all(&metadata)?;
-    let mut data = File::open(&data_tmp)?;
+    let mut data = File::open(data_tmp)?;
     std::io::copy(&mut data, &mut out)?;
     out.flush()?;
     out.get_ref().sync_all()?;
     drop(out);
     std::fs::rename(&archive_tmp, out_path)?;
-    let _ = std::fs::remove_file(&data_tmp);
 
     Ok(ArchiveReport {
         path: out_path.to_path_buf(),
@@ -333,6 +639,162 @@ mod tests {
         ] {
             assert!(parsed.metadata.contains(needle), "metadata: {needle}");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The task-required P6.C4 proof: a 0ms budget forces a yield after
+    /// every tile (minimum-progress guarantee), each slice resumes from the
+    /// durable checkpoint with a FRESH sampler (simulating process death),
+    /// and the final archive is byte-identical to an uninterrupted run —
+    /// including surviving a torn tail scribbled past the high-water mark.
+    #[test]
+    fn zero_budget_slices_resume_to_byte_identical_archive() {
+        let dir = std::env::temp_dir().join(format!("terrain-slices-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mono = dir.join("mono.pmtiles");
+        let sliced = dir.join("sliced.pmtiles");
+
+        build_terrain_archive(&mut sampler(), &mono, 5, 7).unwrap();
+
+        // z5–7 over the synthetic DEM = 6 tiles → exactly 6 yields, then a
+        // finishing slice that only assembles.
+        let mut yields = 0u32;
+        let report = loop {
+            // Fresh sampler per slice: nothing carries over but disk state.
+            match run_archive_slice(&mut sampler(), &sliced, 5, 7, Duration::ZERO).unwrap() {
+                SliceOutcome::Yielded(cp) => {
+                    yields += 1;
+                    assert_eq!(cp.tiles_written, u64::from(yields), "one tile per slice");
+                    assert!(cp.bytes_written > 0);
+                    if yields == 2 {
+                        // Kill-torture: a crash mid-append leaves a torn
+                        // tail past the checkpointed mark; resume must
+                        // discard it, not serve it.
+                        let mut f = OpenOptions::new()
+                            .append(true)
+                            .open(sliced.with_extension("data.tmp"))
+                            .unwrap();
+                        f.write_all(b"TORNTAILGARBAGE").unwrap();
+                    }
+                }
+                SliceOutcome::Finished(r) => break r,
+            }
+            assert!(yields < 100, "slices stopped making progress");
+        };
+        assert_eq!(yields, 6);
+        assert_eq!(report.tile_count, 6);
+
+        // Byte-identical to the uninterrupted run; all temp state purged.
+        assert_eq!(
+            std::fs::read(&mono).unwrap(),
+            std::fs::read(&sliced).unwrap(),
+            "sliced archive must equal the monolithic one byte-for-byte"
+        );
+        assert!(!checkpoint_path(&sliced).exists());
+        assert!(!sliced.with_extension("data.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_rejects_foreign_or_mismatched_checkpoints() {
+        let dir = std::env::temp_dir().join(format!("terrain-ckpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.pmtiles");
+
+        // Cut one real checkpoint.
+        let cp = match run_archive_slice(&mut sampler(), &out, 5, 7, Duration::ZERO).unwrap() {
+            SliceOutcome::Yielded(cp) => cp,
+            SliceOutcome::Finished(_) => panic!("0ms budget must yield"),
+        };
+        assert_eq!(cp.tiles_written, 1);
+
+        // Different zoom range: the enumeration would not match the cursor.
+        let err = run_archive_slice(&mut sampler(), &out, 5, 8, Duration::ZERO).unwrap_err();
+        assert!(matches!(err, TerrainError::Corrupt(_)), "got {err}");
+
+        // Checkpoint present but data file gone.
+        std::fs::remove_file(out.with_extension("data.tmp")).unwrap();
+        let err = run_archive_slice(&mut sampler(), &out, 5, 7, Duration::ZERO).unwrap_err();
+        assert!(matches!(err, TerrainError::Corrupt(_)), "got {err}");
+
+        // Torn checkpoint file (malformed line) is a hard error, not a
+        // silent restart.
+        std::fs::write(checkpoint_path(&out), "not a checkpoint").unwrap();
+        let err = run_archive_slice(&mut sampler(), &out, 5, 7, Duration::ZERO).unwrap_err();
+        assert!(matches!(err, TerrainError::Corrupt(_)), "got {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finish_crash_window_reassembles_idempotently() {
+        // The worst finish-path crash: the archive was renamed into place
+        // but the process died before EITHER purge (checkpoint and data file
+        // both still on disk). A re-entry must resume, reassemble the
+        // identical archive over the existing one, and complete cleanup —
+        // never error, never double-render.
+        let dir = std::env::temp_dir().join(format!("terrain-window-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.pmtiles");
+
+        // Drive to the final yield: all 6 tiles durable, assembly pending.
+        let mut yields = 0;
+        while yields < 6 {
+            match run_archive_slice(&mut sampler(), &out, 5, 7, Duration::ZERO).unwrap() {
+                SliceOutcome::Yielded(_) => yields += 1,
+                SliceOutcome::Finished(_) => panic!("assembly before all yields"),
+            }
+        }
+        // Simulate the crash window: assembly ran (archive exists) but the
+        // purges did not. Plant the archive by snapshotting temp state,
+        // finishing once, then restoring ckpt + data beside the result.
+        let ckpt_bytes = std::fs::read(checkpoint_path(&out)).unwrap();
+        let data_bytes = std::fs::read(out.with_extension("data.tmp")).unwrap();
+        match run_archive_slice(&mut sampler(), &out, 5, 7, Duration::ZERO).unwrap() {
+            SliceOutcome::Finished(r) => assert_eq!(r.tile_count, 6),
+            SliceOutcome::Yielded(_) => panic!("nothing left to render"),
+        }
+        let finished = std::fs::read(&out).unwrap();
+        std::fs::write(checkpoint_path(&out), &ckpt_bytes).unwrap();
+        std::fs::write(out.with_extension("data.tmp"), &data_bytes).unwrap();
+
+        // Re-entry over the planted crash state.
+        match run_archive_slice(&mut sampler(), &out, 5, 7, Duration::ZERO).unwrap() {
+            SliceOutcome::Finished(r) => assert_eq!(r.tile_count, 6),
+            SliceOutcome::Yielded(_) => panic!("re-entry must go straight to assembly"),
+        }
+        assert_eq!(std::fs::read(&out).unwrap(), finished, "idempotent bytes");
+        assert!(!checkpoint_path(&out).exists());
+        assert!(!out.with_extension("data.tmp").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn monolithic_build_resumes_a_killed_sliced_run() {
+        let dir = std::env::temp_dir().join(format!("terrain-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mono = dir.join("mono.pmtiles");
+        let killed = dir.join("killed.pmtiles");
+
+        build_terrain_archive(&mut sampler(), &mono, 5, 7).unwrap();
+
+        // Simulate a run killed after three tiles…
+        for _ in 0..3 {
+            match run_archive_slice(&mut sampler(), &killed, 5, 7, Duration::ZERO).unwrap() {
+                SliceOutcome::Yielded(_) => {}
+                SliceOutcome::Finished(_) => panic!("must still be mid-pyramid"),
+            }
+        }
+        // …then a plain build picks the checkpoint up and completes.
+        let report = build_terrain_archive(&mut sampler(), &killed, 5, 7).unwrap();
+        assert_eq!(report.tile_count, 6);
+        assert_eq!(
+            std::fs::read(&mono).unwrap(),
+            std::fs::read(&killed).unwrap()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

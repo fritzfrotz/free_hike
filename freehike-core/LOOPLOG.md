@@ -1771,3 +1771,85 @@ Surface-v1 budget-yield cursor around the render loop (checkpoint version
 bump), frontend wiring (raster-dem source over the OPFS archive), contour
 bake-vs-runtime study, optional overview-quality trade study (bilinear
 aliasing at z5–8).
+
+---
+
+## P6.C4 — Surface-v1 budget-yield cursor for terrain assembly
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** no new dependencies, no engine changes. The cursor is
+TERRAIN-LOCAL: its own `TERRAIN_CHECKPOINT_VERSION = 1` counter (bump on any
+field or recovery-contract change, house rule), file-based rather than redb —
+the engine's v5 checkpoint is untouched, and wiring terrain into the
+engine's phase table is deferred to product integration (P9), where the
+version-bump rule will apply to whichever side owns the combined cursor.
+
+**Goal:** wrap the P6.C3 render loop in the kill-safe budget-yield contract:
+`run_archive_slice(sampler, out, minz, maxz, budget)` →
+`SliceOutcome::{Yielded(TerrainCheckpoint), Finished(ArchiveReport)}`,
+mirroring the engine's shape.
+
+**Files:** terrain/src/archive.rs (slice machinery), lib.rs (+`Corrupt`
+error, L2 sliced test), main.rs (optional `budget_ms` CLI arg).
+
+**Design (the load-bearing parts):**
+- `TerrainCheckpoint` = cursor (`last_tile_id` Hilbert ID, `tiles_written`,
+  `bytes_written` high-water mark) + identity (zoom range, DEM bounds as
+  exact f64 BIT PATTERNS — resume must be against the very enumeration the
+  checkpoint was cut from; print-precision comparison would be a lie).
+  Serialized as engine-style `key=value` text, written tmp→fsync→rename.
+- Durability order per slice: payload bytes flushed+fsynced BEFORE the
+  checkpoint that references them commits (P5 house rule — the cursor never
+  runs ahead of durable data). Budget checked after each render+write; at
+  least one tile of progress per slice regardless of budget; a spent budget
+  yields BETWEEN render exhaustion and assembly (P5 encode/assemble split),
+  so assembly always starts a slice fresh.
+- Resume: identity-validate checkpoint (zoom/bounds/cursor-vs-enumeration),
+  truncate the data temp to `bytes_written` (torn-tail discard), then
+  REBUILD the directory by walking the RIFF-delimited payloads up to the
+  high-water mark — WebP is self-describing (bytes 4..8 = chunk size), so
+  the checkpoint stays fixed-size regardless of pyramid scale (no
+  per-tile length table to grow at Alps scale).
+- Malformed/foreign/mismatched checkpoint state is a HARD `Corrupt` error,
+  never a silent restart (silent restarts mask bugs and can interleave
+  archives from different parameter sets).
+- **Kill-safety fix found in review:** finish-path purge order. Assembly
+  originally deleted the data temp before the caller deleted the
+  checkpoint; a crash between the two left checkpoint-present/data-missing
+  — which resume (correctly) refuses — bricking a pipeline whose contract
+  is "safe to re-run after a crash at ANY point". Order is now archive
+  rename → checkpoint purge → data purge: every crash window either
+  resumes+reassembles idempotently or falls back to a clean fresh start.
+- `build_terrain_archive` is now a deadline-free call through the same
+  slice path (monolithic == sliced by construction), and it resumes a
+  killed sliced run if a checkpoint exists.
+
+**Verification:**
+- L1 (4 slice tests, 31 total, workspace **162/162 green**, fmt + clippy
+  `-D warnings` clean):
+  - `zero_budget_slices_resume_to_byte_identical_archive` — the
+    task-required proof: 0ms budget → exactly one tile per slice (6 yields
+    for the z5–7 synthetic pyramid), fresh sampler per slice (process-death
+    simulation), a torn tail scribbled past the high-water mark after yield
+    2, final archive BYTE-IDENTICAL to the uninterrupted run, all temp
+    state purged.
+  - `finish_crash_window_reassembles_idempotently` — the fixed purge-order
+    window: archive renamed + both temp files still present → re-entry
+    reassembles identical bytes and completes cleanup.
+  - `resume_rejects_foreign_or_mismatched_checkpoints` — zoom-range
+    mismatch, missing data file, torn checkpoint → hard `Corrupt`.
+  - `monolithic_build_resumes_a_killed_sliced_run` — plain build picks up a
+    3-tile checkpoint and lands byte-identical to mono.
+- L2 (`real_innsbruck_sliced_run_matches_monolithic`, ignored): full z5–12
+  real-DEM pyramid at 50ms budget, fresh sampler per slice — 5 yields,
+  byte-identical to monolithic. All 4 L2 tests green.
+- CLI: `terrain-tile <dem> <out>.pmtiles 5 12 250` → yield at 45/62 tiles
+  (2.8MB durable), resume, finish; output byte-identical (`cmp`) to a fresh
+  monolithic run. 4,143,672 bytes, same as P6.C3.
+- L4: aarch64-linux-android `cargo check -p terrain --lib` clean; ndk ffi
+  build clean.
+
+**Outcome:** CLOSED. Remaining P6: frontend wiring (raster-dem source over
+the OPFS archive), contour bake-vs-runtime study, optional overview-quality
+trade study. Engine-table integration of the terrain phase lands with P9.

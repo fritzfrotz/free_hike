@@ -2,10 +2,12 @@
 //! DEM GeoTIFF, or assemble the full pyramid archive.
 //!
 //! Usage: terrain-tile <dem.tif> <out.webp> [col row | z/x/y]
-//!        terrain-tile <dem.tif> <out.pmtiles> [minzoom maxzoom]
+//!        terrain-tile <dem.tif> <out.pmtiles> [minzoom maxzoom [budget_ms]]
 //!   col row — raw DEM chunk window (P6.C1 path); defaults to 0 0
 //!   z/x/y   — WebMercator pyramid tile, reprojected + bilinear-resampled
-//!   .pmtiles output — full z5–12 (or given range) archive assembly
+//!   .pmtiles output — full z5–12 (or given range) archive assembly;
+//!   budget_ms drives the P6.C4 slice loop (yield/resume) instead of one
+//!   uninterrupted run
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,7 +18,7 @@ use terrain::sample::DemSampler;
 use terrain::{archive, pyramid, rgb, webp};
 
 const USAGE: &str =
-    "usage: terrain-tile <dem.tif> <out.webp> [col row | z/x/y]\n       terrain-tile <dem.tif> <out.pmtiles> [minzoom maxzoom]";
+    "usage: terrain-tile <dem.tif> <out.webp> [col row | z/x/y]\n       terrain-tile <dem.tif> <out.pmtiles> [minzoom maxzoom [budget_ms]]";
 
 fn main() -> ExitCode {
     match run() {
@@ -36,7 +38,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if out.extension().is_some_and(|e| e == "pmtiles") {
         let min_zoom = args.next().map(|a| a.parse()).transpose()?;
         let max_zoom = args.next().map(|a| a.parse()).transpose()?;
-        return run_archive(&dem, &out, min_zoom, max_zoom);
+        let budget_ms = args.next().map(|a| a.parse()).transpose()?;
+        return run_archive(&dem, &out, min_zoom, max_zoom, budget_ms);
     }
     let first = args.next();
     if let Some(zxy) = first.as_deref().filter(|a| a.contains('/')) {
@@ -83,6 +86,7 @@ fn run_archive(
     out: &std::path::Path,
     min_zoom: Option<u8>,
     max_zoom: Option<u8>,
+    budget_ms: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (min_zoom, max_zoom) = (
         min_zoom.unwrap_or(archive::MIN_ZOOM),
@@ -98,7 +102,30 @@ fn run_archive(
         dem.display()
     );
 
-    let report = archive::build_terrain_archive(&mut sampler, out, min_zoom, max_zoom)?;
+    let report = match budget_ms {
+        None => archive::build_terrain_archive(&mut sampler, out, min_zoom, max_zoom)?,
+        Some(ms) => {
+            // P6.C4 slice loop: yield on budget, resume from the durable
+            // checkpoint until the archive lands.
+            let budget = std::time::Duration::from_millis(ms);
+            let mut yields = 0u32;
+            loop {
+                match archive::run_archive_slice(&mut sampler, out, min_zoom, max_zoom, budget)? {
+                    archive::SliceOutcome::Yielded(cp) => {
+                        yields += 1;
+                        println!(
+                            "yield {yields}: {} tiles, {} bytes durable (last id {})",
+                            cp.tiles_written, cp.bytes_written, cp.last_tile_id
+                        );
+                    }
+                    archive::SliceOutcome::Finished(r) => {
+                        println!("finished after {yields} yields at {ms}ms budget");
+                        break r;
+                    }
+                }
+            }
+        }
+    };
     println!(
         "wrote {} tiles ({} tile-data bytes, {} archive bytes) → {}",
         report.tile_count,

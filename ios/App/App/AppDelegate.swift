@@ -7,7 +7,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        // P8.C2: BGTask handler registration MUST complete before this method
+        // returns — iOS rejects registrations after launch finishes. This is
+        // also the launch path when the OS spawns us headless to run the
+        // background compile window itself.
+        BackgroundCompileScheduler.shared.register()
+
+        // Mirror OS thermal pressure into the Rust core from process start:
+        // pushes the current level immediately (notifications only cover
+        // CHANGES), then follows thermalStateDidChangeNotification.
+        ThermalStateBridge.shared.start()
+
         return true
     }
 
@@ -17,8 +27,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
-        // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
+        // P8.C2: (re)submit the processing request whenever we leave the
+        // foreground with compile work still queued. Submission is
+        // idempotent (same identifier replaces the queued request), and iOS
+        // only grants processing windows after backgrounding anyway.
+        BackgroundCompileScheduler.shared.scheduleIfPending()
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {

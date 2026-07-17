@@ -548,8 +548,8 @@ public struct CheckpointState {
      */
     public var nextBlock: UInt32
     /**
-     * Byte offset into the source PBF (exact mmap re-entry point once the
-     * real Pass 1/2 land; simulated until then).
+     * Byte offset into the source PBF — the real Pass 1's exact mmap
+     * re-entry point (block-boundary aligned).
      */
     public var pbfByteOffset: UInt64
     /**
@@ -567,8 +567,8 @@ public struct CheckpointState {
          * Next block index within the phase.
          */nextBlock: UInt32, 
         /**
-         * Byte offset into the source PBF (exact mmap re-entry point once the
-         * real Pass 1/2 land; simulated until then).
+         * Byte offset into the source PBF — the real Pass 1's exact mmap
+         * re-entry point (block-boundary aligned).
          */pbfByteOffset: UInt64, 
         /**
          * Total bytes appended to output archives so far.
@@ -996,12 +996,18 @@ extension CompilationStatus: Equatable, Hashable {}
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * Compilation phases, in execution order.
+ *
+ * P4.C2 surface note: `Pass3Tiles` was appended when the real tile-binning
+ * pass landed — a Surface v1 addition made under the operator's Phase-4
+ * integration directive (adds a Swift/Kotlin enum case; existing cases and
+ * their ordinals are unchanged).
  */
 
 public enum CompilePhase {
     
     case pass1Nodes
     case pass2Ways
+    case pass3Tiles
     case terrain
     case finalize
 }
@@ -1025,9 +1031,11 @@ public struct FfiConverterTypeCompilePhase: FfiConverterRustBuffer {
         
         case 2: return .pass2Ways
         
-        case 3: return .terrain
+        case 3: return .pass3Tiles
         
-        case 4: return .finalize
+        case 4: return .terrain
+        
+        case 5: return .finalize
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1045,12 +1053,16 @@ public struct FfiConverterTypeCompilePhase: FfiConverterRustBuffer {
             writeInt(&buf, Int32(2))
         
         
-        case .terrain:
+        case .pass3Tiles:
             writeInt(&buf, Int32(3))
         
         
-        case .finalize:
+        case .terrain:
             writeInt(&buf, Int32(4))
+        
+        
+        case .finalize:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -1073,6 +1085,106 @@ public func FfiConverterTypeCompilePhase_lower(_ value: CompilePhase) -> RustBuf
 
 
 extension CompilePhase: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Device thermal pressure, reported by the native shells so the compiler
+ * can throttle itself before the OS terminates the process (P8.C1).
+ *
+ * Suggested platform mapping (the shells own this; Rust never polls):
+ * - iOS `ProcessInfo.ThermalState`: `.nominal`/`.fair`/`.serious`/
+ * `.critical` map 1:1.
+ * - Android `PowerManager` thermal status: `NONE` → Nominal, `LIGHT` →
+ * Fair, `MODERATE` → Serious, `SEVERE` and above → Critical.
+ *
+ * Effect inside the compiler: Nominal/Fair run at full duty cycle (Fair
+ * additionally halves parallel-section width); Serious halves the honored
+ * slice budget and injects cooling pauses between blocks; Critical makes
+ * the very next block boundary checkpoint and return `Yielded`, so the
+ * runner can go idle until the OS reports recovery.
+ */
+
+public enum ThermalState {
+    
+    case nominal
+    case fair
+    case serious
+    case critical
+}
+
+
+#if compiler(>=6)
+extension ThermalState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeThermalState: FfiConverterRustBuffer {
+    typealias SwiftType = ThermalState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ThermalState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .nominal
+        
+        case 2: return .fair
+        
+        case 3: return .serious
+        
+        case 4: return .critical
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ThermalState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .nominal:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .fair:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .serious:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .critical:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeThermalState_lift(_ buf: RustBuffer) throws -> ThermalState {
+    return try FfiConverterTypeThermalState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeThermalState_lower(_ value: ThermalState) -> RustBuffer {
+    return FfiConverterTypeThermalState.lower(value)
+}
+
+
+extension ThermalState: Equatable, Hashable {}
 
 
 
@@ -1315,6 +1427,32 @@ public func queryCheckpoint(jobId: String, outputDir: String) -> CheckpointState
     )
 })
 }
+/**
+ * Publishes the OS-reported thermal level to the compiler core. Callable
+ * from ANY foreign thread at any time — including while `compile_chunk`
+ * is running on another thread; the write is a single atomic store and
+ * running loops pick it up at their next block boundary. The shells
+ * should call this from their thermal-notification observers
+ * (`thermalStateDidChangeNotification` / `OnThermalStatusChangedListener`)
+ * and once at scheduler-window start (notifications don't fire for a
+ * state that was already elevated when the process woke).
+ */
+public func setThermalState(state: ThermalState)  {try! rustCall() {
+    uniffi_freehike_ffi_fn_func_set_thermal_state(
+        FfiConverterTypeThermalState_lower(state),$0
+    )
+}
+}
+/**
+ * The thermal level the compiler is currently governed by (Nominal until
+ * a shell reports otherwise). For smoke tests and telemetry/UI.
+ */
+public func thermalState() -> ThermalState  {
+    return try!  FfiConverterTypeThermalState_lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_thermal_state($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -1344,6 +1482,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freehike_ffi_checksum_func_query_checkpoint() != 56823) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_func_set_thermal_state() != 35667) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_func_thermal_state() != 28231) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freehike_ffi_checksum_method_progresscallback_on_progress() != 34746) {

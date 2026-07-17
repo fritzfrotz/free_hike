@@ -1930,3 +1930,79 @@ ffi/tests/thermal.rs (new), both Cargo.toml.
 `thermalStateDidChangeNotification` observer, Kotlin WorkManager FGS +
 `OnThermalStatusChangedListener` (P8.C2/C3); first parallel consumer of
 `for_each_governed` lands with the terrain engine-table integration (P9).
+
+## P8.C2 — iOS shell: BGProcessingTask scheduler + thermal observer
+
+**Status:** CLOSED (build-verification carried — see Verification)
+**Date:** 2026-07-17
+**Operator context:** operator-directed. No Rust changes; the Surface v1
+bindings were REGENERATED (uniffi-bindgen library mode, Swift + Kotlin)
+because the vendored `ios/App/App/FreeHikeFFI/freehike.swift` predated
+P8.C1 and had no `ThermalState` — the Kotlin copy in `ffi/bindings/` is
+refreshed alongside for P8.C3. All new Swift lives INSIDE the two existing
+files (MapCompilerPlugin.swift, AppDelegate.swift): this env is CLT-only
+(no iphoneos SDK), so adding new files would mean unverifiable
+project.pbxproj surgery.
+
+**Goal:** drive the P8.C1 thermal contract from iOS: observe
+`ProcessInfo.thermalState` → `set_thermal_state()`, and run the compile
+loop inside `BGProcessingTask` windows with graceful expiration.
+
+**Files:** ios/App/App/MapCompilerPlugin.swift (+~330 lines),
+AppDelegate.swift, Info.plist, regenerated bindings (ios vendored copy +
+ffi/bindings).
+
+**Design (the load-bearing parts):**
+- `ThermalStateBridge`: 1:1 map (`.nominal→.nominal` … `.critical→
+  .critical`, `@unknown default → .critical` — fail COOL, mirroring the
+  core's unknown-byte rule). Started in `didFinishLaunching`; pushes the
+  CURRENT state immediately (notifications only cover changes), and
+  `handle(task:)` pushes again at window start — a BGTask can wake a fresh
+  process on an already-hot device. Observer queue `nil` (posting thread)
+  is safe: the FFI setter is one lock-free atomic store.
+- `BackgroundCompileScheduler` (`com.freehike.compiler.sync`):
+  registration before `didFinishLaunching` returns (hard iOS requirement);
+  `requiresExternalPower = true`, `requiresNetworkConnectivity = false`
+  (raw PBF/DEM already fetched; honest "compiles while charging" UX).
+  Submission is idempotent (same-id replaces) and re-issued from
+  `applicationDidEnterBackground`; submit failure (Simulator, BG refresh
+  off) just logs — the job stays runnable via foreground `startJob`, same
+  checkpoint.
+- Execution loop: 2000ms slices via `compileChunk`. Expiration handler
+  only raises an NSLock flag (house idiom, same as cancelJob) — the
+  graceful stop IS not starting another slice: the in-flight slice ends
+  through the engine's own fsync+rename checkpoint path, so there is no
+  native-side state to save inside the ~5s grace. `Yielded` → continue,
+  UNLESS `thermal_state() == .critical`: re-invoking would defeat the
+  throttle (engine yields after its 1-block minimum every call), so the
+  window is handed back and re-requested for after cooldown.
+- `Finished` → the archive is already at its final sandbox path;
+  native code CANNOT write WKWebView's OPFS (P7 seam), so the "copy to
+  OPFS" is delegated: durable `PendingJobStore` record flips to
+  `finished`, `backgroundCompile` event fires if a WebView is alive, and
+  the JS layer stream-copies into OPFS on resume via new plugin methods
+  `enqueueBackgroundJob` / `queryBackgroundJob` / `acknowledgeBackgroundJob`
+  (ack of a still-pending job is refused — that's cancel+purge territory).
+  `Failed` → marked, NOT rescheduled (fatal per Surface v1; retrying
+  overnight burns battery/flash).
+- `PendingJobStore`: single-job JSON (atomic write) beside the engine
+  state — BGProcessingTask fires in a fresh process, so the job spec must
+  be durable; a queue is Phase 9 product territory.
+- Info.plist: `UIBackgroundModes = [processing]`,
+  `BGTaskSchedulerPermittedIdentifiers = [com.freehike.compiler.sync]`.
+
+**Verification:**
+- Bindings regen clean; vendored copy now exposes
+  `ThermalState`/`setThermalState`/`thermalState` (diff-checked against
+  generated source; enum cases and record fields match all call sites).
+- `swiftc -parse` clean on both edited files; `plutil -lint` OK.
+- L3b/L4 (device build, real BGTask window via
+  `_simulateLaunchForTaskWithIdentifier`, SIGKILL-mid-window resume) is
+  CARRIED on the existing "iOS full build/link needs an Xcode machine"
+  follow-up — this CLT-only env cannot link UIKit/Capacitor. The chunk's
+  logic surface is otherwise fully exercised by the P8.C1 Rust tests
+  (Critical→Yielded, resume-to-Finished) that this shell merely drives.
+
+**Outcome:** CLOSED with carried device-verification. Remaining Phase 8:
+Android WorkManager FGS + OnThermalStatusChangedListener (P8.C3), device
+smoke of the BGTask window when an Xcode machine is available.

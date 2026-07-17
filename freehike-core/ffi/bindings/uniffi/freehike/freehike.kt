@@ -742,6 +742,10 @@ internal open class UniffiVTableCallbackInterfaceProgressCallback(
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -766,6 +770,10 @@ fun uniffi_freehike_ffi_checksum_func_engine_version(
 fun uniffi_freehike_ffi_checksum_func_purge_job(
 ): Short
 fun uniffi_freehike_ffi_checksum_func_query_checkpoint(
+): Short
+fun uniffi_freehike_ffi_checksum_func_set_thermal_state(
+): Short
+fun uniffi_freehike_ffi_checksum_func_thermal_state(
 ): Short
 fun uniffi_freehike_ffi_checksum_method_progresscallback_on_progress(
 ): Short
@@ -826,6 +834,10 @@ fun uniffi_freehike_ffi_fn_func_engine_version(uniffi_out_err: UniffiRustCallSta
 fun uniffi_freehike_ffi_fn_func_purge_job(`jobId`: RustBuffer.ByValue,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
 fun uniffi_freehike_ffi_fn_func_query_checkpoint(`jobId`: RustBuffer.ByValue,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freehike_ffi_fn_func_set_thermal_state(`state`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_freehike_ffi_fn_func_thermal_state(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_freehike_ffi_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -966,6 +978,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freehike_ffi_checksum_func_query_checkpoint() != 56823.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_func_set_thermal_state() != 35667.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_func_thermal_state() != 28231.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freehike_ffi_checksum_method_progresscallback_on_progress() != 34746.toShort()) {
@@ -1270,8 +1288,8 @@ data class CheckpointState (
      */
     var `nextBlock`: kotlin.UInt, 
     /**
-     * Byte offset into the source PBF (exact mmap re-entry point once the
-     * real Pass 1/2 land; simulated until then).
+     * Byte offset into the source PBF — the real Pass 1's exact mmap
+     * re-entry point (block-boundary aligned).
      */
     var `pbfByteOffset`: kotlin.ULong, 
     /**
@@ -1537,12 +1555,18 @@ public object FfiConverterTypeCompilationStatus : FfiConverterRustBuffer<Compila
 
 /**
  * Compilation phases, in execution order.
+ *
+ * P4.C2 surface note: `Pass3Tiles` was appended when the real tile-binning
+ * pass landed — a Surface v1 addition made under the operator's Phase-4
+ * integration directive (adds a Swift/Kotlin enum case; existing cases and
+ * their ordinals are unchanged).
  */
 
 enum class CompilePhase {
     
     PASS1_NODES,
     PASS2_WAYS,
+    PASS3_TILES,
     TERRAIN,
     FINALIZE;
     companion object
@@ -1562,6 +1586,54 @@ public object FfiConverterTypeCompilePhase: FfiConverterRustBuffer<CompilePhase>
     override fun allocationSize(value: CompilePhase) = 4UL
 
     override fun write(value: CompilePhase, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Device thermal pressure, reported by the native shells so the compiler
+ * can throttle itself before the OS terminates the process (P8.C1).
+ *
+ * Suggested platform mapping (the shells own this; Rust never polls):
+ * - iOS `ProcessInfo.ThermalState`: `.nominal`/`.fair`/`.serious`/
+ * `.critical` map 1:1.
+ * - Android `PowerManager` thermal status: `NONE` → Nominal, `LIGHT` →
+ * Fair, `MODERATE` → Serious, `SEVERE` and above → Critical.
+ *
+ * Effect inside the compiler: Nominal/Fair run at full duty cycle (Fair
+ * additionally halves parallel-section width); Serious halves the honored
+ * slice budget and injects cooling pauses between blocks; Critical makes
+ * the very next block boundary checkpoint and return `Yielded`, so the
+ * runner can go idle until the OS reports recovery.
+ */
+
+enum class ThermalState {
+    
+    NOMINAL,
+    FAIR,
+    SERIOUS,
+    CRITICAL;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeThermalState: FfiConverterRustBuffer<ThermalState> {
+    override fun read(buf: ByteBuffer) = try {
+        ThermalState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: ThermalState) = 4UL
+
+    override fun write(value: ThermalState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -1757,6 +1829,37 @@ public object FfiConverterOptionalTypeCheckpointState: FfiConverterRustBuffer<Ch
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_query_checkpoint(
         FfiConverterString.lower(`jobId`),FfiConverterString.lower(`outputDir`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Publishes the OS-reported thermal level to the compiler core. Callable
+         * from ANY foreign thread at any time — including while `compile_chunk`
+         * is running on another thread; the write is a single atomic store and
+         * running loops pick it up at their next block boundary. The shells
+         * should call this from their thermal-notification observers
+         * (`thermalStateDidChangeNotification` / `OnThermalStatusChangedListener`)
+         * and once at scheduler-window start (notifications don't fire for a
+         * state that was already elevated when the process woke).
+         */ fun `setThermalState`(`state`: ThermalState)
+        = 
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_set_thermal_state(
+        FfiConverterTypeThermalState.lower(`state`),_status)
+}
+    
+    
+
+        /**
+         * The thermal level the compiler is currently governed by (Nominal until
+         * a shell reports otherwise). For smoke tests and telemetry/UI.
+         */ fun `thermalState`(): ThermalState {
+            return FfiConverterTypeThermalState.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_thermal_state(
+        _status)
 }
     )
     }

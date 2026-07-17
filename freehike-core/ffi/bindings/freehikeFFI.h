@@ -297,6 +297,17 @@ int8_t uniffi_freehike_ffi_fn_func_purge_job(RustBuffer job_id, RustBuffer outpu
 RustBuffer uniffi_freehike_ffi_fn_func_query_checkpoint(RustBuffer job_id, RustBuffer output_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_SET_THERMAL_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_SET_THERMAL_STATE
+void uniffi_freehike_ffi_fn_func_set_thermal_state(RustBuffer state, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_THERMAL_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_THERMAL_STATE
+RustBuffer uniffi_freehike_ffi_fn_func_thermal_state(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_FFI_FREEHIKE_FFI_RUSTBUFFER_ALLOC
 #define UNIFFI_FFIDEF_FFI_FREEHIKE_FFI_RUSTBUFFER_ALLOC
 RustBuffer ffi_freehike_ffi_rustbuffer_alloc(uint64_t size, RustCallStatus *_Nonnull out_status
@@ -604,6 +615,18 @@ uint16_t uniffi_freehike_ffi_checksum_func_purge_job(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_CHECKPOINT
 uint16_t uniffi_freehike_ffi_checksum_func_query_checkpoint(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_SET_THERMAL_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_SET_THERMAL_STATE
+uint16_t uniffi_freehike_ffi_checksum_func_set_thermal_state(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_THERMAL_STATE
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_THERMAL_STATE
+uint16_t uniffi_freehike_ffi_checksum_func_thermal_state(void
     
 );
 #endif

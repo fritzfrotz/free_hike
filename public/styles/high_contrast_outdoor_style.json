@@ -71,6 +71,30 @@
       }
     },
     {
+      "id": "natural-wood",
+      "type": "fill",
+      "source": "basemap-local",
+      "source-layer": "natural",
+      "minzoom": 4,
+      "filter": ["==", ["get", "class"], "wood"],
+      "paint": {
+        "fill-color": "#1B4D3E",
+        "fill-opacity": 1.0
+      }
+    },
+    {
+      "id": "natural-vegetation",
+      "type": "fill",
+      "source": "basemap-local",
+      "source-layer": "natural",
+      "minzoom": 4,
+      "filter": ["match", ["get", "class"], ["scrub", "grassland", "heath"], true, false],
+      "paint": {
+        "fill-color": "#A3B899",
+        "fill-opacity": 1.0
+      }
+    },
+    {
       "id": "natural-water",
       "type": "fill",
       "source": "basemap-local",
@@ -163,7 +187,15 @@
         "line-join": "round"
       },
       "paint": {
-        "line-color": "#2ECC71",
+        "line-color": [
+          "match", ["get", "sac_scale"],
+          "mountain_hiking", "#F1C40F",
+          "demanding_mountain_hiking", "#E74C3C",
+          "alpine_hiking", "#000000",
+          "demanding_alpine_hiking", "#000000",
+          "difficult_alpine_hiking", "#000000",
+          "#2ECC71"
+        ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.5, 18, 5.0]
       }
     },
@@ -179,7 +211,15 @@
         "line-join": "round"
       },
       "paint": {
-        "line-color": "#E67E22",
+        "line-color": [
+          "match", ["get", "sac_scale"],
+          "mountain_hiking", "#F1C40F",
+          "demanding_mountain_hiking", "#E74C3C",
+          "alpine_hiking", "#000000",
+          "demanding_alpine_hiking", "#000000",
+          "difficult_alpine_hiking", "#000000",
+          "#2ECC71"
+        ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.5, 18, 5.0],
         "line-dasharray": [4, 2]
       }
@@ -196,7 +236,15 @@
         "line-join": "round"
       },
       "paint": {
-        "line-color": "#8E44AD",
+        "line-color": [
+          "match", ["get", "sac_scale"],
+          "mountain_hiking", "#F1C40F",
+          "demanding_mountain_hiking", "#E74C3C",
+          "alpine_hiking", "#000000",
+          "demanding_alpine_hiking", "#000000",
+          "difficult_alpine_hiking", "#000000",
+          "#2ECC71"
+        ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.0, 18, 4.5],
         "line-dasharray": [1, 2]
       }
@@ -213,7 +261,15 @@
         "line-join": "round"
       },
       "paint": {
-        "line-color": "#E74C3C",
+        "line-color": [
+          "match", ["get", "sac_scale"],
+          "mountain_hiking", "#F1C40F",
+          "demanding_mountain_hiking", "#E74C3C",
+          "alpine_hiking", "#000000",
+          "demanding_alpine_hiking", "#000000",
+          "difficult_alpine_hiking", "#000000",
+          "#2ECC71"
+        ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.5, 18, 5.5],
         "line-dasharray": [1, 1]
       }
@@ -230,7 +286,15 @@
         "line-join": "round"
       },
       "paint": {
-        "line-color": "#3498DB",
+        "line-color": [
+          "match", ["get", "sac_scale"],
+          "mountain_hiking", "#F1C40F",
+          "demanding_mountain_hiking", "#E74C3C",
+          "alpine_hiking", "#000000",
+          "demanding_alpine_hiking", "#000000",
+          "difficult_alpine_hiking", "#000000",
+          "#2ECC71"
+        ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 12, 1.5, 15, 3.0, 18, 4.5],
         "line-dasharray": [6, 2]
       }
@@ -263,6 +327,64 @@
         "circle-color": "#2B2D42",
         "circle-stroke-color": "#FFFFFF",
         "circle-stroke-width": 1.5
+      }
+    },
+    {
+      "id": "waterway-labels",
+      "type": "symbol",
+      "source": "basemap-local",
+      "source-layer": "waterway",
+      "minzoom": 12,
+      "filter": ["has", "name"],
+      "layout": {
+        "symbol-placement": "line",
+        "text-field": ["get", "name"],
+        "text-font": ["Noto Sans Regular"],
+        "text-size": 12
+      },
+      "paint": {
+        "text-color": "#0A84A8",
+        "text-halo-color": "#FFFFFF",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "highway-labels",
+      "type": "symbol",
+      "source": "basemap-local",
+      "source-layer": "highway",
+      "minzoom": 14,
+      "filter": ["has", "name"],
+      "layout": {
+        "symbol-placement": "line",
+        "text-field": ["get", "name"],
+        "text-font": ["Noto Sans Regular"],
+        "text-size": 12
+      },
+      "paint": {
+        "text-color": "#4A4A4A",
+        "text-halo-color": "#FFFFFF",
+        "text-halo-width": 1
+      }
+    },
+    {
+      "id": "natural-peak-label",
+      "type": "symbol",
+      "source": "basemap-local",
+      "source-layer": "natural",
+      "minzoom": 10,
+      "filter": ["all", ["==", ["get", "class"], "peak"], ["has", "name"]],
+      "layout": {
+        "text-field": ["get", "name"],
+        "text-font": ["Noto Sans Regular"],
+        "text-size": 12,
+        "text-offset": [0, 1],
+        "text-anchor": "top"
+      },
+      "paint": {
+        "text-color": "#000000",
+        "text-halo-color": "#FFFFFF",
+        "text-halo-width": 1
       }
     }
   ]

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <application
         android:allowBackup="true"
@@ -24,6 +25,16 @@
 
         </activity>
 
+        <!-- P8.C3: WorkManager promotes BackgroundCompileWorker to an FGS
+             through its own SystemForegroundService; Android 14+ requires
+             the service type declared HERE as well as in the
+             ForegroundInfo. tools:node="merge" folds this attribute into
+             the service entry WorkManager's manifest already ships. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -38,4 +49,11 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- P8.C3: background compile FGS (dataSync type is mandatory on 14+)
+         and the visibility of its persistent notification on 13+ (the FGS
+         runs without the runtime grant; the notification is just hidden —
+         requesting the grant is Phase 9 product UI). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 </manifest>

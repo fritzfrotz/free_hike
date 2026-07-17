@@ -2006,3 +2006,81 @@ ffi/bindings).
 **Outcome:** CLOSED with carried device-verification. Remaining Phase 8:
 Android WorkManager FGS + OnThermalStatusChangedListener (P8.C3), device
 smoke of the BGTask window when an Xcode machine is available.
+
+## P8.C3 — Android shell: WorkManager + dataSync FGS + thermal listener
+
+**Status:** CLOSED (device smoke carried; build-level verification full)
+**Date:** 2026-07-17
+**Operator context:** operator-directed. One new dependency,
+`androidx.work:work-runtime-ktx 2.10.2` (task-directed: "Implement
+WorkManager"), pinned in variables.gradle per house convention. The
+vendored `android/.../uniffi/freehike/freehike.kt` was STALE (pre-P8.C1,
+no ThermalState — the P8.C2 regen refreshed `ffi/bindings/` but never
+vendored to android/) and was synced from `ffi/bindings/`. No Rust
+changes.
+
+**Goal:** Android mirror of the iOS shell: PowerManager thermal status →
+`set_thermal_state()`, and the 2000ms budget-yield loop inside a
+WorkManager CoroutineWorker promoted to a dataSync Foreground Service.
+
+**Files:** ThermalStateBridge.kt (new), PendingJobStore.kt (new),
+BackgroundCompileWorker.kt (new), MapCompilerPlugin.kt (background
+methods + thermal start), AndroidManifest.xml, app/build.gradle,
+variables.gradle, vendored freehike.kt.
+
+**Design (the load-bearing parts):**
+- `ThermalStateBridge`: collapse map NONE→Nominal, LIGHT→Fair,
+  MODERATE→Serious, SEVERE+ (CRITICAL/EMERGENCY/SHUTDOWN and any future
+  level) → Critical — unknown-hot fails COOL, mirroring the core's rule.
+  API-29 gated (minSdk 24: below Q there is no status API, so the core
+  stays at its full-speed Nominal default — pre-governance behavior).
+  `start()` pushes the CURRENT status first (listener covers CHANGES
+  only), registers once per process (AtomicBoolean), direct executor
+  (callback body is one lock-free atomic store). Started from BOTH plugin
+  `load()` (WebView path) and worker start (headless path).
+- `BackgroundCompileWorker` (CoroutineWorker, Dispatchers.IO):
+  charging-constrained unique work (`KEEP` = idempotent re-enqueue,
+  mirroring iOS same-identifier submission), exponential backoff.
+  `setForeground(dataSync)` promotion is try/caught: API 31+ can refuse
+  FGS-from-background — the worker then still runs under WorkManager's
+  10-minute cap (~300 checkpointed 2s slices), degraded pace, never lost
+  work. Loop: `isStopped` between slices is the expiration analog
+  (charger unplugged → constraint-stop → WorkManager auto-reschedules;
+  the engine's last yield already fsync'd, so the graceful stop IS not
+  starting another slice). Yielded + `thermal_state() == CRITICAL` →
+  `Result.retry()` — WorkManager's backoff IS the cooldown. Failed →
+  `Result.failure()`, no retry (fatal per Surface v1; overnight retry
+  burns battery/flash). FFI exceptions (UniFFI-surfaced panics) treated
+  as Failed.
+- `PendingJobStore`: SharedPreferences mirror of the iOS JSON store,
+  synchronous `commit()` (an unflushed async write could lose the
+  terminal marker to process death). Same JS handoff surface:
+  `enqueueBackgroundJob` / `queryBackgroundJob` / `acknowledgeBackgroundJob`
+  + `backgroundCompile` event (via a @Volatile active-plugin ref; no-op
+  headless) — OPFS copy stays JS-side (P7 seam), identical event/record
+  shape to iOS so the JS layer is platform-blind.
+- Manifest: FOREGROUND_SERVICE + FOREGROUND_SERVICE_DATA_SYNC +
+  POST_NOTIFICATIONS (notification hidden without the 13+ runtime grant,
+  FGS unaffected; requesting it is Phase 9 UI), and WorkManager's
+  `SystemForegroundService` overridden with
+  `foregroundServiceType="dataSync"` via `tools:node="merge"` (Android
+  14+ requires the type in the MANIFEST, not just ForegroundInfo).
+
+**Verification:**
+- `:app:compileDebugKotlin` clean; full `:app:assembleDebug` clean
+  (32MB APK). Env note: gradle 8.14.3 rejects the default Homebrew JDK 26
+  ("class file major version 70") — build with
+  `JAVA_HOME=/opt/homebrew/opt/openjdk@21/...`.
+- Merged-manifest inspection: all three permissions present AND
+  `android:foregroundServiceType="dataSync"` confirmed ON
+  `androidx.work.impl.foreground.SystemForegroundService` post-merge (the
+  tools:node="merge" fold is verified, not assumed).
+- Device smoke (real charging-constrained window, thermal listener on
+  hardware) CARRIED: no device/emulator attached (`adb devices` empty).
+  The loop logic itself is exercised by the P8.C1 Rust tests this shell
+  drives (Critical→Yielded, resume-to-Finished).
+
+**Outcome:** CLOSED with carried device smoke. Phase 8 native shells are
+both in place; remaining Phase-8 tail: iOS + Android device smokes, JS
+listener for `backgroundCompile` + OPFS import call (Phase 9 product
+integration territory).

@@ -37,6 +37,9 @@ dependencies {
     // which bind libfreehike_ffi.so via com.sun.jna.Native.load.
     implementation "net.java.dev.jna:jna:5.17.0@aar"
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    // P8.C3: background compile windows — CoroutineWorker + FGS promotion
+    // (setForeground/dataSync). ktx flavor pulls kotlinx-coroutines.
+    implementation "androidx.work:work-runtime-ktx:$androidxWorkVersion"
     implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
     implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
     implementation project(':capacitor-android')

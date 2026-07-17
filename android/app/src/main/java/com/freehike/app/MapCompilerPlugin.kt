@@ -49,6 +49,22 @@ class MapCompilerPlugin : Plugin() {
         } catch (e: UnsatisfiedLinkError) {
             Log.e(TAG, "libfreehike_ffi.so missing from jniLibs — FFI calls will fail", e)
         }
+
+        // P8.C3: mirror OS thermal pressure into the Rust core from plugin
+        // load (pushes the current status immediately, then listens), and
+        // let the background worker reach the WebView while one exists.
+        ThermalStateBridge.start(context)
+        active = this
+    }
+
+    override fun handleOnDestroy() {
+        if (active === this) active = null
+        super.handleOnDestroy()
+    }
+
+    /** Forwards a background-compile terminal event to the WebView. */
+    internal fun emitBackground(data: JSObject) {
+        notifyListeners(EVENT_BACKGROUND, data)
     }
 
     /** Smoke test: proves the Rust core is linked and callable. */
@@ -227,6 +243,86 @@ class MapCompilerPlugin : Plugin() {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Background compilation (P8.C3) — mirrors the iOS P8.C2 surface
+    // -----------------------------------------------------------------------
+
+    /**
+     * Queues a compile job for WorkManager execution: persists the job spec
+     * durably (the worker may run in a fresh process with no WebView), then
+     * enqueues the charging-constrained unique work request.
+     */
+    @PluginMethod
+    fun enqueueBackgroundJob(call: PluginCall) {
+        val bbox = call.getString("bbox")
+        if (bbox.isNullOrBlank()) {
+            call.reject("Missing required parameter: bbox (\"west,south,east,north\")")
+            return
+        }
+        val jobId = call.getString("jobId") ?: UUID.randomUUID().toString()
+        val minZoom = (call.getInt("minZoom") ?: 5).coerceIn(0, 22)
+        val maxZoom = (call.getInt("maxZoom") ?: 14).coerceIn(0, 22)
+        val jobsDir = context.filesDir.absolutePath + "/map_jobs"
+
+        PendingJobStore.save(
+            context,
+            PendingJobStore.Record(
+                state = PendingJobStore.STATE_PENDING,
+                jobId = jobId,
+                bbox = bbox,
+                minZoom = minZoom,
+                maxZoom = maxZoom,
+                pbfPath = "$jobsDir/raw/$jobId.osm.pbf",
+                demPath = "$jobsDir/raw/$jobId.dem.tif",
+                outputDir = jobsDir,
+                reason = null,
+                blocksTotal = 0,
+                bytesWritten = 0,
+            )
+        )
+        BackgroundCompileWorker.enqueue(context)
+        call.resolve(JSObject().put("scheduled", true).put("jobId", jobId))
+    }
+
+    /**
+     * Resume-time discovery for the JS layer: reports the durable
+     * background-job record. On `finished`, `archivePath` names the
+     * .pmtiles in app storage — the WebView stream-copies it into OPFS
+     * (the P7 seam) and then calls `acknowledgeBackgroundJob`.
+     */
+    @PluginMethod
+    fun queryBackgroundJob(call: PluginCall) {
+        val record = PendingJobStore.loadAny(context)
+        if (record == null) {
+            call.resolve(JSObject().put("state", "idle"))
+            return
+        }
+        val data = JSObject().put("state", record.state).put("jobId", record.jobId)
+        if (record.state == PendingJobStore.STATE_FINISHED) {
+            data.put("archivePath", record.archivePath)
+                .put("blocksTotal", record.blocksTotal)
+                .put("bytesWritten", record.bytesWritten)
+        }
+        record.reason?.let { data.put("reason", it) }
+        call.resolve(data)
+    }
+
+    /**
+     * Clears a terminal (finished/failed) record once the JS layer has
+     * imported the archive into OPFS (or shown the failure). A pending
+     * record is NOT clearable here — that is cancelJob + purge territory.
+     */
+    @PluginMethod
+    fun acknowledgeBackgroundJob(call: PluginCall) {
+        val record = PendingJobStore.loadAny(context)
+        if (record != null && record.state == PendingJobStore.STATE_PENDING) {
+            call.reject("Job ${record.jobId} is still pending; cancel it instead")
+            return
+        }
+        PendingJobStore.clear(context)
+        call.resolve(JSObject().put("cleared", true))
+    }
+
     /** Adapts the UniFFI callback interface onto Capacitor's event emitter. */
     private fun bridgeForwardingCallback(): ProgressCallback =
         object : ProgressCallback {
@@ -249,5 +345,34 @@ class MapCompilerPlugin : Plugin() {
         private const val TAG = "MapCompilerPlugin"
         private const val EVENT_PROGRESS = "compilationProgress"
         private const val EVENT_STATUS = "compilationStatus"
+        private const val EVENT_BACKGROUND = "backgroundCompile"
+
+        /**
+         * The live plugin instance, if a WebView is up. The background
+         * worker uses it to surface terminal events to the UI when (and
+         * only when) there is a UI; a headless WorkManager run has no
+         * WebView, and the JS layer discovers results via
+         * `queryBackgroundJob` on resume.
+         */
+        @Volatile
+        private var active: MapCompilerPlugin? = null
+
+        /** No-op when no WebView exists (headless worker process). */
+        fun emitBackgroundEvent(
+            state: String,
+            jobId: String,
+            archivePath: String? = null,
+            blocksTotal: Long? = null,
+            bytesWritten: Long? = null,
+            reason: String? = null,
+        ) {
+            val plugin = active ?: return
+            val data = JSObject().put("state", state).put("jobId", jobId)
+            archivePath?.let { data.put("archivePath", it) }
+            blocksTotal?.let { data.put("blocksTotal", it) }
+            bytesWritten?.let { data.put("bytesWritten", it) }
+            reason?.let { data.put("reason", it) }
+            plugin.emitBackground(data)
+        }
     }
 }

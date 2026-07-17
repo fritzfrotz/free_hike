@@ -37,6 +37,7 @@ import { saveSyncMetadata, loadSyncMetadata, clearSyncMetadata } from './service
 import { featuresToGpx } from './services/gpxSerializer';
 import SavedRoutesPanel from './components/SavedRoutesPanel';
 import BackgroundHandoffBar from './components/BackgroundHandoffBar';
+import RegionPicker from './components/RegionPicker';
 import { saveRoute, deleteRoute } from '../shared/db';
 import type { SavedRoute } from '../shared/db';
 import { requestPersistentStorage } from './services/storageGuard';
@@ -140,6 +141,10 @@ export default function App() {
   const downloadProgressHandleRef = useRef<DownloadProgressHandle | null>(null);
   /** Ref to the mapData worker — needed to send DOWNLOAD_REGION_REQUEST. */
   const mapDataWorkerRef = useRef<Worker | null>(null);
+
+  // ── P9.C2: Region Picker sheet ───────────────────────────────────────────
+  const [isRegionPickerOpen, setIsRegionPickerOpen] = useState(false);
+  const isBackgroundCompiling = useCompilerStore((s) => s.isBackgroundCompiling);
 
   // ── Phase 11: Route State Management state ───────────────────────────────
   const [isSavedRoutesOpen, setIsSavedRoutesOpen] = useState(false);
@@ -927,6 +932,24 @@ export default function App() {
             </div>
           )}
 
+          {/* Region Picker trigger (P9.C2) — pulses while the OS owns a queued compile */}
+          <button
+            onClick={() => setIsRegionPickerOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-900/60 hover:bg-slate-800/80 border border-slate-800 text-xs text-slate-300 font-semibold cursor-pointer transition-all active:scale-95"
+          >
+            <span
+              className={
+                isBackgroundCompiling
+                  ? 'h-2 w-2 rounded-full bg-amber-400 animate-pulse'
+                  : 'hidden'
+              }
+            />
+            <svg className="h-3.5 w-3.5 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" />
+            </svg>
+            {isBackgroundCompiling ? 'Compiling…' : 'New Region'}
+          </button>
+
           {/* My Hikes HUD Trigger */}
           <button
             onClick={() => setIsSavedRoutesOpen(true)}
@@ -1093,6 +1116,12 @@ export default function App() {
           )}
         </div>
       </footer>
+
+      {/* ── Region Picker Sheet (P9.C2) ─────────────────────────────────────── */}
+      <RegionPicker
+        isOpen={isRegionPickerOpen}
+        onClose={() => setIsRegionPickerOpen(false)}
+      />
 
       {/* ── Saved Routes Drawer Panel ───────────────────────────────────────── */}
       <SavedRoutesPanel

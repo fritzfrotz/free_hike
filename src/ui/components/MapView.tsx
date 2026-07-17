@@ -238,6 +238,30 @@ const HIKE_LOCATIONS: HikeLocation[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// OPFS existence probe (P9.C2 cold-boot replay guard)
+// ---------------------------------------------------------------------------
+
+/**
+ * True if `filename` exists at the OPFS root with at least one byte. Used to
+ * validate a persisted region before binding the map to it — OPFS can be
+ * evicted independently of localStorage (non-durable storage, user "clear
+ * site data"), and binding to a missing file would silently render an empty
+ * map: the worker's handle open uses `{ create: true }` and would fabricate
+ * a zero-byte archive. Deliberately opens NO SyncAccessHandle (worker-owned
+ * locks) — getFile() is a lock-free snapshot read.
+ */
+async function opfsFileHasBytes(filename: string): Promise<boolean> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const fileHandle = await root.getFileHandle(filename); // throws if absent
+    const file = await fileHandle.getFile();
+    return file.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MapLibre source/layer IDs for the OSM trail overlay
 // ---------------------------------------------------------------------------
 
@@ -594,6 +618,45 @@ export default function MapView({
               };
               regionSwitcherRef.current = switcher;
               onRegionSwitcherReady?.(switcher);
+
+              // ── P9.C2: cold-boot replay of the persisted region ────────
+              // The activeRegion effect below fires on mount, BEFORE this
+              // 'load' handler builds the switcher, and bails — a region
+              // rehydrated from localStorage would otherwise never re-bind.
+              // Replay it here exactly once, after validating its OPFS files
+              // still hold bytes (localStorage and OPFS can diverge: cleared
+              // site data, storage eviction). A missing file drops the
+              // persisted binding entirely so the map stays on the defaults
+              // it just booted with instead of binding to an empty archive.
+              {
+                const { activeRegion: persisted, clearActiveRegion } = useMapStore.getState();
+                if (persisted) {
+                  void (async () => {
+                    // Only probe files the map isn't already bound to — the
+                    // booted defaults trivially exist (worker just opened
+                    // them), and probing an already-locked file is pointless.
+                    const toVerify = [
+                      ...(persisted.basemapFile !== DEFAULT_BASEMAP ? [persisted.basemapFile] : []),
+                      ...(persisted.terrainFile !== DEFAULT_TERRAIN ? [persisted.terrainFile] : []),
+                    ];
+                    const exists = await Promise.all(toVerify.map(opfsFileHasBytes));
+                    const missing = toVerify.filter((_, i) => !exists[i]);
+                    if (missing.length > 0) {
+                      console.warn(
+                        `[MapView] Persisted region "${persisted.regionLabel}" dropped — missing OPFS file(s): ${missing.join(', ')}`,
+                      );
+                      clearActiveRegion();
+                      return;
+                    }
+                    if (toVerify.length === 0) return; // persisted region IS the default binding
+                    try {
+                      await switcher.loadOfflineRegion(persisted.basemapFile, persisted.terrainFile);
+                    } catch (err) {
+                      console.error('[MapView] Cold-boot region replay failed:', err);
+                    }
+                  })();
+                }
+              }
             }
 
             // Instantiate demSource for dynamic contours, sourcing raw DEM

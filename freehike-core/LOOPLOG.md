@@ -2186,3 +2186,61 @@ discovery effect + doorbell listener + banner mount).
 **Outcome:** CLOSED. Remaining Phase-9 tail: region picker UI wired to
 `enqueueBackgroundJob`, plus the carried device smokes (both platforms) to
 exercise the real BGTask/WorkManager → discovery → ingest → hot-swap loop.
+
+## P9.C2 — Active-region persistence + Region Picker UI
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** operator-directed Phase 9 chunk — close the cold-boot
+gap (background-compiled regions reset to the hardcoded default on restart)
+and give `enqueueBackgroundJob` its first product entry point.
+
+**Files:** `src/store/mapStore.ts` (zustand/persist wrapper +
+`clearActiveRegion`), `src/ui/components/MapView.tsx` (OPFS existence probe
++ cold-boot replay in the map 'load' handler),
+`src/ui/components/RegionPicker.tsx` NEW, `src/ui/App.tsx` (header trigger +
+sheet mount).
+
+**Design (the load-bearing parts):**
+- Persistence is localStorage via zustand/persist, `partialize`d to
+  `activeRegion` ONLY — transient download/camera state must not resurrect
+  on boot. localStorage over Capacitor Preferences because rehydration is
+  SYNCHRONOUS: the persisted region is in the store before MapView's first
+  render, so the boot path needs no async hydration gate.
+- The pre-existing activeRegion effect fires on mount BEFORE the map 'load'
+  handler builds the region switcher and bails silently — a rehydrated
+  region would never re-bind. The cold-boot replay therefore lives at the
+  end of the 'load' handler: validate → swap, exactly once.
+- Replay validates persisted OPFS files before binding (localStorage and
+  OPFS can diverge: cleared site data, storage eviction). A missing/empty
+  file drops the binding via `clearActiveRegion()` and the map stays on the
+  booted defaults — binding blind would fabricate a zero-byte archive
+  (worker handle opens use `{create:true}`) and render an empty map. Probe
+  uses lock-free `getFile()` snapshots and only touches files the map is
+  not already bound to.
+- RegionPicker: hardcoded Innsbruck-area test regions (bbox selector is a
+  later chunk), `enqueueBackgroundJob(bbox, jobId, z5–14)` with a
+  slug+base36-timestamp jobId (filesystem-safe; becomes `{jobId}.pmtiles`).
+  After enqueue it calls `discoverBackgroundJobs()` rather than assuming —
+  the durable native record stays the SSOT for `isBackgroundCompiling`.
+  Confirm hard-disables while a job is queued: the native PendingJobStore
+  is single-job, and a second enqueue would OVERWRITE the record.
+
+**Verification (web preview; device smokes deliberately deferred):**
+- `tsc -b` + eslint clean.
+- Picker drives correctly: selection, confirm → web-fallback error
+  ("needs the iOS/Android app", native bridge absent), queued state
+  (`isBackgroundCompiling`) disables confirm + shows the managed-by-OS
+  notice + header pill flips to "Compiling…".
+- Cold-boot replay proven live: staged an OPFS file under a job-style
+  name, persisted it, full reload → "[MapView] Offline region swapped →
+  basemap: bg_replay_test.pmtiles" and the map read the swapped archive.
+- Eviction branch primitives proven in-page (missing file →
+  NotFoundError → probe false; `clearActiveRegion()` round-trips
+  `activeRegion: null` through persist). Full-boot re-run of that branch
+  was blocked by the KNOWN env leaked-lock issue (map 'load' never fires
+  after rapid force-reloads — pre-existing, tracked, unrelated).
+
+**Outcome:** CLOSED. Remaining Phase-9 tail: drawn bounding-box selector,
+device smokes for the end-to-end enqueue → BGTask/WorkManager → discovery →
+ingest → hot-swap → persistence loop.

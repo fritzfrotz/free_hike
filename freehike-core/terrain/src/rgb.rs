@@ -36,6 +36,20 @@ pub fn rgb_to_elevation(rgb: [u8; 3]) -> f64 {
     f64::from(value) * 0.1 - 10_000.0
 }
 
+/// Transforms a full `TILE_SIZE × TILE_SIZE` elevation grid (row-major, as
+/// produced by the pyramid resampler) into an RGB buffer.
+pub fn grid_to_terrain_rgb(elevations: &[f32]) -> Result<Vec<u8>, DemError> {
+    if elevations.len() != TILE_SIZE * TILE_SIZE {
+        return Err(DemError::GridSizeMismatch {
+            got: elevations.len(),
+        });
+    }
+    Ok(elevations
+        .iter()
+        .flat_map(|e| elevation_to_rgb(*e))
+        .collect())
+}
+
 /// Transforms a decoded DEM window into a `TILE_SIZE × TILE_SIZE` RGB buffer
 /// (row-major, 3 bytes/pixel). Edge windows smaller than the tile are padded
 /// right/bottom with the NoData pixel (0m); assembly against neighbouring
@@ -111,6 +125,18 @@ mod tests {
         // First padded pixel (x=2) and the last pixel are the 0m fill.
         assert_eq!(&rgb[6..9], &elevation_to_rgb(0.0));
         assert_eq!(&rgb[rgb.len() - 3..], &elevation_to_rgb(0.0));
+    }
+
+    #[test]
+    fn grid_transform_encodes_and_rejects_bad_sizes() {
+        let grid = vec![0.0f32; TILE_SIZE * TILE_SIZE];
+        let rgb = grid_to_terrain_rgb(&grid).unwrap();
+        assert_eq!(rgb.len(), TILE_SIZE * TILE_SIZE * 3);
+        assert_eq!(&rgb[0..3], &elevation_to_rgb(0.0));
+        assert!(matches!(
+            grid_to_terrain_rgb(&[0.0f32; 4]),
+            Err(DemError::GridSizeMismatch { got: 4 })
+        ));
     }
 
     #[test]

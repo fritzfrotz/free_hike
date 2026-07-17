@@ -1618,3 +1618,72 @@ full raster, violating the windowed-read/50MB posture; we sit directly on the
 **Outcome:** CLOSED. Next chunks: z5–12 tile pyramid (reprojection/resampling
 onto XYZ tiles), `terrain.pmtiles` assembly via the Phase-5 writer, Surface-v1
 budget-yield cursor (checkpoint version bump), contour bake-vs-runtime study.
+
+---
+
+## P6.C2 — WebMercator reprojection & bilinear resampling (tile pyramid core)
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** no new dependencies — pure math on top of the P6.C1
+reader/encoder. Continues the desktop-first ladder.
+
+**Goal:** map a WebMercator `(z,x,y)` onto the DEM and emit the full
+per-tile pipeline: reprojection → bilinear resampling → Terrain-RGB →
+lossless WebP, yielding `RenderedTile { coord, webp }`.
+
+**Files:** terrain/src/{mercator,sample,pyramid}.rs (new),
+reader.rs (+GeoTransform), rgb.rs (+grid_to_terrain_rgb), lib.rs (modules +
+L2 test), main.rs (z/x/y CLI mode).
+
+**Design:**
+- `reader::GeoTransform` — parsed from ModelTiepointTag (33922) +
+  ModelPixelScaleTag (33550); general tiepoint form (i,j)→(X,Y) handled,
+  ModelTransformationTag (rotated rasters) declared out of scope. PixelIsArea
+  (GeoKey 1025=1, GDAL default, fixture-confirmed): integer sample coords are
+  pixel CENTERS, hence the ±0.5 in both directions of the transform.
+  Fixture: origin (11.099861, 47.450139), scale 0.000278° (~1 arcsec).
+- `mercator` — slippy-map math in EPSG:4326 degrees (the DEM's model space).
+  Load-bearing subtlety: latitude is NOT linear across a tile — per-row lats
+  come from the Mercator inverse `atan(sinh(π(1−2yn)))`, never from
+  interpolating corner latitudes. Innsbruck z12 tile = 12/2177/1436
+  (cross-checked against the standard formula and asserted in L1).
+- `sample::DemSampler` — bilinear needs 4 pixel-center neighbours that
+  routinely straddle chunk boundaries, so a bounded LRU of decoded chunks
+  (default 16 → ≤4MB f32) sits over the windowed reader. Memory scales with
+  the working set, never the raster; 50MB posture intact. NaN-aware
+  weighting: NoData/off-raster neighbours drop out and the finite ones
+  renormalise; all-NaN → NaN (→ 0m fill in Terrain-RGB).
+- `pyramid::render_tile` — 256×256 pixel-center sampling (one Mercator lat
+  per row, linear lons per column) → `rgb::grid_to_terrain_rgb` →
+  `webp::encode_rgb_lossless`. Bilinear covers both mismatch directions: z12
+  slightly oversamples the ~21–31m DEM smoothly (no terracing); low zooms
+  (z5–8) downsample with acceptable aliasing — a proper reduction filter is
+  logged as a later trade study if overview renders look noisy.
+
+**Verification:**
+- L1: 15 new tests (23 total, fixture-independent via the shared
+  `test_dem::build` synthetic-GeoTIFF builder now carrying geo tags):
+  mercator (z0 world bounds, known Innsbruck z12 tile, in-bounds monotonic
+  pixel centers, pole/dateline clamps), reader (transform parse + round-trip,
+  missing-tags → None), sampler (exact pixel-center hits, bilinear midpoints,
+  NoData drop-out, off-raster NaN, ungeoreferenced rejection), pyramid (the
+  task's required test — known z12 tile over an Innsbruck-shaped synthetic
+  DEM renders a valid decodable WebP with every pixel on the elevation ramp;
+  z5 mostly-outside tile fills 0m but still samples the covered corner;
+  anti-terracing: an oversampled row keeps >50 distinct levels). Workspace
+  **154/154 green**; fmt clean; clippy `-D warnings` clean.
+- L2 (`real_innsbruck_z12_tile_renders_plausibly`, ignored): real-DEM render
+  of 12/2177/1436 — all 65,536 pixels finite alpine relief (no NoData fill,
+  tile fully inside coverage), decoded elevations agree with direct bilinear
+  sampler queries to the 0.1m encoding step at spot-checked pixels.
+- CLI: `terrain-tile <dem> <out> z/x/y` renders 12/2177/1436 (79,080 bytes,
+  real relief) and 5/17/11 (524 bytes, mostly-fill overview) — both validated
+  externally (`file`: RIFF Web/P; `sips`: 256×256).
+- L4: aarch64-linux-android `cargo check -p terrain --lib` clean;
+  `cargo ndk -t arm64-v8a build -p ffi` stays clean.
+
+**Outcome:** CLOSED. Next chunks: pyramid enumeration (which (z,x,y) sets
+cover the DEM extent per zoom), `terrain.pmtiles` assembly via the Phase-5
+writer, Surface-v1 budget-yield cursor (checkpoint version bump), contour
+bake-vs-runtime study.

@@ -164,7 +164,7 @@ against the Innsbruck fixtures before touching a device.
 | 3 | Pass 1: mmap → DenseNodes → redb, StringTable prefilter | ✅ CLOSED (P3.C1–C4) |
 | 4 | Pass 2 geometry + RDP + Liang-Barsky clip + z14 tile binning | ✅ CLOSED (P4.C0–C2) |
 | 5 | MVT encode + PMTiles v3 assembly + tag pipeline (class, sac_scale, name) + frontend style/glyphs/labels | ✅ **CLOSED & SEALED** (P5.C1–C4 + commits `cbb0e05`, `01fed9f`, `d3481de`, `555207e`) |
-| **6** | **Terrain pipeline: windowed GeoTIFF → Terrain-RGB WebP → terrain.pmtiles; contour bake-vs-runtime decision** | ⏳ **IN PROGRESS** — P6.C1 closed (windowed reads + Terrain-RGB WebP); pyramid + pmtiles assembly next |
+| **6** | **Terrain pipeline: windowed GeoTIFF → Terrain-RGB WebP → terrain.pmtiles; contour bake-vs-runtime decision** | ⏳ **IN PROGRESS** — P6.C1–C2 closed (windowed reads, Terrain-RGB WebP, WebMercator reprojection + bilinear resampling); pmtiles assembly next |
 | 7 | Idempotent state machine | ✅ done early (inside Phase 2); torture-cycle expansion optional |
 | 8 | Background schedulers (BGProcessingTask / WorkManager FGS) + thermal governance | ◻ pending |
 | 9 | Product integration: region picker → compile → OPFS copy → hot-swap | ◻ pending (hot-swap path already exists) |

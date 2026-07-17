@@ -2130,3 +2130,59 @@ manifest reference `.MainActivity` is language-agnostic).
 C2 iOS, C3 Android, C4 boot wiring). Remaining Phase-8 tail unchanged:
 device smokes on both platforms; JS `backgroundCompile` listener + OPFS
 import land with Phase 9.
+
+## P9.C1 — Handoff orchestration: background-job discovery + OPFS ingestion
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** operator-directed Phase 9 chunk — bridge the sealed
+Phase 8 background-job engine into the React frontend.
+
+**Files:** `src/plugins/MapCompiler.ts` (TS surface for the already-shipped
+native `enqueueBackgroundJob` / `queryBackgroundJob` /
+`acknowledgeBackgroundJob` methods + `backgroundCompile` event),
+`src/store/compilerStore.ts` (`isBackgroundCompiling`, `backgroundProgress`,
+`pendingHandoffJobs`, `discoverBackgroundJobs`, `ingestHandoffJob`),
+`src/services/handoffProgress.ts` NEW (imperative byte-progress bus),
+`src/ui/components/BackgroundHandoffBar.tsx` NEW, `src/ui/App.tsx` (cold-boot
+discovery effect + doorbell listener + banner mount).
+
+**Design (the load-bearing parts):**
+- One code path for both entry points: cold boot AND the `backgroundCompile`
+  event funnel into `discoverBackgroundJobs()`, which re-queries the durable
+  native PendingJobStore record (the event is a doorbell, never a data
+  source — headless runs emit nothing). Racing discoveries are harmless: a
+  module-level per-jobId Set guards `ingestHandoffJob` re-entrancy.
+- Acknowledge-after-durable: `acknowledgeBackgroundJob` fires only after
+  `moveNativeFileToOPFS` resolves (OPFS writable closed + byte count verified
+  against the source). Copy failure leaves the native record and archive
+  intact — the next discovery retries idempotently.
+- **Spec deviation (flagged):** the directed target "write into
+  `alps_basemap.pmtiles`" is unimplementable while the map runs — the
+  mapData worker holds a lifetime-scoped `SyncAccessHandle` (exclusive OPFS
+  lock) on the bound basemap, so a main-thread `createWritable()` on that
+  name throws `NoModificationAllowedError`; and `loadOfflineRegion`
+  deliberately no-ops same-filename swaps (re-registering an active PMTiles
+  source corrupts in-flight transfers). Ingestion therefore lands at
+  `{jobId}.pmtiles` and hot-swaps — the sealed P7-seam pattern
+  `handleJobFinished` already uses. Terrain stays the shared default
+  archive (background jobs compile basemap only).
+- 60 FPS rule honored: byte-level copy progress flows producer →
+  `handoffProgress` module (plain mutable snapshot, no Zustand, no events) →
+  `BackgroundHandoffBar`'s rAF loop → direct DOM writes (`transform` +
+  `textContent`). Zustand carries only coarse stage transitions
+  (idle/copying/swapping/done/error).
+
+**Verification:**
+- `tsc -b` and `eslint` clean over all touched files.
+- Web dev server: app boots with no new console errors; the discovery effect
+  degrades silently without a native bridge (Capacitor "not implemented"
+  rejections swallowed); banner hidden at idle.
+- Live UI drive (Vite module graph, no React involvement): pushing absolute
+  bytes into the ref sink alone advanced the painted bar/readout
+  38% → 85% with zero store writes — confirmed rAF-direct-DOM path; banner
+  unmounts on return to idle.
+
+**Outcome:** CLOSED. Remaining Phase-9 tail: region picker UI wired to
+`enqueueBackgroundJob`, plus the carried device smokes (both platforms) to
+exercise the real BGTask/WorkManager → discovery → ingest → hot-swap loop.

@@ -36,6 +36,7 @@ import {
 import { saveSyncMetadata, loadSyncMetadata, clearSyncMetadata } from './services/syncDB';
 import { featuresToGpx } from './services/gpxSerializer';
 import SavedRoutesPanel from './components/SavedRoutesPanel';
+import BackgroundHandoffBar from './components/BackgroundHandoffBar';
 import { saveRoute, deleteRoute } from '../shared/db';
 import type { SavedRoute } from '../shared/db';
 import { requestPersistentStorage } from './services/storageGuard';
@@ -434,6 +435,27 @@ export default function App() {
       statusPromise.then((handle) => handle?.remove());
     };
   }, [appendNativeDebugLine]);
+
+  // ── P9.C1: background-job discovery + OPFS handoff orchestration ──────────
+  // Two entry paths, one code path: eager discovery on cold boot (a
+  // BGProcessingTask / WorkManager run may have finished — or still be
+  // queued — while no WebView existed), plus a global 'backgroundCompile'
+  // listener for terminal events that land while the app is open. The event
+  // is treated purely as a doorbell: discovery re-queries the durable native
+  // PendingJobStore record, which stays authoritative until acknowledged,
+  // and ingestion is re-entrancy-guarded per jobId, so the two paths racing
+  // is harmless.
+  useEffect(() => {
+    void useCompilerStore.getState().discoverBackgroundJobs();
+
+    const backgroundPromise = MapCompiler.addListener('backgroundCompile', () => {
+      void useCompilerStore.getState().discoverBackgroundJobs();
+    }).catch(() => null); // web: no native bridge — background compiles are native-only
+
+    return () => {
+      backgroundPromise.then((handle) => handle?.remove());
+    };
+  }, []);
 
   // Debug button: proves the full Surface v1 loop — a deliberately tiny
   // per-slice budget forces the Rust engine to Yield repeatedly, so one tap
@@ -925,6 +947,9 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* ── Background compile → OPFS handoff banner (P9.C1) ──────────────── */}
+      <BackgroundHandoffBar />
 
       {/* ── Map + Elevation Panel ──────────────────────────────────────────── */}
       <section className="w-full max-w-6xl mb-8 relative">

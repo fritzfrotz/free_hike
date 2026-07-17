@@ -45,6 +45,46 @@ export interface StartJobResult {
   reason?: string;
 }
 
+/**
+ * Lifecycle of the ONE durable background-job record (native PendingJobStore:
+ * SharedPreferences on Android, atomic-rename JSON on iOS). Single-job by
+ * design — Surface v1 compiles one region at a time.
+ */
+export type BackgroundJobState = 'idle' | 'pending' | 'finished' | 'failed';
+
+/** Result of queryBackgroundJob — resume-time discovery of the durable record. */
+export interface BackgroundJobQueryResult {
+  state: BackgroundJobState;
+  /** Absent only when state === 'idle'. */
+  jobId?: string;
+  /**
+   * Present when state === 'finished': absolute path of the compiled
+   * `.pmtiles` inside the native app sandbox (NOT OPFS — the JS layer owns
+   * the stream-copy across that seam, then acknowledges).
+   */
+  archivePath?: string;
+  blocksTotal?: number;
+  bytesWritten?: number;
+  /** Present when state === 'failed'. */
+  reason?: string;
+}
+
+/**
+ * Payload of the 'backgroundCompile' event, emitted when a background window
+ * (BGProcessingTask / WorkManager) reaches a terminal state while a WebView
+ * is alive. Headless runs emit nothing — cold-boot discovery via
+ * queryBackgroundJob is the always-correct path; treat this event as a
+ * doorbell to re-run that discovery, not as a data source.
+ */
+export interface BackgroundCompileEvent {
+  state: 'finished' | 'failed';
+  jobId: string;
+  archivePath?: string;
+  blocksTotal?: number;
+  bytesWritten?: number;
+  reason?: string;
+}
+
 export interface StartJobOptions {
   /** "west,south,east,north" in WGS84 degrees. Required. */
   bbox: string;
@@ -85,6 +125,35 @@ export interface MapCompilerPlugin {
     bytesWritten?: number;
   }>;
 
+  /**
+   * Queues a compile job for background execution (iOS BGProcessingTask /
+   * Android WorkManager + dataSync FGS). The OS decides when the window
+   * opens (external power required); results are discovered via
+   * queryBackgroundJob or the 'backgroundCompile' event.
+   */
+  enqueueBackgroundJob(options: {
+    bbox: string;
+    jobId?: string;
+    minZoom?: number;
+    maxZoom?: number;
+  }): Promise<{ scheduled: boolean; jobId: string }>;
+
+  /**
+   * Resume-time discovery of the durable background-job record. Call on
+   * every cold boot AND on each 'backgroundCompile' event — the record, not
+   * the event, is the source of truth (a headless background run has no
+   * WebView to emit to).
+   */
+  queryBackgroundJob(): Promise<BackgroundJobQueryResult>;
+
+  /**
+   * Releases a terminal (finished/failed) record — and with it the native
+   * temporary archive's claim — once the JS layer has durably imported the
+   * archive into OPFS (writable closed + byte-count verified) or surfaced
+   * the failure. Rejects if the record is still 'pending'.
+   */
+  acknowledgeBackgroundJob(options: { jobId: string }): Promise<{ cleared: boolean }>;
+
   /** Smoke test: proves the Rust core is linked and callable. */
   getEngineVersion(): Promise<{ version: string }>;
 
@@ -102,6 +171,11 @@ export interface MapCompilerPlugin {
   addListener(
     eventName: 'compilationStatus',
     listenerFunc: (event: CompilationStatusEvent) => void,
+  ): Promise<PluginListenerHandle>;
+
+  addListener(
+    eventName: 'backgroundCompile',
+    listenerFunc: (event: BackgroundCompileEvent) => void,
   ): Promise<PluginListenerHandle>;
 
   removeAllListeners(): Promise<void>;

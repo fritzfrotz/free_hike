@@ -22,6 +22,15 @@ miniz_oxide = "0.9"
 # backend (miniz_oxide — the same inflate core Pass 1 already ships), no
 # zlib-sys in the mobile cross-compile path.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Terrain pipeline (Phase 6): pure-Rust pair — `tiff` decodes single internal
+# GeoTIFF chunks (256×256 tiles on the DEM fixture) by byte-range with the
+# weezl LZW core, `image`/image-webp emits lossless Terrain-RGB WebP. The
+# richer `geotiff` wrapper is deliberately NOT used: its only read path
+# (`GeoTiff::read` → `read_image()`) decodes the full raster, which breaks the
+# 50MB windowed-read posture. No GDAL, no C codecs in the mobile cross-compile
+# path.
+tiff = { version = "0.11", default-features = false, features = ["lzw"] }
+image = { version = "0.25", default-features = false, features = ["webp"] }
 compiler = { path = "compiler" }
 pbf = { path = "pbf" }
 terrain = { path = "terrain" }

@@ -6,3 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+tiff = { workspace = true }
+image = { workspace = true }
+
+# Dev CLI (P6.C1): cut a single Terrain-RGB WebP tile from a DEM window.
+# Bin targets are never pulled into the ffi cross-compile, so this stays
+# host-side only.
+[[bin]]
+name = "terrain-tile"
+path = "src/main.rs"

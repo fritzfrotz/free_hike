@@ -1560,3 +1560,61 @@ engine phase with a real driver in the `terrain` crate:
 terrain/hillshade/contours indistinguishably from the massif-built one.
 
 *(Chunks P6.C1… follow below as work begins.)*
+
+---
+
+## P6.C1 — Windowed GeoTIFF reads + Terrain-RGB WebP encoding
+
+**Status:** CLOSED
+**Date:** 2026-07-17
+**Operator context:** Phase-6 dependency additions in-band: `tiff` 0.11
+(default-features off, `lzw` only — weezl core) and `image` 0.25
+(default-features off, `webp` only — pure-Rust image-webp). Both cross-compile
+clean (no GDAL, no C codecs). The `geotiff` wrapper crate was evaluated and
+REJECTED: its sole read path (`GeoTiff::read` → `read_image()`) decodes the
+full raster, violating the windowed-read/50MB posture; we sit directly on the
+`tiff` decoder it wraps, using `read_chunk` per internal chunk.
+
+**Goal:** `terrain` crate becomes real — windowed DEM reads → Terrain-RGB
+(mapbox: base −10000, interval 0.1) → lossless 256×256 WebP tiles.
+
+**Files:** freehike-core/Cargo.toml (+tiff, +image), terrain/Cargo.toml
+(deps + `terrain-tile` dev bin), terrain/src/{lib,reader,rgb,webp,main}.rs.
+
+**Design:**
+- `reader::WindowedDemReader` — `Decoder::read_chunk` seeks each chunk's byte
+  range (TileOffsets/TileByteCounts) and inflates only it; works on tiled and
+  striped layouts; GDAL NoData (ASCII tag 42113) resolved to NaN in f64 so
+  integer sentinels (−32768) match exactly. Peak heap per window on the
+  fixture: 128KB i16 chunk + 256KB f32 + 192KB RGB ≪ 50MB, raster-size
+  independent. The fixture is natively tiled 256×256 (LZW, predictor 1) — the
+  P5.SEAL note "striped layout" was a magic-bytes-only guess; tiffinfo and the
+  decoded chunk grid (8×5) settle it as tiled.
+- `rgb::elevation_to_rgb` — exact task equation; scaled value **rounded** (not
+  truncated) so f32 representation noise can't slip a 0.1m step, clamped to
+  24 bits; NoData encodes as 0m (Terrain-RGB convention). Inverse
+  `rgb_to_elevation` shipped for verification. Edge windows pad to 256×256
+  with the 0m pixel (pyramid assembly is a later chunk's concern).
+- `webp::encode_rgb_lossless` — lossless is load-bearing: lossy quantisation
+  would corrupt the low-order 0.1m byte.
+- `terrain-tile` dev CLI (bin target — never enters the ffi cross-compile):
+  `terrain-tile <dem.tif> <out.webp> [col] [row]`.
+
+**Verification:**
+- L1: 8 new tests (synthetic in-memory TIFF reader round-trip incl. NoData +
+  out-of-range windows; known Terrain-RGB encodings incl. sea level
+  [1,134,160], floor, Everest; 0.05m round-trip sweep; clamp; edge padding;
+  WebP byte-exact round-trip). Workspace 139/139 green; fmt clean; clippy
+  `-D warnings` clean.
+- L2 (`real_innsbruck_dem_window_to_webp`, ignored): fixture parses as
+  1800×1260 / 256×256 chunks / 8×5 grid / nodata −32768; window (1,1) decodes
+  998.0–2364.0m (Inn valley → Nordkette flank, plausible); full pipeline WebP
+  decoded back pixel-for-pixel to source elevations within the 0.1m step.
+- CLI run: `offline_sandbox/output/terrain_rgb_1_1.webp` — 67,056 bytes,
+  independently validated (`file`: RIFF Web/P; `sips`: 256×256).
+- L4: `cargo check --target aarch64-linux-android -p terrain --lib` clean;
+  `cargo ndk -t arm64-v8a build -p ffi` stays clean.
+
+**Outcome:** CLOSED. Next chunks: z5–12 tile pyramid (reprojection/resampling
+onto XYZ tiles), `terrain.pmtiles` assembly via the Phase-5 writer, Surface-v1
+budget-yield cursor (checkpoint version bump), contour bake-vs-runtime study.

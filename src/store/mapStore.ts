@@ -20,6 +20,11 @@ interface MapState {
   regionDownloadStatus: RegionDownloadStatus;
   /** Human-readable label for the current download step. */
   regionDownloadLabel: string;
+  /** P9.C3 — true while the map is in custom-region selection mode (fixed
+   *  reticle overlay; user pans/zooms the map beneath it). Lives here, not
+   *  in component state, because RegionPicker (App) enters the mode and
+   *  RegionSelectorOverlay (MapView) exits it. NOT persisted (partialize). */
+  isSelectingRegion: boolean;
 
   setActiveRegion: (region: OfflineRegion) => void;
   /** Drops the persisted region (e.g. its OPFS files were evicted) so the
@@ -28,6 +33,7 @@ interface MapState {
   setTrackingCamera: (tracking: boolean) => void;
   setRegionDownloadStatus: (status: RegionDownloadStatus) => void;
   setRegionDownloadLabel: (label: string) => void;
+  setSelectingRegion: (selecting: boolean) => void;
 }
 
 /**
@@ -54,12 +60,14 @@ export const useMapStore = create<MapState>()(
       isTrackingCamera: false,
       regionDownloadStatus: 'idle',
       regionDownloadLabel: '',
+      isSelectingRegion: false,
 
       setActiveRegion: (region) => set({ activeRegion: region }),
       clearActiveRegion: () => set({ activeRegion: null }),
       setTrackingCamera: (tracking) => set({ isTrackingCamera: tracking }),
       setRegionDownloadStatus: (status) => set({ regionDownloadStatus: status }),
       setRegionDownloadLabel: (label) => set({ regionDownloadLabel: label }),
+      setSelectingRegion: (selecting) => set({ isSelectingRegion: selecting }),
     }),
     {
       name: 'freehike-active-region',

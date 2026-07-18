@@ -8,6 +8,7 @@ import mlcontour from 'maplibre-contour';
 import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
 import { useMapStore } from '../../store/mapStore';
 import DownloadProgressBar, { type DownloadProgressHandle } from './DownloadProgressBar';
+import RegionSelectorOverlay from './RegionSelectorOverlay';
 
 // ---------------------------------------------------------------------------
 // Telemetry (OPFS byte-range reads from the mapData worker)
@@ -383,6 +384,10 @@ export default function MapView({
 
   // Map bootstrap state
   const [initStatus,     setInitStatus]     = useState<'idle' | 'initializing' | 'ready' | 'error'>('idle');
+  /** Render-safe mirror of mapRef — set once when the map instance is
+   *  created, so JSX (e.g. RegionSelectorOverlay's prop) never has to read
+   *  a ref during render. */
+  const [liveMap, setLiveMap] = useState<maplibregl.Map | null>(null);
   const [statusMessage,  setStatusMessage]  = useState('Booting offline mapping engines...');
   const [fileSize,       setFileSize]       = useState<number | null>(null);
   const [selectedHike,   setSelectedHike]   = useState(HIKE_LOCATIONS[0].name);
@@ -438,6 +443,22 @@ export default function MapView({
   /** The offline region bound to the live MapLibre sources — hot-swapped via
    *  loadOfflineRegion() below whenever this changes, without a style reload. */
   const activeRegion = useMapStore((s) => s.activeRegion);
+
+  // ── P9.C3: custom-region selection mode ────────────────────────────────
+  // Entered by RegionPicker (App), exited by RegionSelectorOverlay or Esc.
+  // While active, ALL of MapView's control chrome unmounts: the overlay's
+  // vignette is pointer-events-none (panning beneath the reticle is the
+  // interaction), so any chrome left mounted would still catch clicks
+  // through the dim — invisible-but-clickable buttons.
+  const isSelectingRegion = useMapStore((s) => s.isSelectingRegion);
+  const showChrome = initStatus === 'ready' && !isSelectingRegion;
+
+  // Selection mode and the Phase-10 download mode are mutually exclusive
+  // overlays over the same canvas — entering one dismisses the other.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (isSelectingRegion) setIsDownloadMode(false);
+  }, [isSelectingRegion]);
 
   // Start and end coordinates for routing clicks
   const [startPt, setStartPt] = useState<[number, number] | null>(null);
@@ -538,6 +559,7 @@ export default function MapView({
 
           const activeMap = map;
           mapRef.current = activeMap;
+          setLiveMap(activeMap);
           activeMap.on('load', () => {
             // ── Memory management: WebGL texture-cache OOM guards ────────
             // Clamp each source cache to 25 tiles max to prevent GPU VRAM
@@ -1490,7 +1512,7 @@ export default function MapView({
       )}
 
       {/* ── Top HUD bar ──────────────────────────────────────────────────── */}
-      {initStatus === 'ready' && (
+      {showChrome && (
         <div className="absolute top-4 left-4 right-4 z-20 flex flex-wrap items-center justify-between gap-3 pointer-events-none">
 
           {/* Location selector */}
@@ -1519,7 +1541,7 @@ export default function MapView({
       )}
 
       {/* ── "Scan Viewport for Trails" floating CTA ──────────────────────── */}
-      {initStatus === 'ready' && (
+      {showChrome && (
         <div className="absolute top-20 left-1/2 -translate-x-1/2 z-20 pointer-events-auto">
           <button
             id="scan-viewport-btn"
@@ -1589,7 +1611,7 @@ export default function MapView({
       )}
 
       {/* ── Bottom-left: Thread telemetry HUD ────────────────────────────── */}
-      {initStatus === 'ready' && (
+      {showChrome && (
         <div className="absolute bottom-4 left-4 z-20 max-w-[268px] pointer-events-auto">
           <div className="backdrop-blur-md bg-slate-950/75 border border-slate-800 rounded-2xl p-4 shadow-xl space-y-4 text-slate-200">
 
@@ -1659,8 +1681,13 @@ export default function MapView({
         </div>
       )}
 
+      {/* ── Custom-region selection overlay (P9.C3) ───────────────────────── */}
+      {initStatus === 'ready' && isSelectingRegion && liveMap && (
+        <RegionSelectorOverlay map={liveMap} />
+      )}
+
       {/* ── Download zone overlay (visible only in download mode) ─────────── */}
-      {initStatus === 'ready' && isDownloadMode && (
+      {showChrome && isDownloadMode && (
         <div className="absolute inset-0 z-25 pointer-events-none flex items-center justify-center">
           {/* Dark vignette outside the selection box */}
           <div className="absolute inset-0 bg-slate-950/50" />
@@ -1700,7 +1727,7 @@ export default function MapView({
       )}
 
       {/* ── Download control: floating button / confirm panel ───────────── */}
-      {initStatus === 'ready' && (
+      {showChrome && (
         <div className="absolute top-20 right-4 z-30 pointer-events-auto flex flex-col items-end gap-2">
 
           {!isDownloadMode ? (
@@ -1850,7 +1877,7 @@ export default function MapView({
       )}
 
       {/* ── Bottom-right: Center on Me button ──────────────────────────────── */}
-      {initStatus === 'ready' && (
+      {showChrome && (
         <div className="absolute bottom-[270px] right-4 z-20 pointer-events-auto">
           <button
             id="center-on-me-btn"
@@ -1887,7 +1914,7 @@ export default function MapView({
       )}
 
       {/* ── Bottom-right: Live proximity HUD ─────────────────────────────── */}
-      {initStatus === 'ready' && (
+      {showChrome && (
         <div className="absolute bottom-4 right-4 z-20 w-[220px] pointer-events-none">
           <div className={[
             'backdrop-blur-md border rounded-2xl p-4 shadow-xl transition-all duration-300',

@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { MapCompiler } from '../../plugins/MapCompiler';
 import { useCompilerStore } from '../../store/compilerStore';
+import { useMapStore } from '../../store/mapStore';
+import { enqueueRegionDownload, COMPILE_MIN_ZOOM, COMPILE_MAX_ZOOM } from '../../services/regionCompiler';
 
 /**
  * P9.C2 — hardcoded test regions for the background-compile pipeline. Bboxes
@@ -43,11 +44,6 @@ const TEST_REGIONS: CompileRegion[] = [
   },
 ];
 
-/** Vector tile range compiled by the engine. The terrain raster pyramid
- *  (z5–12) is derived engine-side from the same job — not a JS knob. */
-const COMPILE_MIN_ZOOM = 5;
-const COMPILE_MAX_ZOOM = 14;
-
 type SubmitState = 'idle' | 'submitting' | 'queued' | 'error';
 
 interface RegionPickerProps {
@@ -83,30 +79,21 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
     setSubmitState('submitting');
     setSubmitError(null);
 
-    // Timestamp suffix keeps re-compiles of the same region from colliding
-    // with an older OPFS archive of the same name; base36 keeps it short.
-    const jobId = `bg_${selected.slug}_${Date.now().toString(36)}`;
-
-    try {
-      await MapCompiler.enqueueBackgroundJob({
-        bbox: selected.bbox,
-        jobId,
-        minZoom: COMPILE_MIN_ZOOM,
-        maxZoom: COMPILE_MAX_ZOOM,
-      });
-      // Flip isBackgroundCompiling from the durable native record rather
-      // than assuming: discovery is the single source of truth (P9.C1).
-      await useCompilerStore.getState().discoverBackgroundJobs();
+    const result = await enqueueRegionDownload(selected.name, selected.bbox);
+    if (result.queued) {
       setSubmitState('queued');
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+    } else {
       setSubmitState('error');
-      setSubmitError(
-        message.toLowerCase().includes('not implemented')
-          ? 'Background compiling needs the iOS/Android app — the web build has no native compile engine.'
-          : message,
-      );
+      setSubmitError(result.error ?? 'Unknown enqueue failure.');
     }
+  };
+
+  /** P9.C3: hand off to the map's fixed-reticle selection mode — the sheet
+   *  closes and RegionSelectorOverlay (MapView) takes over. */
+  const handleCustomArea = () => {
+    if (busy) return;
+    useMapStore.getState().setSelectingRegion(true);
+    onClose();
   };
 
   return (
@@ -183,6 +170,25 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
               </button>
             );
           })}
+
+          {/* Custom area — hands off to the map's fixed-reticle selection mode */}
+          <button
+            onClick={handleCustomArea}
+            disabled={busy}
+            className="w-full text-left p-4 rounded-2xl border-2 border-dashed border-slate-700/70 bg-slate-950/30 hover:border-emerald-500/40 hover:bg-emerald-500/5 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-default"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h4 className="text-xs font-bold text-slate-200">Custom Area</h4>
+                <p className="text-[10px] font-mono text-slate-500 mt-0.5">
+                  Frame any area on the map with a selection reticle
+                </p>
+              </div>
+              <svg className="h-5 w-5 text-slate-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 3.75H6A2.25 2.25 0 003.75 6v1.5M16.5 3.75H18A2.25 2.25 0 0120.25 6v1.5m0 9V18A2.25 2.25 0 0118 20.25h-1.5m-9 0H6A2.25 2.25 0 013.75 18v-1.5M12 12h.008v.008H12V12z" />
+              </svg>
+            </div>
+          </button>
         </div>
 
         {/* Footer: status + confirm */}

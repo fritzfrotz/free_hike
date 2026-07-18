@@ -2244,3 +2244,66 @@ sheet mount).
 **Outcome:** CLOSED. Remaining Phase-9 tail: drawn bounding-box selector,
 device smokes for the end-to-end enqueue → BGTask/WorkManager → discovery →
 ingest → hot-swap → persistence loop.
+
+## P9.C3 — Interactive bounding-box selector (fixed reticle)
+
+**Status:** CLOSED
+**Date:** 2026-07-18
+**Operator context:** operator-directed Phase 9 chunk — replace the
+hardcoded-region-only picker with a draw-your-own region mode.
+
+**Files:** `src/ui/components/RegionSelectorOverlay.tsx` NEW,
+`src/services/regionCompiler.ts` NEW (shared `enqueueRegionDownload`),
+`src/store/mapStore.ts` (`isSelectingRegion` + setter, transient — excluded
+from the persist partialize), `src/ui/components/RegionPicker.tsx`
+(refactor onto the shared helper + "Custom Area" card),
+`src/ui/components/MapView.tsx` (`showChrome` gating, `liveMap` state,
+mode exclusivity with the Phase-10 download overlay, overlay mount).
+
+**Design (the load-bearing parts):**
+- Fixed center reticle (70%×60% of container), user pans/zooms the map
+  BENEATH it — the mobile-recommended pattern from the task. The mask is
+  pointer-events-none (drag must reach the canvas); consequently ALL MapView
+  chrome unmounts while selecting (`showChrome`) — anything left mounted
+  would be invisible-but-clickable through the dim.
+- Bounds: all FOUR reticle corners unprojected and min/maxed (under pitch
+  the screen rect maps to a trapezoid; min/max gives its bbox). Entering the
+  mode eases pitch→0 so the compiled bbox matches what the user framed;
+  fractions are shared constants between the rendered box and the math.
+- Perf: the reticle/mask are static DOM; the per-frame bounds readout is
+  written via textContent from the map 'move' listener — zero React work
+  while panning. Bounds are recomputed fresh at confirm; the readout is
+  display-only.
+- One enqueue path: RegionPicker presets AND the FAB both call
+  `enqueueRegionDownload(label, bbox)` (regionCompiler.ts) — jobId
+  convention, single-job guard, and discovery-after-enqueue can't drift.
+- `isSelectingRegion` lives in mapStore because the enterer (RegionPicker,
+  App tree) and the exiter (overlay/Esc, MapView tree) are in different
+  subtrees. Selection mode and Phase-10 download mode are mutually
+  exclusive overlays; entering selection dismisses download mode.
+- `liveMap` React state mirrors mapRef for the overlay's prop — reading a
+  ref during render is a react-hooks/refs violation.
+
+**Verification (web preview; device smokes still deferred):**
+- `tsc -b` + eslint clean.
+- Verified live: picker → "Custom Area" closes the sheet and mounts the
+  overlay; chrome fully hidden; camera flattens; reticle + hint + cancel
+  render; live readout updates during drag-pan via direct DOM
+  (6.0×4.6 km / 11.3509,47.2548,11.4302,47.2960 →
+  5.9×4.6 km / 11.3779,47.2437,11.4563,47.2849).
+- FAB error-path and cancel-restore not re-driven live: the session's
+  KNOWN flaky boot (map 'load' stall) returned after an interruption tore
+  down the preview. Both paths are thin over already-verified machinery
+  (the FAB calls the same enqueueRegionDownload the picker's confirm
+  exercised — web-fallback error banner seen earlier; cancel is a
+  setSelectingRegion(false) store flip through the same conditional mount).
+- NEW diagnostic on the boot stall, for the eventual fix: while stalled,
+  tile requests for `pmtiles://local/*` fall back to HTTP
+  (`GET /local/alps_*.pmtiles` → Vite 206 index.html partials) — the
+  pmtiles Protocol registry misses the key, so MapLibre's FetchSource
+  fallback engages and 'load' never fires. Points at protocol/registry
+  instance duplication, not OPFS locks alone.
+
+**Outcome:** CLOSED. Remaining Phase-9 tail: device smokes (enqueue →
+BGTask/WorkManager → discovery → ingest → hot-swap → persistence, plus one
+custom-reticle job end-to-end on device).

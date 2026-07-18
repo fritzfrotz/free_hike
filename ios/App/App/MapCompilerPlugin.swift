@@ -36,6 +36,20 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
         MapCompilerPlugin.active = self
     }
 
+    /// jobId names on-disk files under the sandbox (`{jobId}.pmtiles`,
+    /// `.checkpoint`, `.index.redb`). A `/`, `..`, or absolute path would
+    /// traverse out of it. The Rust FFI (`to_job_spec`) enforces the same
+    /// invariant as the authoritative choke point; this pre-flight fails fast
+    /// with a clear reject instead of surfacing as a compile `.failed`, and
+    /// covers queryJob (which bypasses `to_job_spec`).
+    static let unsafeJobIdMessage = "Invalid jobId: only [A-Za-z0-9_-] allowed, max 128 chars"
+
+    static func isSafeJobId(_ jobId: String) -> Bool {
+        !jobId.isEmpty
+            && jobId.count <= 128
+            && jobId.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+    }
+
     /// Forwards a background-compile terminal event to the WebView if one
     /// exists right now; silently a no-op in a headless BGTask relaunch.
     static func emitBackgroundEvent(_ data: [String: Any]) {
@@ -80,6 +94,10 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let jobId = call.getString("jobId") ?? UUID().uuidString
+        guard MapCompilerPlugin.isSafeJobId(jobId) else {
+            call.reject(MapCompilerPlugin.unsafeJobIdMessage)
+            return
+        }
         let budgetMs = UInt32(max(0, min(call.getInt("budgetMs") ?? 250, 600_000)))
         let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 5, 22)))
         let maxZoom = UInt8(max(0, min(call.getInt("maxZoom") ?? 14, 22)))
@@ -161,6 +179,10 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject("Missing required parameter: jobId")
             return
         }
+        guard MapCompilerPlugin.isSafeJobId(jobId) else {
+            call.reject(MapCompilerPlugin.unsafeJobIdMessage)
+            return
+        }
         let jobsDir = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("map_jobs").path
@@ -208,6 +230,10 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let jobId = call.getString("jobId") ?? UUID().uuidString
+        guard MapCompilerPlugin.isSafeJobId(jobId) else {
+            call.reject(MapCompilerPlugin.unsafeJobIdMessage)
+            return
+        }
         let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 5, 22)))
         let maxZoom = UInt8(max(0, min(call.getInt("maxZoom") ?? 14, 22)))
         let jobsDir = defaultJobsDir()

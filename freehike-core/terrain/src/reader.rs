@@ -19,6 +19,26 @@ use tiff::decoder::{Decoder, DecodingResult};
 use tiff::tags::Tag;
 use tiff::TiffError;
 
+/// Upper bound on a single internal TIFF chunk's sample count, enforced at
+/// open time so a hostile DEM cannot drive an unbounded allocation inside
+/// `read_chunk` (which sizes its buffer from the TIFF's own TileWidth/
+/// TileLength or RowsPerStrip tags). The cap is on AREA, not per dimension:
+/// a legitimately striped DEM can have a chunk as tall as the whole raster
+/// (a full-width, full-height single strip), so a per-dimension cap would
+/// reject valid inputs — while a hostile 65535×65535 tile (~4.3e9 samples)
+/// is rejected decisively. 64Mi samples bounds the worst-case transient to
+/// ~128MB (i16) / ~512MB (f64) instead of multi-gigabyte.
+const MAX_CHUNK_SAMPLES: u64 = 64 * 1024 * 1024;
+
+/// True when a chunk of `chunk_width`×`chunk_height` samples is within the
+/// allocation cap (and non-degenerate). Pure, so the bound is unit-testable
+/// without materializing a hostile multi-gigabyte GeoTIFF.
+fn chunk_dims_within_limit(chunk_width: u32, chunk_height: u32) -> bool {
+    chunk_width != 0
+        && chunk_height != 0
+        && u64::from(chunk_width) * u64::from(chunk_height) <= MAX_CHUNK_SAMPLES
+}
+
 /// Errors from windowed DEM access.
 #[derive(Debug)]
 pub enum DemError {
@@ -180,6 +200,19 @@ impl<R: Read + Seek> WindowedDemReader<R> {
         let mut decoder = Decoder::new(reader)?;
         let (width, height) = decoder.dimensions()?;
         let (chunk_width, chunk_height) = decoder.chunk_dimensions();
+        // Validate the declared chunk size BEFORE any read_chunk: the dims
+        // come straight from the TIFF's TileWidth/TileLength (or RowsPerStrip)
+        // tags, and read_chunk allocates/decodes a buffer sized to them. A
+        // hostile DEM declaring e.g. a 65535×65535 tile would drive a
+        // multi-GB allocation (OOM/DoS) — and the WindowLargerThanTile guard
+        // in rgb.rs only fires AFTER decode. Reject up front. (0 is also
+        // rejected: div_ceil below would panic on a zero divisor.)
+        if !chunk_dims_within_limit(chunk_width, chunk_height) {
+            return Err(DemError::WindowLargerThanTile {
+                width: chunk_width as usize,
+                height: chunk_height as usize,
+            });
+        }
         // GDAL writes NoData as the ASCII tag 42113.
         let nodata = match decoder.find_tag(Tag::GdalNodata)? {
             Some(v) => v.into_string()?.trim().parse::<f64>().ok(),
@@ -422,6 +455,24 @@ mod tests {
         let (x, y) = gt.pixel_to_model(3.0, 2.0);
         let (px, py) = gt.model_to_pixel(x, y);
         assert!((px - 3.0).abs() < 1e-9 && (py - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn chunk_size_limit_rejects_bombs_and_accepts_valid_shapes() {
+        // The hostile tiled bomb (~4.3e9 samples) is rejected.
+        assert!(!chunk_dims_within_limit(65535, 65535));
+        // Degenerate dims are rejected (also guards div_ceil).
+        assert!(!chunk_dims_within_limit(0, 256));
+        assert!(!chunk_dims_within_limit(256, 0));
+        // A tall full-height single strip (the striped-DEM case that a
+        // per-dimension cap would wrongly reject) is accepted while its
+        // AREA stays within budget — this is the shape the sample.rs
+        // fixtures (e.g. 20×25000, 4×125000) rely on.
+        assert!(chunk_dims_within_limit(20, 25_000));
+        assert!(chunk_dims_within_limit(4, 125_000));
+        assert!(chunk_dims_within_limit(256, 256));
+        // Just over the area cap is rejected regardless of aspect ratio.
+        assert!(!chunk_dims_within_limit(8192, 8193)); // 8192*8193 > 64Mi
     }
 
     #[test]

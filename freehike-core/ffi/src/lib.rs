@@ -188,8 +188,23 @@ pub trait ProgressCallback: Send + Sync {
 
 fn to_job_spec(job: &CompileJob) -> Result<JobSpec, String> {
     let bbox = BBox::parse(&job.bbox).map_err(|e| format!("invalid bbox: {e}"))?;
-    if job.job_id.trim().is_empty() {
+    // job_id names on-disk files (checkpoint/index/archive) via
+    // `output_dir.join(format!("{job_id}.pmtiles"))` in the engine. A `/`,
+    // `..`, or absolute path there would traverse out of the sandbox (or,
+    // with a leading `/`, replace output_dir entirely). This is the single
+    // choke point every platform and both the foreground and background
+    // paths cross, so the filesystem-safe-charset invariant is enforced here.
+    // Validate the raw value that becomes the path component (not a trimmed
+    // copy): the charset below already forbids whitespace, so leading/trailing
+    // spaces are rejected rather than silently smuggled into the filename.
+    let id = &job.job_id;
+    if id.is_empty() {
         return Err("job_id must not be empty".to_string());
+    }
+    if id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(format!(
+            "invalid job_id {id:?}: only [A-Za-z0-9_-] allowed, max 128 chars"
+        ));
     }
     if job.min_zoom > job.max_zoom {
         return Err(format!(
@@ -422,6 +437,33 @@ mod tests {
                 assert!(reason.contains("invalid bbox"), "got: {reason}")
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failed_on_traversal_job_id() {
+        // A job_id that would traverse out of output_dir (or, with a leading
+        // '/', replace it) must be rejected before any path is built.
+        for evil in [
+            "../../../../etc/passwd",
+            "/tmp/evil",
+            "a/b",
+            "sub\\dir",
+            "has space",
+            "",
+            "   ",
+        ] {
+            let mut job = test_job("traversal");
+            job.job_id = evil.to_string();
+            match compile_chunk(job, 300_000, Box::new(Recorder(Default::default()))) {
+                CompilationStatus::Failed { reason } => {
+                    assert!(
+                        reason.contains("job_id"),
+                        "job_id {evil:?} rejected for the wrong reason: {reason}"
+                    )
+                }
+                other => panic!("job_id {evil:?} must be rejected, got {other:?}"),
+            }
         }
     }
 

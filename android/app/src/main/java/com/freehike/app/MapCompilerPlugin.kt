@@ -96,6 +96,10 @@ class MapCompilerPlugin : Plugin() {
             return
         }
         val jobId = call.getString("jobId") ?: UUID.randomUUID().toString()
+        if (!isSafeJobId(jobId)) {
+            call.reject(UNSAFE_JOB_ID_MESSAGE)
+            return
+        }
         val budgetMs = (call.getInt("budgetMs") ?: 250).coerceIn(0, 600_000)
         val minZoom = (call.getInt("minZoom") ?: 5).coerceIn(0, 22)
         val maxZoom = (call.getInt("maxZoom") ?: 14).coerceIn(0, 22)
@@ -197,6 +201,10 @@ class MapCompilerPlugin : Plugin() {
             call.reject("Missing required parameter: jobId")
             return
         }
+        if (!isSafeJobId(jobId)) {
+            call.reject(UNSAFE_JOB_ID_MESSAGE)
+            return
+        }
         val jobsDir = context.filesDir.absolutePath + "/map_jobs"
         executor.execute {
             try {
@@ -260,6 +268,10 @@ class MapCompilerPlugin : Plugin() {
             return
         }
         val jobId = call.getString("jobId") ?: UUID.randomUUID().toString()
+        if (!isSafeJobId(jobId)) {
+            call.reject(UNSAFE_JOB_ID_MESSAGE)
+            return
+        }
         val minZoom = (call.getInt("minZoom") ?: 5).coerceIn(0, 22)
         val maxZoom = (call.getInt("maxZoom") ?: 14).coerceIn(0, 22)
         val jobsDir = context.filesDir.absolutePath + "/map_jobs"
@@ -346,6 +358,20 @@ class MapCompilerPlugin : Plugin() {
         private const val EVENT_PROGRESS = "compilationProgress"
         private const val EVENT_STATUS = "compilationStatus"
         private const val EVENT_BACKGROUND = "backgroundCompile"
+
+        /**
+         * jobId names on-disk files under the sandbox (`{jobId}.pmtiles`,
+         * `.checkpoint`, `.index.redb`). A `/`, `..`, or absolute path would
+         * traverse out of it. The Rust FFI (`to_job_spec`) enforces the same
+         * invariant as the authoritative choke point; this pre-flight fails
+         * fast with a clear reject instead of surfacing as a compile `Failed`,
+         * and covers queryJob (which bypasses `to_job_spec`).
+         */
+        private val SAFE_JOB_ID = Regex("^[A-Za-z0-9_-]{1,128}$")
+        private const val UNSAFE_JOB_ID_MESSAGE =
+            "Invalid jobId: only [A-Za-z0-9_-] allowed, max 128 chars"
+
+        private fun isSafeJobId(jobId: String): Boolean = SAFE_JOB_ID.matches(jobId)
 
         /**
          * The live plugin instance, if a WebView is up. The background

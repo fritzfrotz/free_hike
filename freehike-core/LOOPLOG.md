@@ -2384,3 +2384,88 @@ protocol/singleton/class deleted; cleanup no longer clears the registry).
 verify a compiled `{jobId}.pmtiles` hot-swap renders on device — that
 path was structurally broken until this fix and has never been exercised
 with real tiles.
+
+---
+
+## P9.SEC — Static security audit: path-traversal + GeoTIFF DoS hardening
+
+**Status:** CLOSED
+**Date:** 2026-07-18
+**Goal:** Pre-device-smoke static security sweep of the full stack (Rust core,
+Swift/Kotlin shells, React/Capacitor frontend) across four vectors: path
+traversal / FS escape, FFI & memory safety, native IPC / component exporting,
+malformed-input / DoS. Patch the confirmed findings; leave latent-only risks
+logged for Phase 10.
+
+**Findings & disposition:**
+
+1. **(HIGH) Path traversal via unsanitized `jobId`.** `to_job_spec`
+   (ffi/src/lib.rs) validated only non-empty, then the engine built every
+   on-disk path as `output_dir.join(format!("{job_id}.pmtiles"))`
+   (.checkpoint / .index.redb / .tiledata.tmp likewise). A `jobId` of `../…`
+   traverses out of the sandbox; a leading-`/` absolute path makes
+   `Path::join` DISCARD `output_dir` entirely → arbitrary create/overwrite/
+   delete (purge_job_state removes these paths). Attacker-controlled: both
+   shells pass `call.getString("jobId")` through verbatim; the only prior
+   defense was the frontend `slugify` (least-trusted layer).
+   **Fix:** strict `[A-Za-z0-9_-]{1,128}` charset enforced at the FFI choke
+   point `to_job_spec` (validates the raw value used for the path, not a
+   trimmed copy). Belt-and-suspenders pre-flight `isSafeJobId` added to BOTH
+   shells on `startJob`, `enqueueBackgroundJob`, AND `queryJob` — the last
+   reaches the FS via `queryCheckpoint`/`load_checkpoint` WITHOUT crossing
+   `to_job_spec`, so the shell guard is the enforcement point there.
+
+2. **(MED) Terrain GeoTIFF unbounded chunk allocation (DoS).** `read_window`
+   → `Decoder::read_chunk` allocates a buffer sized from the TIFF's own
+   TileWidth/TileLength (or RowsPerStrip) tags; the `WindowLargerThanTile`
+   guard in rgb.rs fires only AFTER decode. A hostile 65535×65535 tile
+   (~4.3e9 samples) OOMs before any guard.
+   **Fix:** `WindowedDemReader::new` validates chunk size BEFORE any
+   `read_chunk` via the pure `chunk_dims_within_limit` helper. Cap is on
+   AREA (`MAX_CHUNK_SAMPLES = 64Mi`), NOT per dimension — a legitimately
+   striped DEM can have a full-height single strip (the existing 20×25000 /
+   4×125000 sample fixtures), so a per-dimension cap would reject valid
+   inputs while the area cap still kills the tiled bomb. Also rejects 0
+   (guards the `div_ceil` divisor). Deviation from the audit's proposed
+   per-dimension `MAX_CHUNK_DIM` recorded here.
+
+3. **(LOW) Android `allowBackup="true"`.** App-private job state
+   (PendingJobStore SharedPreferences, engine checkpoints under
+   files/map_jobs/) extractable via `adb backup`. **Fix:**
+   `android:allowBackup="false"` in AndroidManifest.xml.
+
+**Verified Secure (no change):** FFI memory safety (single audited read-only
+`Mmap::map` in pbf/src/lib.rs; value-type-only UniFFI surface, panics unwind
+to typed errors); PBF dense-node parser (every length field byte-capped;
+StringTable indices `get()`-checked; delta `checked_add`; zlib inflate via
+`decompress_to_vec_zlib_with_limit` clamped to 16 MiB with post-size assert);
+`SystemForegroundService` / receivers (WorkManager service inherits library
+`exported=false`; no app-defined receivers; FileProvider `exported=false`;
+MainActivity `exported=true` is the MAIN/LAUNCHER-only requirement, no custom
+scheme); iOS background tasks (single BGTaskScheduler identifier, minimal
+external-power request, handler registered in didFinishLaunching, no
+CFBundleURLTypes).
+
+**Deferred to Phase 10 (latent-only — logged, deliberately NOT patched):**
+- **Finding 2 (MED→latent): Android FileProvider over-broad paths.**
+  `res/xml/file_paths.xml` roots `external-path` and `cache-path` at `.`,
+  exposing the entire external-files + cache trees to any minted
+  `content://…fileprovider/…` URI. Latent because the app currently mints
+  NO such URIs. Phase-10 fix: scope to a dedicated `shared/` subdir, drop
+  the unused external-path entry.
+- **Finding 5 (LOW→latent): no Capacitor navigation allowlist.** Legacy
+  Cordova `<access origin="*"/>` in config.xml is inert under Capacitor
+  (navigation is governed by `capacitor.config.ts` `server.*`, unset →
+  safe localhost default). Latent because no external web navigation is
+  performed. Phase-10 fix: set explicit `server: { allowNavigation: [] }`
+  + `androidScheme: 'https'` to make the closed posture intentional.
+
+**Verification:**
+- `cargo test` (full workspace) green — 0 failed; new tests
+  `ffi::tests::failed_on_traversal_job_id` and
+  `terrain::reader::tests::chunk_size_limit_rejects_bombs_and_accepts_valid_shapes`.
+- `npx tsc --noEmit` exit 0 (frontend untouched by these patches).
+
+**Outcome:** CLOSED. Two confirmed sandbox-integrity findings (path traversal,
+GeoTIFF DoS) patched at the correct enforcement layers + one trivial manifest
+hardening. Findings 2 & 5 carried to Phase 10 as non-blocking cleanup.

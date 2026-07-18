@@ -2307,3 +2307,80 @@ mode exclusivity with the Phase-10 download overlay, overlay mount).
 **Outcome:** CLOSED. Remaining Phase-9 tail: device smokes (enqueue →
 BGTask/WorkManager → discovery → ingest → hot-swap → persistence, plus one
 custom-reticle job end-to-end on device).
+
+## P9.C4 — PMTiles protocol registry: root-cause fix for the flaky boot
+
+**Status:** CLOSED
+**Date:** 2026-07-18
+**Operator context:** operator-directed blocker fix ahead of device smokes.
+
+**Files:** `src/services/pmtilesRegistry.ts` NEW (globalThis-anchored
+protocol singleton + WorkerPMTilesSource + fail-loud guard),
+`src/ui/components/MapView.tsx` (delegates to the registry; local
+protocol/singleton/class deleted; cleanup no longer clears the registry).
+
+**Root cause — TWO real defects plus ONE environment artifact:**
+
+1. **The key mismatch (the actual bug, present since initial commit).**
+   pmtiles v4's `Protocol.add(p)` stores under `p.source.getKey()`, but
+   `Protocol.tile` looks archives up by the SCHEME-STRIPPED URL
+   (`url.substr("pmtiles://".length)` → `local/alps_basemap.pmtiles`).
+   Our getKey() returned `pmtiles://local/<file>` (commit 659a203; bare
+   `<file>` before that) — so **no lookup ever matched, on any boot,
+   ever**. Every request took the Protocol's silent miss path, which
+   fabricates a fetch-backed archive from the stripped URL. Because real
+   copies of both default archives sit in `public/local/` (the worker's
+   OPFS provisioning source), Vite served them over HTTP 206 and the app
+   LOOKED offline-capable while never once serving MapLibre from OPFS.
+   Consequence: every compiled-region hot-swap target
+   (`{jobId}.pmtiles`, `active_map.pmtiles`) — which has no HTTP twin —
+   could never render ("Wrong magic number" = index.html bytes).
+   **Fix: getKey() returns the scheme-stripped `local/<file>`.** OPFS
+   serving now demonstrably engages (see verification).
+
+2. **Module-scoped singleton vs HMR duplication.** `getGlobalProtocol()`
+   lived in MapView.tsx behind `let globalProtocol` — after an HMR pass
+   Vite can keep BOTH `MapView.tsx` and its `?t=`-stamped twin live, each
+   with its own registry, `addProtocol` last-writer-wins. Never observed
+   to bite on its own (the registry never worked anyway, see 1), but a
+   real latent hazard. **Fix: the singleton lives on `globalThis`;
+   `maplibregl.addProtocol` runs exactly once per page at module
+   evaluation, outside the React lifecycle.** The registry's guard now
+   REJECTS loudly on a `pmtiles://` key miss (with the registered-keys
+   list in the message) instead of inheriting the silent HTTP fallback;
+   one first-serve log line per archive gives boot-time confirmation.
+   Cleanup's `tiles.clear()` is deleted — last-write-wins re-registration
+   per mount makes it pointless, and stale entries are inert (their
+   worker is terminated). Worker lifecycle audited: one worker per mount
+   (`[]`-deps effect), StrictMode remounts serialized by the existing
+   `pendingWorkerTeardown` gate — unchanged.
+
+3. **The "flakiness" itself was an environment artifact.** Isolated with
+   a from-scratch probe map (inline style + empty GeoJSON source, zero
+   app code): in the embedded browser-preview pane, `requestAnimationFrame`
+   is SUSPENDED while no frames are being composited, and MapLibre drives
+   its whole load pipeline through its render frame — so an untouched
+   page never fires 'load' (zero styledata/render events in 5s), while
+   any interaction (screenshot/hover/resize) lets the same boot complete
+   instantly. This retroactively explains every "stalled boot" across
+   P9.C2–C4 sessions, including why success correlated with screenshots
+   and resizes. NOT a product bug; real browsers/devices run rAF
+   continuously. The P9.C3 LOOPLOG entry's registry-duplication suspicion
+   is superseded by this entry.
+
+**Verification:**
+- `tsc -b` + eslint clean.
+- Registry proven live end-to-end in-page: correct scheme-stripped keys;
+  `getHeader()` through worker → OPFS SyncAccessHandle resolves a real
+  MVT header; "[pmtilesRegistry] Serving …" logs for both archives.
+- 5/5 aggressive force-reload boots reached full map render
+  (terrain + hillshade + vector layers + chrome) with **zero**
+  `/local/*` HTTP requests (page-scoped resource log) and zero guard
+  errors — MapLibre served exclusively from OPFS for the first time in
+  the project's history. (Each boot needed an interaction to un-suspend
+  the pane's rAF, per finding 3.)
+
+**Outcome:** CLOSED. Device smokes unblocked. Note for the smoke plan:
+verify a compiled `{jobId}.pmtiles` hot-swap renders on device — that
+path was structurally broken until this fix and has never been exercised
+with real tiles.

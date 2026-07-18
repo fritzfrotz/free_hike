@@ -1,25 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import maplibregl from 'maplibre-gl';
-import { Protocol, PMTiles } from 'pmtiles';
-import type { Source, RangeResponse } from 'pmtiles';
 import type { WorkerRequestMessage, WorkerResponseMessage, MapInitSuccessPayload } from '../../shared/types';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import mlcontour from 'maplibre-contour';
 import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
 import { useMapStore } from '../../store/mapStore';
+import { registerPMTilesSource, type TelemetryData } from '../../services/pmtilesRegistry';
 import DownloadProgressBar, { type DownloadProgressHandle } from './DownloadProgressBar';
 import RegionSelectorOverlay from './RegionSelectorOverlay';
 
-// ---------------------------------------------------------------------------
-// Telemetry (OPFS byte-range reads from the mapData worker)
-// ---------------------------------------------------------------------------
-
-export interface TelemetryData {
-  activeRequests: number;
-  lastFetchTime: number;
-  lastFetchSize: number;
-  totalBytes: number;
-}
+export type { TelemetryData };
 
 // ---------------------------------------------------------------------------
 // Spatial worker proximity HUD state
@@ -39,102 +29,16 @@ interface NearestTrail {
 type ScanStatus = 'idle' | 'scanning' | 'indexed' | 'error';
 
 // ---------------------------------------------------------------------------
-// WorkerPMTilesSource — bridges PMTiles byte-range calls to the mapData worker
-// ---------------------------------------------------------------------------
-
-class WorkerPMTilesSource implements Source {
-  /**
-   * The OPFS filename this source reads from (e.g. 'alps_basemap.pmtiles').
-   * Sent with every MAP_READ_BYTES request so the worker can dispatch to the
-   * correct SyncAccessHandle — one handle per file, all kept open concurrently.
-   */
-  readonly filename: string;
-
-  private worker: Worker;
-  private onTelemetry?: (data: TelemetryData) => void;
-  private activeRequests = 0;
-  private totalBytes = 0;
-
-  constructor(filename: string, worker: Worker, onTelemetry?: (data: TelemetryData) => void) {
-    this.filename = filename;
-    this.worker   = worker;
-    this.onTelemetry = onTelemetry;
-  }
-
-  /** PMTiles protocol uses the key to de-duplicate sources in its registry. */
-  getKey() { return `pmtiles://local/${this.filename}`; }
-
-  async getBytes(offset: number, length: number, signal?: AbortSignal): Promise<RangeResponse> {
-    const startTime = performance.now();
-    this.activeRequests++;
-    this.triggerTelemetry(0, 0);
-
-    return new Promise<RangeResponse>((resolve, reject) => {
-      const requestId = Math.random().toString(36).substring(2, 9);
-
-      const onMessage = (event: MessageEvent<WorkerResponseMessage>) => {
-        const response = event.data;
-        if (response.id !== requestId) return;
-        this.worker.removeEventListener('message', onMessage);
-        this.activeRequests--;
-        const duration = performance.now() - startTime;
-
-        if (response.type === 'MAP_BYTES_RESPONSE') {
-          const buffer = response.payload.buffer as ArrayBuffer;
-          this.totalBytes += buffer.byteLength;
-          this.triggerTelemetry(duration, buffer.byteLength);
-          resolve({ data: buffer });
-        } else {
-          this.triggerTelemetry(duration, 0);
-          reject(new Error(response.error ?? 'Failed to read bytes from worker'));
-        }
-      };
-
-      this.worker.addEventListener('message', onMessage);
-
-      if (signal) {
-        signal.addEventListener('abort', () => {
-          this.worker.removeEventListener('message', onMessage);
-          this.activeRequests--;
-          this.triggerTelemetry(performance.now() - startTime, 0);
-          reject(new DOMException('Aborted', 'AbortError'));
-        });
-      }
-
-      // Include the target filename so the worker routes the read to the
-      // correct OPFS SyncAccessHandle rather than a single shared slot.
-      const req: WorkerRequestMessage = {
-        id:      requestId,
-        type:    'MAP_READ_BYTES',
-        payload: { filename: this.filename, offset, length },
-      };
-      this.worker.postMessage(req);
-    });
-  }
-
-  private triggerTelemetry(duration: number, bytesRead: number) {
-    this.onTelemetry?.({
-      activeRequests: this.activeRequests,
-      lastFetchTime: duration,
-      lastFetchSize: bytesRead,
-      totalBytes: this.totalBytes,
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Global PMTiles protocol singleton (survives HMR)
-// ---------------------------------------------------------------------------
-
-let globalProtocol: Protocol | null = null;
-function getGlobalProtocol(): Protocol {
-  if (!globalProtocol) {
-    globalProtocol = new Protocol();
-    maplibregl.addProtocol('pmtiles', globalProtocol.tile);
-  }
-  return globalProtocol;
-}
-
+// PMTiles protocol + source registry
+//
+// P9.C4: registration moved OUT of this component module entirely — see
+// services/pmtilesRegistry.ts. The old module-scoped `getGlobalProtocol()`
+// singleton did not survive HMR module duplication (MapView.tsx and its
+// ?t=-stamped twin could both be live, each with its own registry, and
+// maplibre kept whichever handler registered last) — the root cause of the
+// flaky "map never fires 'load'" boots. The registry now lives on
+// globalThis, registers with maplibre once at import time, and fails LOUD
+// on a key miss instead of silently falling back to HTTP.
 // ---------------------------------------------------------------------------
 // mapData worker teardown gate
 //
@@ -489,21 +393,14 @@ export default function MapView({
     const DEFAULT_TERRAIN  = 'alps_terrain.pmtiles';
     activeFilesRef.current = { basemap: DEFAULT_BASEMAP, terrain: DEFAULT_TERRAIN };
 
-    const protocol = getGlobalProtocol();
-    let   map: maplibregl.Map | null = null;
+    let map: maplibregl.Map | null = null;
 
-    // Helper: create a WorkerPMTilesSource + PMTiles pair and register it
-    // with the global protocol.  Safe to call multiple times for the same
-    // filename — PMTiles.getKey() de-duplicates within the protocol registry.
-    const registerSource = (
-      filename: string,
-      onTelemetry?: (d: TelemetryData) => void,
-    ): PMTiles => {
-      const src      = new WorkerPMTilesSource(filename, mapDataWorker, onTelemetry);
-      const instance = new PMTiles(src);
-      protocol.add(instance);
-      return instance;
-    };
+    // Helper: bind an OPFS filename to THIS mount's worker in the global
+    // registry. Last write wins by key, so re-registering (StrictMode
+    // remount, hot-swap) atomically replaces any stale instance bound to a
+    // torn-down worker.
+    const registerSource = (filename: string, onTelemetry?: (d: TelemetryData) => void) =>
+      registerPMTilesSource(filename, mapDataWorker, onTelemetry);
 
     const initId = Math.random().toString(36).substring(2, 9);
 
@@ -864,13 +761,13 @@ export default function MapView({
       active = false;
       mapDataWorker.removeEventListener('message', handleInitMessage);
 
-      // Clear the global protocol tiles registry to release any references/handles
-      // to offline files on map unmount
-      try {
-        getGlobalProtocol().tiles.clear();
-      } catch (err) {
-        console.warn('[MapView] Failed to clear global protocol cache:', err);
-      }
+      // Deliberately NOT clearing the protocol registry here (P9.C4): stale
+      // entries are inert (their worker is terminated, and the map that
+      // could request through them is removed below), and the next mount
+      // re-registers every key it uses before creating its map. Clearing
+      // raced the async boot for zero benefit — and with the registry's
+      // fail-loud guard, an unexpected empty registry would now error every
+      // tile request instead of degrading silently.
 
       // Explicitly remove map instances to free map canvas/WebGL context
       map?.remove();

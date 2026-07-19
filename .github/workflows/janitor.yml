@@ -1,0 +1,20 @@
+# Tracker janitor — rules enforcement + debt/bug tracking (docs/tracker_tags.md).
+# CI is the real enforcement; the pre-commit hook is fast local feedback.
+name: tracker-janitor
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  janitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Janitor self-test
+        run: node --test scripts/tracker-janitor.test.mjs
+      - name: Tracker check (tags, mirrors, forbidden patterns, TRACKER.md drift)
+        run: node scripts/tracker-janitor.mjs --check

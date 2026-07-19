@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `terrain.pmtiles` assembly: pyramid enumeration → rendered WebP tiles →
 //! PMTiles v3 archive through the Phase-5 byte-level writer.
 //!

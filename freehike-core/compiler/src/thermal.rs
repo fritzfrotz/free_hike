@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `thermal` — Phase 8 thermal governance (ARCHITECTURE.md P9).
 //!
 //! Mobile SoCs terminate background processes that keep P-cores pinned while

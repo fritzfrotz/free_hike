@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * pmtilesRegistry.ts — the ONE owner of MapLibre's `pmtiles://` protocol
  * registration and its source registry (P9.C4).

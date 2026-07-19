@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type {
   WorkerRequestMessage,
@@ -24,7 +25,7 @@ import {
   syncToGoogle,
   disconnectGoogle,
   loadGoogleTokenRecord,
-} from './services/sync/GoogleDriveSync';
+} from '../experimental/GoogleDriveSync';
 import {
   buildDropboxAuthUrl,
   exchangeDropboxCode,
@@ -32,7 +33,7 @@ import {
   syncToDropbox,
   disconnectDropbox,
   loadDropboxTokenRecord,
-} from './services/sync/DropboxSync';
+} from '../experimental/DropboxSync';
 import { saveSyncMetadata, loadSyncMetadata, clearSyncMetadata } from './services/syncDB';
 import { featuresToGpx } from './services/gpxSerializer';
 import SavedRoutesPanel from './components/SavedRoutesPanel';
@@ -105,7 +106,6 @@ function formatElapsed(totalSeconds: number): string {
 export default function App() {
   // ── Background worker health (drives the header status pill) ────────────────
   const [workerReady, setWorkerReady] = useState(false);
-  const workerRef = useRef<Worker | null>(null);
 
   // ── Native compiler state (granular selectors — App only re-renders when
   // these specific fields change, not on every compilerStore update) ─────────
@@ -279,29 +279,6 @@ export default function App() {
       const status = await requestPersistentStorage();
       setIsStorageDurable(status.isPersistent);
     })();
-  }, []);
-
-  // ── Effect 2: Background worker heartbeat (drives the header status pill) ───
-  useEffect(() => {
-    const worker = new Worker(
-      new URL('../workers/dummy.worker.ts', import.meta.url),
-      { type: 'module' },
-    );
-    workerRef.current = worker;
-
-    const handleMessage = (event: MessageEvent<WorkerResponseMessage>) => {
-      console.log('%c[Main Thread] Worker response:', 'color:#0d9488;font-weight:bold;', event.data);
-    };
-
-    worker.addEventListener('message', handleMessage);
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setWorkerReady(true);
-    console.log('%c[Main Thread] Web Worker initialized.', 'color:#0284c7;font-weight:bold;');
-
-    return () => {
-      worker.removeEventListener('message', handleMessage);
-      worker.terminate();
-    };
   }, []);
 
   // ── Offline Routing Worker lifecycle (Phase 5) ─────────────────────────────
@@ -509,6 +486,7 @@ export default function App() {
     setMapDataError(message);
   }, []);
 
+  // BUG(B004): hike.pmtiles/test_graph.tar sandbox fixtures missing, region-download demo path fails — severity: major — repro: tap region download in web build
   // ── Phase 10: Region download orchestrator ────────────────────────────────
   //
   // Flow:
@@ -987,6 +965,9 @@ export default function App() {
           hoveredElevIndex={hoveredElevIndex}
           onSpatialWorkerReady={(worker) => {
             spatialWorkerRef.current = worker;
+            // Drives the header status pill: "connected" means the real
+            // spatial worker is up, not a placeholder heartbeat.
+            setWorkerReady(true);
             // Attach the elevation response listener exactly once.
             if (!spatialListenerAttached.current) {
               worker.addEventListener('message', handleSpatialElevation);
@@ -1095,7 +1076,7 @@ export default function App() {
 
       {/* ── Footer ─────────────────────────────────────────────────────────── */}
       <footer className="w-full max-w-6xl text-center border-t border-slate-900 pt-6 mt-8 text-xs text-slate-600">
-        <p>© 2026 Antigravity. Built with uncompromised client autonomy.</p>
+        <p>© 2026 FreeHike contributors. Built with uncompromised client autonomy.</p>
 
         {/* Phase 1 debug: native compile bridge round-trip (discrete by design) */}
         <div className="mt-3 flex flex-col items-center gap-2">

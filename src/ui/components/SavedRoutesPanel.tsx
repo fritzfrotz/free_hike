@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { useEffect, useState } from 'react';
 import type { SavedRoute } from '../../shared/db';
 import { getAllRoutes } from '../../shared/db';

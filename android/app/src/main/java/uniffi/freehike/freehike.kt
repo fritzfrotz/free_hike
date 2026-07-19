@@ -965,7 +965,7 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_freehike_ffi_checksum_func_compile_chunk() != 52545.toShort()) {
+    if (lib.uniffi_freehike_ffi_checksum_func_compile_chunk() != 59234.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freehike_ffi_checksum_func_emit_test_progress() != 52095.toShort()) {
@@ -1452,6 +1452,10 @@ public object FfiConverterTypeCompileSummary: FfiConverterRustBuffer<CompileSumm
 
 /**
  * Result of one execution slice.
+ *
+ * Surface v1 revision (operator-directed hardening pass): the former
+ * `Failed` case is split by retryability so the shells can route failures
+ * to the right WorkManager/BGTask policy instead of guessing from strings.
  */
 sealed class CompilationStatus {
     
@@ -1473,9 +1477,22 @@ sealed class CompilationStatus {
     }
     
     /**
-     * A fatal error occurred (e.g. disk full, corrupted payload).
+     * A fatal error occurred (corrupted checkpoint, corrupted index, bad
+     * input, non-clearing I/O like EACCES). Runners must NOT retry — the
+     * same inputs fail the same way.
      */
-    data class Failed(
+    data class FailedFatal(
+        val `reason`: kotlin.String) : CompilationStatus() {
+        companion object
+    }
+    
+    /**
+     * The environment refused this slice: another runner holds the job's
+     * slice lock, or an I/O operation hit a condition that can clear
+     * (ENOSPC — disk full; EIO — transient device error). Durable state
+     * is untouched; back off and retry later.
+     */
+    data class FailedTransient(
         val `reason`: kotlin.String) : CompilationStatus() {
         companion object
     }
@@ -1497,7 +1514,10 @@ public object FfiConverterTypeCompilationStatus : FfiConverterRustBuffer<Compila
             2 -> CompilationStatus.Yielded(
                 FfiConverterTypeCheckpointState.read(buf),
                 )
-            3 -> CompilationStatus.Failed(
+            3 -> CompilationStatus.FailedFatal(
+                FfiConverterString.read(buf),
+                )
+            4 -> CompilationStatus.FailedTransient(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -1519,7 +1539,14 @@ public object FfiConverterTypeCompilationStatus : FfiConverterRustBuffer<Compila
                 + FfiConverterTypeCheckpointState.allocationSize(value.`checkpoint`)
             )
         }
-        is CompilationStatus.Failed -> {
+        is CompilationStatus.FailedFatal -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+        is CompilationStatus.FailedTransient -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -1540,8 +1567,13 @@ public object FfiConverterTypeCompilationStatus : FfiConverterRustBuffer<Compila
                 FfiConverterTypeCheckpointState.write(value.`checkpoint`, buf)
                 Unit
             }
-            is CompilationStatus.Failed -> {
+            is CompilationStatus.FailedFatal -> {
                 buf.putInt(3)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+            is CompilationStatus.FailedTransient -> {
+                buf.putInt(4)
                 FfiConverterString.write(value.`reason`, buf)
                 Unit
             }
@@ -1768,8 +1800,9 @@ public object FfiConverterOptionalTypeCheckpointState: FfiConverterRustBuffer<Ch
 }
         /**
          * Runs one budget-bounded slice of `job`. See module docs for the
-         * Finished / Yielded / Failed contract. Never throws: all failures are
-         * values, so foreign call sites need no try/catch ceremony.
+         * Finished / Yielded / FailedFatal / FailedTransient contract. Never
+         * throws: all failures are values, so foreign call sites need no
+         * try/catch ceremony.
          */ fun `compileChunk`(`job`: CompileJob, `budgetMs`: kotlin.UInt, `callback`: ProgressCallback): CompilationStatus {
             return FfiConverterTypeCompilationStatus.lift(
     uniffiRustCall() { _status ->

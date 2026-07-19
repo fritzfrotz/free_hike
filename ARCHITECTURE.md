@@ -67,15 +67,27 @@ largest transient allocation.
 
 **P4 — Idempotent, budget-yielding, kill-safe state machine.** The public FFI contract
 (Surface v1) is `compile_chunk(job, budget_ms, callback) → Finished | Yielded | Failed`.
-Durable checkpoints (currently **v5**: `phase`, `pbf_byte_offset`, `pass2_byte_offset`,
-`pass3_last_way_id`, `pass5_last_tile`, `blocks_done`, `bytes_written`) are written
-fsync+atomic-rename, always *behind* durable data — a checkpoint never runs ahead of
-what's on disk. Resume is by job identity: the foreign layer can't feed state back, only
+Durable checkpoints (currently **v6**: `spec_hash`, `phase`, `pbf_byte_offset`,
+`pass2_byte_offset`, `pass3_last_way_id`, `pass5_last_tile`, `blocks_done`,
+`bytes_written`) are written fsync+atomic-rename, always *behind* durable data — a
+checkpoint never runs ahead of what's on disk. `spec_hash` fingerprints the job
+parameters (bbox, zooms, input paths): a checkpoint whose fingerprint doesn't match the
+incoming spec (jobId reused for a different region) is never resumed — the engine purges
+the stale state loudly and restarts fresh, never bricking the job. Resume is by job identity: the foreign layer can't feed state back, only
 re-invoke; disk is the sole carrier. Proven on-device: SIGKILL mid-compile loses
 nothing, resume is exact and non-duplicating. Any checkpoint format change bumps the
 version and old checkpoints are refused loudly (never guessed at). This contract is what
 survives iOS's ~295s `BGProcessingTask` guillotine and Android's 6h/24h foreground-service
 cap (Phase 8 wires the schedulers).
+
+```
+rule-id: P4a
+forbidden-pattern: ^panic\s*=\s*"abort"
+paths: freehike-core/**
+# UniFFI converts Rust panics into typed foreign errors by UNWINDING;
+# panic="abort" would turn every internal bug into a native crash.
+# Line-anchored so prose/comments discussing the setting don't trip it.
+```
 
 **P5 — Sequential PMTiles v3 output, never SQLite.** Millions of tiny random writes
 destroy mobile NAND (write amplification), drain battery, and trigger thermal
@@ -85,11 +97,33 @@ assembled Hilbert-ordered (`clustered=1`) with exact-offset 127-byte header + va
 directory, atomic tmp+rename. MLT is a possible future encode stage behind a format flag
 (R4) — MVT+gzip ships first and is what's implemented.
 
+```
+rule-id: P5a
+forbidden-pattern: ^\s*\S*sqlite\S*\s*=|^name = "[^"]*sqlite
+paths: freehike-core/**
+# First alternative: direct dependency lines in Cargo.toml. Second:
+# resolved-graph entries in Cargo.lock, so TRANSITIVE sqlite deps are
+# caught too. Limitation: Cargo table syntax ([dependencies.rusqlite])
+# is not matched by the first alternative — the Cargo.lock check is the
+# safety net that still catches the resolve.
+```
+
 **P6 — Hostile-mirror ingestion.** Every download is validated before it is trusted:
 resumable Range requests, magic-byte checks (PBF `OSMHeader` blob; TIFF `II*\0`/`MM\0*`),
 Content-Length sanity. This permanently encodes the Geofabrik-HTML-redirect lesson (a
 302-to-homepage saved as a "successful" `.pbf` poisoned the pipeline for weeks). TLS is
 pure-Rust rustls — zero OpenSSL in the mobile cross-compile.
+
+```
+rule-id: P6a
+forbidden-pattern: ^\s*(native-tls|openssl)\S*\s*=|^name = "(native-tls|openssl)
+paths: freehike-core/**
+# First alternative: direct dependency lines in Cargo.toml. Second:
+# resolved-graph entries in Cargo.lock (transitive OpenSSL sneaking in
+# via a feature flag fails CI). Limitation: Cargo table syntax
+# ([dependencies.openssl]) is not matched by the first alternative —
+# the Cargo.lock check is the safety net.
+```
 
 **P7 — The OPFS seam.** The WebView renders through
 `WorkerPMTilesSource → mapData.worker → OPFS SyncAccessHandle` synchronous byte-range
@@ -107,6 +141,19 @@ MapLibre canvas stays permanently mounted (CSS visibility toggling) to preserve 
 context. Styling is fully offline: vendored glyphs (Noto Sans SDF `.pbf` ranges under
 `public/`), local sprites, `pmtiles://` sources; theme switching via
 `map.setPaintProperty()`, never `setStyle()` teardown.
+
+```
+rule-id: P8a
+forbidden-pattern: \.setStyle\(
+paths: src/**
+```
+
+```
+rule-id: P8b
+forbidden-pattern: createContext\(
+paths: src/**
+# Global state is Zustand, not React Context (P8).
+```
 
 **P9 — Thermal & background governance (Phase 8).** Rayon pool capped to P-cores − 2–3;
 poll `ProcessInfo.thermalState` / Android `THERMAL_STATUS` and voluntarily downshift at
@@ -170,13 +217,8 @@ against the Innsbruck fixtures before touching a device.
 | 9 | Product integration: region picker → compile → OPFS copy → hot-swap | ⏳ **IN PROGRESS** — P9.C1 closed: background-job handoff orchestration (Zustand `isBackgroundCompiling`/`backgroundProgress`/`pendingHandoffJobs`, cold-boot `queryBackgroundJob` discovery + `backgroundCompile` doorbell listener, stream-copy sandbox archive → OPFS via opfsMover, acknowledge-after-durable-close, `setActiveRegion` hot-swap; byte progress bypasses React via ref sink + rAF direct-DOM paint in `BackgroundHandoffBar`). Note: archives ingest as `{jobId}.pmtiles`, not over the live `alps_basemap.pmtiles` — the worker's persistent SyncAccessHandle holds an exclusive OPFS lock on the bound file, and same-name swaps are no-ops in `loadOfflineRegion` by design. P9.C2 closed: activeRegion persistence (zustand/persist over localStorage, partialized to the region binding; MapView cold-boot replay in the 'load' handler validates OPFS files before binding, drops evicted regions via `clearActiveRegion`) + `RegionPicker.tsx` sheet (hardcoded Innsbruck test regions → `enqueueBackgroundJob` z5–14; confirm hard-disabled while the single-job native record is pending). P9.C3 closed: fixed-reticle custom region selector (`RegionSelectorOverlay.tsx`: pointer-transparent mask + chrome unmount, pitch→0 ease, 4-corner unproject min/max bounds, direct-DOM bounds readout; shared `enqueueRegionDownload` in `regionCompiler.ts` unifies picker presets + custom FAB). P9.C4 closed: pmtiles protocol registry root-cause fix (`services/pmtilesRegistry.ts` — getKey MUST be scheme-stripped `local/<file>` to match pmtiles v4 lookups; the old full-URL key never matched, so ALL tile traffic silently fell back to HTTP `public/local/` twins and OPFS never served MapLibre; globalThis singleton + addProtocol once at module eval + fail-loud miss guard; verified 5/5 reload boots serving 100% from OPFS, zero /local/ HTTP). Remaining: device smokes (must include a `{jobId}.pmtiles` hot-swap render — structurally broken pre-C4, never exercised) |
 | 10 | Hardening & release: flash-write telemetry, mirror etiquette, store review | ◻ pending |
 
-**Carried follow-ups (tracked, not blocking Phase 6):** leaf-directory splitting +
-run-length coalescing in the PMTiles writer; node-POI extraction (peak names are
-node-tagged, outside the ways-only pipeline); RSS:anon as a CI gate + Austria-scale
-(767MB) on-device index run + iOS increased-memory entitlements; iOS full build/link
-(needs an Xcode machine — CLT-only env blocks the `iphoneos` SDK); scroll-reset UI nit on
-map mount; pre-existing frontend gaps (hillshade detached-buffer console error, missing
-`hike.pmtiles`/`test_graph.tar` fixtures).
+**Carried follow-ups:** tracked as inline `DEBT(D###)`/`BUG(B###)` tags in code —
+see the generated `TRACKER.md` (authority model + tag spec: `docs/tracker_tags.md`).
 
 ## 6. Risk Register (condensed; full prose in the deprecated research docs)
 
@@ -201,3 +243,21 @@ map mount; pre-existing frontend gaps (hillshade detached-buffer console error, 
 Verification ladder per `agentic_operating_manual.md`: L1 = workspace tests + clippy
 `-D warnings` + fmt, green-locked ×2; L2 = ignored real-data tests; L4 = aarch64
 cross-compiles (`cargo ndk -t arm64-v8a build -p ffi` must stay clean).
+
+## 8. Generated UniFFI Bindings — Sync Rule
+
+The UniFFI-generated bindings exist in **two places** and are vendored, not
+built on the fly:
+
+1. `freehike-core/ffi/bindings/` — canonical generator output
+   (`freehike.swift`, `freehikeFFI.h`, `freehikeFFI.modulemap`, `uniffi/`).
+2. The native OS trees that actually compile them:
+   - iOS: `ios/App/App/FreeHikeFFI/` (Swift + header + modulemap)
+   - Android: `android/app/src/main/java/uniffi/freehike/freehike.kt`
+
+Any change to the FFI surface (`ffi` crate) MUST regenerate the bindings
+(`cargo run -p ffi --features cli --bin uniffi-bindgen`) and re-vendor them
+into **both** OS trees in the same commit. A drifted copy fails at runtime,
+not at build time (JNA/modulemap symbol lookup), so treat "bindings differ
+between locations" as a broken build. These generated files are exempt from
+SPDX headers (`scripts/add_spdx_headers.sh` skips them).

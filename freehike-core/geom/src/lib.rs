@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `geom` — pure geometry math for Phase 4 (simplification, clipping,
 //! and slippy-tile grid math).
 //!

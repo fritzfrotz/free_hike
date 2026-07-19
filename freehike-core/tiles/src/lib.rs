@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `tiles` — MVT encoding and PMTiles v3 assembly (Phase 5, P5.C1).
 //!
 //! The Finalize stage of the compile pipeline: drains the `TileFeatures`

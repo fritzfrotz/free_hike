@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! The Finalize drivers: budget-yieldable MVT encode + PMTiles assembly.
 //!
 //! ## Durability contract (mirrors Passes 1-3)
@@ -31,6 +32,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::Path;
 
+use log::{info, warn};
+
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
 };
@@ -61,9 +64,13 @@ const PAYLOAD_HASHES: TableDefinition<u64, (u64, u64)> =
 
 #[derive(Debug)]
 pub enum FinalizeError {
-    /// Filesystem failure on the data file or archive.
-    Io(String),
-    /// redb failure or corrupted index content.
+    /// Filesystem failure on the data file or archive. Carries the source
+    /// `std::io::Error` (not a string) so the engine can classify
+    /// retryability by errno — ENOSPC/EIO during the big Finalize writes
+    /// are transient environment conditions; the rest are fatal.
+    Io(std::io::Error),
+    /// redb failure or corrupted index content. Always fatal downstream —
+    /// a corrupted store ("All roots corrupted") does not heal on retry.
     Index(String),
     /// Internal invariant broken (corrupt cursor, impossible state).
     Corrupt(String),
@@ -72,7 +79,7 @@ pub enum FinalizeError {
 impl std::fmt::Display for FinalizeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FinalizeError::Io(m) => write!(f, "I/O error: {m}"),
+            FinalizeError::Io(e) => write!(f, "I/O error: {e}"),
             FinalizeError::Index(m) => write!(f, "index error: {m}"),
             FinalizeError::Corrupt(m) => write!(f, "state corrupt: {m}"),
         }
@@ -92,7 +99,7 @@ fn db_err(e: impl std::fmt::Display) -> FinalizeError {
 }
 
 fn io_err(e: std::io::Error) -> FinalizeError {
-    FinalizeError::Io(e.to_string())
+    FinalizeError::Io(e)
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +205,17 @@ pub fn run_finalize_encode_slice(
         .map_err(io_err)?;
     let file_len = file.metadata().map_err(io_err)?.len();
     match file_len.cmp(&high_water) {
-        std::cmp::Ordering::Greater => file.set_len(high_water).map_err(io_err)?,
+        std::cmp::Ordering::Greater => {
+            // Crash-recovery event: a previous run died mid-append, leaving
+            // bytes past the committed entries' high-water mark.
+            warn!(
+                "finalize: truncating torn tail on '{}' ({} bytes past committed high-water {})",
+                data_path.display(),
+                file_len - high_water,
+                high_water
+            );
+            file.set_len(high_water).map_err(io_err)?;
+        }
         std::cmp::Ordering::Less => {
             return Err(FinalizeError::Corrupt(format!(
                 "tile data file is {file_len} bytes but committed entries reach {high_water}"
@@ -450,6 +467,7 @@ pub fn assemble_archive(
     let root_dir_offset = HEADER_BYTES as u64;
     let metadata_offset = root_dir_offset + root_dir.len() as u64;
     let leaf_dirs_offset = metadata_offset + metadata.len() as u64;
+        // DEBT(D001): PMTiles writer is root-directory-only; leaf splitting and run-length coalescing needed at scale — platforms: core
     let tile_data_offset = leaf_dirs_offset; // leaf section present but empty
     let (west, south, east, north) = bounds_deg;
 
@@ -502,6 +520,23 @@ pub fn assemble_archive(
     out_file.sync_all().map_err(io_err)?;
     drop(out_file);
     std::fs::rename(&tmp_path, out_path).map_err(io_err)?;
+    // Power-loss durability: the rename's directory entry must be fsync'd
+    // too, or a power cut can leave a durable "finished" record pointing at
+    // an archive that never became reachable. On Unix a directory opens as
+    // a real fd and `sync_all` lowers to fsync(2) on it.
+    #[cfg(unix)]
+    {
+        let dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(io_err)?;
+    }
+    info!(
+        "finalize: archive assembled at '{}' ({} entries, {} bytes, rename + dir fsync durable)",
+        out_path.display(),
+        entries.len(),
+        tile_data_offset + data_len
+    );
 
     Ok(ArchiveInfo {
         addressed_tiles: entries.len() as u64,

@@ -106,7 +106,13 @@ After every `cargo` invocation, classify the outcome: `PASS`, `COMPILE_FAIL`, `T
 - **Green-lock:** a chunk closes only when its full ladder (§2) passes **twice consecutively**
   (guards against order-dependent or flaky greens).
 - **Session bootstrap:** at the start of every session, the agent re-reads this manual's Part 1,
-  runs `TaskList`, reads the tail of `LOOPLOG.md`, and runs `git status` before doing anything.
+  runs `TaskList`, reads the tail of `LOOPLOG.md`, reads the ARCHITECTURE.md pillars and
+  `TRACKER.md`, and runs `git status` before doing anything mutating. Open `BUG(blocker)`
+  items in TRACKER.md are mandatory chunk-planning input: address, re-triage with the
+  operator, or explicitly defer them in the plan entry.
+- **Session close:** run `node scripts/tracker-janitor.mjs --fix` and commit the regenerated
+  `TRACKER.md` with the session's work. Every LOOPLOG kill entry for a tracked item MUST
+  include `closes D###`/`closes B###` — the janitor flags "resolved but not buried" otherwise.
 
 ### 1.5 Mandatory HITL gates (recap)
 

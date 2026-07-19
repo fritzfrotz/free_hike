@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * syncDB.ts
  *
@@ -9,13 +10,13 @@
  *   for the latter — it stores exactly one SyncManifestRecord at a time
  *   (primary key = 'sync_manifest') and never touches OPFS.
  *
- * Database:     antigravity_sync_db  v1
+ * Database:     freehike_sync_db  v1
  * Object store: sync_manifest        keyPath: 'id'
  */
 
 import type { SyncManifestRecord } from '../../shared/types';
 
-const DB_NAME    = 'antigravity_sync_db';
+const DB_NAME    = 'freehike_sync_db';
 const DB_VERSION = 1;
 const STORE_NAME = 'sync_manifest';
 

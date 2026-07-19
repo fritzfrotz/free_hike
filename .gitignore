@@ -65,3 +65,23 @@ android/app/build/
 # Nested sandbox repositories (vendored checkouts, never part of this repo)
 offline_sandbox/gdal/
 offline_sandbox/massif/
+
+# Sandbox pipeline outputs — regenerable via scripts/compile_sandbox_data.sh
+offline_sandbox/output/
+
+# Native build outputs & IDE state
+ios/App/build/
+xcuserdata/
+DerivedData/
+
+# On-device compiler checkpoint / intermediate artifacts
+*.checkpoint
+*.checkpoint.tmp
+*.tiledata.tmp
+
+# Agent session workspace
+.claude/
+
+# Installed from npm (@jansoft/mbujkanji-valhalla-wasm) by
+# scripts/copy_valhalla_wasm.mjs on predev/prebuild — never commit.
+public/valhalla.wasm

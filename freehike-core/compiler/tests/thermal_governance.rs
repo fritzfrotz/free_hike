@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Thermal-governance behavior over the GLOBAL thermal flag (P8.C1).
 //!
 //! Lives in its own integration binary so mutations of the process-wide

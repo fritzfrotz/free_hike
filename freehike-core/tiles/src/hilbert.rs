@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! PMTiles tile IDs: cumulative-pyramid offset + Hilbert curve position.
 //!
 //! The PMTiles v3 spec addresses every tile in the z0..=z pyramid with a

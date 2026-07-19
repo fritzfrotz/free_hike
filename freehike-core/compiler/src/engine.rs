@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Suspendable slice engine — the Phase 7-shaped execution core.
 //!
 //! Contract (mirrored across the FFI in `ffi/src/lib.rs`):
@@ -30,6 +31,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use fs2::FileExt;
+use log::{error, info, warn};
 
 use crate::thermal::SliceGovernor;
 use crate::BBox;
@@ -104,10 +108,17 @@ pub struct JobSpec {
     pub output_dir: String,
 }
 
-/// Durable resume state (checkpoint format v5).
+/// Durable resume state (checkpoint format v6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
     pub job_id: String,
+    /// FNV-1a 64 fingerprint of the job parameters that define WHAT is
+    /// being compiled (bbox, zoom range, input paths). A checkpoint whose
+    /// fingerprint differs from the incoming JobSpec belongs to a
+    /// different job that reused the jobId — resuming would blend redb
+    /// state from two regions, so `run_slice` purges and restarts fresh
+    /// instead (never resumes, never bricks).
+    pub spec_hash: u64,
     pub phase: Phase,
     /// Blocks completed *within* `phase` (real passes 1/2: PBF blocks
     /// scanned; pass 3: ways binned; simulated phases: block index).
@@ -151,8 +162,96 @@ pub enum SliceOutcome {
     /// Budget expired; durable checkpoint written. Call `run_slice` again
     /// with the same JobSpec to resume.
     Yielded(Checkpoint),
-    /// Fatal, non-resumable-as-is error (corrupted state, bad input, I/O).
-    Failed(String),
+    /// Fatal, non-resumable-as-is error (corrupted state, bad input,
+    /// unrecoverable I/O). Runners must NOT retry: the same inputs will
+    /// fail the same way, and re-burning the failure wastes battery.
+    FailedFatal(String),
+    /// The environment, not the job, refused this slice: another runner
+    /// holds the job's slice lock, or an I/O operation failed with a
+    /// condition that can clear (ENOSPC — user frees space; EIO — flash
+    /// controller recovers). The durable state is intact and a later
+    /// re-invocation with the same JobSpec is expected to succeed; runners
+    /// should back off and retry, never mark the job dead.
+    FailedTransient(String),
+}
+
+// ---------------------------------------------------------------------------
+// Failure classification (P2-8): retryable environment vs. dead job
+// ---------------------------------------------------------------------------
+
+/// Errno-level retryability. ENOSPC and EIO are environment conditions a
+/// retry can outlive; every other I/O failure (NotFound, EACCES, ENOTDIR,
+/// …) — and every non-I/O failure, including all redb errors ("All roots
+/// corrupted" et al.) — is fatal: the same inputs will fail the same way.
+/// Raw errnos are matched because `ErrorKind::StorageFull` requires a
+/// newer toolchain and EIO has no stable `ErrorKind` at all; both values
+/// are identical on Linux/Android/Darwin.
+pub fn is_transient_io(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(28 /* ENOSPC */) | Some(5 /* EIO */))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// An engine failure with its retryability already decided — the internal
+/// precursor of [`SliceOutcome::FailedFatal`] / [`SliceOutcome::FailedTransient`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineError {
+    pub transient: bool,
+    pub reason: String,
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl EngineError {
+    fn fatal(reason: impl Into<String>) -> Self {
+        Self {
+            transient: false,
+            reason: reason.into(),
+        }
+    }
+
+    /// Classifies a raw `std::io::Error` under a human-readable context.
+    fn io(context: impl fmt::Display, e: &std::io::Error) -> Self {
+        Self {
+            transient: is_transient_io(e),
+            reason: format!("{context}: {e}"),
+        }
+    }
+
+    /// Terminal conversion, with the lifecycle log line the Loop Log
+    /// requirement demands at every error-recovery decision.
+    fn into_outcome(self, job_id: &str) -> SliceOutcome {
+        if self.transient {
+            warn!("job {job_id}: transient failure (retryable) — {}", self.reason);
+            SliceOutcome::FailedTransient(self.reason)
+        } else {
+            error!("job {job_id}: fatal failure — {}", self.reason);
+            SliceOutcome::FailedFatal(self.reason)
+        }
+    }
+}
+
+/// Maps a Finalize-stage error onto the classification: the `io::Error`
+/// inside [`tiles::FinalizeError::Io`] decides retryability — Finalize does
+/// the job's big writes (payload appends, archive assembly), which is where
+/// ENOSPC actually bites. redb (`Index`) and invariant (`Corrupt`) errors
+/// stay fatal.
+fn classify_finalize(e: tiles::FinalizeError) -> EngineError {
+    let transient = matches!(&e, tiles::FinalizeError::Io(ioe) if is_transient_io(ioe));
+    EngineError {
+        transient,
+        reason: format!("finalize: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,24 +325,84 @@ fn tile_data_tmp_path(output_dir: &str, job_id: &str) -> PathBuf {
 // Durable checkpoint persistence (std-only; becomes a redb table in Phase 7)
 // ---------------------------------------------------------------------------
 
-// v5: added pass5_last_tile (P5.C1). Any format change bumps the version —
-// that discipline is what keeps kill-resume honest; older versions are
-// rejected as corrupt rather than guessed at (no shipped users yet).
-const CHECKPOINT_VERSION: u32 = 5;
+// v6: added spec_hash (P9.C6, closes D006). v5 added pass5_last_tile
+// (P5.C1). Any format change bumps the version — that discipline is what
+// keeps kill-resume honest; older versions are rejected as corrupt rather
+// than guessed at (no shipped users yet).
+const CHECKPOINT_VERSION: u32 = 6;
+
+/// FNV-1a 64 over the job parameters that define WHAT is being compiled.
+/// `job_id`/`output_dir` are deliberately excluded — they are the resume
+/// IDENTITY; this hash is the resume CONTENT check layered on top of it.
+fn spec_fingerprint(job: &JobSpec) -> u64 {
+    let canon = format!(
+        "{};{};{};{};{};{};{};{}",
+        job.bbox.west,
+        job.bbox.south,
+        job.bbox.east,
+        job.bbox.north,
+        job.min_zoom,
+        job.max_zoom,
+        job.pbf_path,
+        job.dem_path.as_deref().unwrap_or("")
+    );
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canon.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 fn checkpoint_path(output_dir: &str, job_id: &str) -> PathBuf {
     Path::new(output_dir).join(format!("{job_id}.checkpoint"))
 }
 
-/// Atomic, durable write: temp file → fsync → rename. A crash at any point
-/// leaves either the previous checkpoint or the new one — never a torn file.
-fn save_checkpoint(output_dir: &str, cp: &Checkpoint) -> Result<(), String> {
+/// The per-job advisory slice lock. Deliberately NOT removed by
+/// `purge_job_state`: unlinking a file another runner still holds an flock
+/// on would let a third runner lock a fresh inode at the same path — two
+/// "exclusive" holders at once. A leaked 0-byte `.lock` is the cheap side
+/// of that trade.
+fn lock_path(output_dir: &str, job_id: &str) -> PathBuf {
+    Path::new(output_dir).join(format!("{job_id}.lock"))
+}
+
+/// Durability for renames: fsync the PARENT DIRECTORY so the new directory
+/// entry itself survives power loss. `File::sync_all` on the renamed file
+/// covers its *contents*; the entry that makes it reachable lives in the
+/// directory, and ext4/f2fs may lose an un-fsynced rename at power cut —
+/// leaving a durable "finished" marker pointing at a file that is not
+/// there. On Unix, opening the directory read-only yields a real fd and
+/// `sync_all` lowers to `fsync(2)` on it — the open(2)+fsync(2) pair.
+/// No-op on non-Unix (dev hosts); both mobile targets are Unix.
+fn fsync_dir(dir: &Path) -> Result<(), EngineError> {
+    #[cfg(unix)]
+    {
+        let d = fs::File::open(dir).map_err(|e| {
+            EngineError::io(format!("directory open for fsync failed ({})", dir.display()), &e)
+        })?;
+        d.sync_all()
+            .map_err(|e| EngineError::io(format!("directory fsync failed ({})", dir.display()), &e))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Atomic, durable write: temp file → fsync → rename → parent-dir fsync.
+/// A crash at any point leaves either the previous checkpoint or the new
+/// one — never a torn file — and once this returns Ok the rename itself is
+/// power-loss durable.
+fn save_checkpoint(output_dir: &str, cp: &Checkpoint) -> Result<(), EngineError> {
     let final_path = checkpoint_path(output_dir, &cp.job_id);
     let tmp_path = final_path.with_extension("checkpoint.tmp");
 
     let body = format!(
-        "version={CHECKPOINT_VERSION}\njob_id={}\nphase={}\nnext_block={}\npbf_byte_offset={}\npass2_byte_offset={}\npass3_last_way_id={}\npass5_last_tile={}\nbytes_written={}\nblocks_done={}\n",
+        "version={CHECKPOINT_VERSION}\njob_id={}\nspec_hash={}\nphase={}\nnext_block={}\npbf_byte_offset={}\npass2_byte_offset={}\npass3_last_way_id={}\npass5_last_tile={}\nbytes_written={}\nblocks_done={}\n",
         cp.job_id,
+        cp.spec_hash,
         cp.phase,
         cp.next_block,
         cp.pbf_byte_offset,
@@ -255,30 +414,44 @@ fn save_checkpoint(output_dir: &str, cp: &Checkpoint) -> Result<(), String> {
     );
 
     let mut f = fs::File::create(&tmp_path)
-        .map_err(|e| format!("checkpoint write failed ({}): {e}", tmp_path.display()))?;
+        .map_err(|e| EngineError::io(format!("checkpoint write failed ({})", tmp_path.display()), &e))?;
     f.write_all(body.as_bytes())
-        .map_err(|e| format!("checkpoint write failed: {e}"))?;
+        .map_err(|e| EngineError::io("checkpoint write failed", &e))?;
     f.sync_all()
-        .map_err(|e| format!("checkpoint fsync failed: {e}"))?;
+        .map_err(|e| EngineError::io("checkpoint fsync failed", &e))?;
     drop(f);
 
-    fs::rename(&tmp_path, &final_path).map_err(|e| format!("checkpoint rename failed: {e}"))?;
+    fs::rename(&tmp_path, &final_path)
+        .map_err(|e| EngineError::io("checkpoint rename failed", &e))?;
+    fsync_dir(Path::new(output_dir))?;
+    info!(
+        "job {}: checkpoint durable (phase={}, next_block={}, blocks_done={}, bytes_written={})",
+        cp.job_id, cp.phase, cp.next_block, cp.blocks_done, cp.bytes_written
+    );
     Ok(())
 }
 
 /// Loads the checkpoint for a job if one exists. `Ok(None)` = fresh start.
-/// Any malformed content is a hard `Err` — a torn or foreign file must never
-/// silently restart (and thus duplicate) work.
-pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoint>, String> {
+/// Any malformed content is a hard fatal `Err` — a torn or foreign file
+/// must never silently restart (and thus duplicate) work. A read failure
+/// is classified by errno: EIO is transient (retry the read later),
+/// everything else fatal.
+pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoint>, EngineError> {
     let path = checkpoint_path(output_dir, job_id);
     let raw = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("checkpoint unreadable ({}): {e}", path.display())),
+        Err(e) => {
+            return Err(EngineError::io(
+                format!("checkpoint unreadable ({})", path.display()),
+                &e,
+            ))
+        }
     };
 
     let mut version = None;
     let mut id = None;
+    let mut spec_hash = None;
     let mut phase = None;
     let mut next_block = None;
     let mut pbf_byte_offset = None;
@@ -290,11 +463,12 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
 
     for line in raw.lines() {
         let Some((k, v)) = line.split_once('=') else {
-            return Err(format!("corrupted checkpoint: malformed line '{line}'"));
+            return Err(EngineError::fatal(format!("corrupted checkpoint: malformed line '{line}'")));
         };
         match k {
             "version" => version = v.parse::<u32>().ok(),
             "job_id" => id = Some(v.to_string()),
+            "spec_hash" => spec_hash = v.parse::<u64>().ok(),
             "phase" => phase = Phase::from_str(v),
             "next_block" => next_block = v.parse::<u32>().ok(),
             "pbf_byte_offset" => pbf_byte_offset = v.parse::<u64>().ok(),
@@ -303,13 +477,14 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             "pass5_last_tile" => pass5_last_tile = v.parse::<u64>().ok(),
             "bytes_written" => bytes_written = v.parse::<u64>().ok(),
             "blocks_done" => blocks_done = v.parse::<u32>().ok(),
-            other => return Err(format!("corrupted checkpoint: unknown key '{other}'")),
+            other => return Err(EngineError::fatal(format!("corrupted checkpoint: unknown key '{other}'"))),
         }
     }
 
     match (
         version,
         id,
+        spec_hash,
         phase,
         next_block,
         pbf_byte_offset,
@@ -322,6 +497,7 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
         (
             Some(CHECKPOINT_VERSION),
             Some(id),
+            Some(sh),
             Some(phase),
             Some(nb),
             Some(po),
@@ -332,12 +508,13 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
             Some(bd),
         ) => {
             if id != job_id {
-                return Err(format!(
+                return Err(EngineError::fatal(format!(
                     "corrupted checkpoint: job_id mismatch (file='{id}', requested='{job_id}')"
-                ));
+                )));
             }
             Ok(Some(Checkpoint {
                 job_id: id,
+                spec_hash: sh,
                 phase,
                 next_block: nb,
                 pbf_byte_offset: po,
@@ -348,10 +525,10 @@ pub fn load_checkpoint(output_dir: &str, job_id: &str) -> Result<Option<Checkpoi
                 blocks_done: bd,
             }))
         }
-        (Some(v), ..) if v != CHECKPOINT_VERSION => {
-            Err(format!("corrupted checkpoint: unsupported version {v}"))
-        }
-        _ => Err("corrupted checkpoint: missing required fields".to_string()),
+        (Some(v), ..) if v != CHECKPOINT_VERSION => Err(EngineError::fatal(format!(
+            "corrupted checkpoint: unsupported version {v}"
+        ))),
+        _ => Err(EngineError::fatal("corrupted checkpoint: missing required fields")),
     }
 }
 
@@ -367,7 +544,13 @@ pub fn purge_job_state(output_dir: &str, job_id: &str) -> bool {
     let tiledata_gone = fs::remove_file(tile_data_tmp_path(output_dir, job_id)).is_ok();
     let archive_tmp_gone =
         fs::remove_file(archive_path(output_dir, job_id).with_extension("pmtiles.tmp")).is_ok();
-    checkpoint_gone || index_gone || tiledata_gone || archive_tmp_gone
+    // NOTE: `{job_id}.lock` is intentionally NOT purged — see `lock_path`.
+    let purged = checkpoint_gone || index_gone || tiledata_gone || archive_tmp_gone;
+    info!(
+        "job {job_id}: purged temporary state (checkpoint={checkpoint_gone}, \
+         index={index_gone}, tiledata={tiledata_gone}, archive_tmp={archive_tmp_gone})"
+    );
+    purged
 }
 
 // ---------------------------------------------------------------------------
@@ -381,42 +564,119 @@ pub fn run_slice(
     budget: Duration,
     on_progress: &mut dyn FnMut(f32, String),
 ) -> SliceOutcome {
-    // Output dir must exist (checkpoints + index live there).
+    // Output dir must exist (checkpoints + index + lock live there).
+    // Classified: ENOSPC here is retryable; ENOTDIR/EACCES etc. are not.
     if let Err(e) = fs::create_dir_all(&job.output_dir) {
-        return SliceOutcome::Failed(format!(
-            "cannot create output dir '{}': {e}",
-            job.output_dir
-        ));
+        return EngineError::io(
+            format!("cannot create output dir '{}'", job.output_dir),
+            &e,
+        )
+        .into_outcome(&job.job_id);
     }
 
+    // ── Advisory slice lock ─────────────────────────────────────────────
+    // Exactly one runner may execute slices for a job at a time. Without
+    // this, two runners (foreground plugin loop + background worker, or an
+    // orphaned loop after a WebView reload) interleave writes to the SAME
+    // `.checkpoint.tmp` path and can publish a torn checkpoint via rename —
+    // manufacturing the one corruption class the atomic-write discipline
+    // exists to prevent. flock is advisory but every runner enters through
+    // this function, and the kernel releases it on process death, so a
+    // crash can never wedge the job. Held (`_slice_lock`) until this
+    // function returns — every early return below drops it.
+    let lock_path = lock_path(&job.output_dir, &job.job_id);
+    let lock_file = match fs::File::create(&lock_path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Classified like any other I/O: ENOSPC → transient, the rest
+            // (EACCES, EROFS, …) fatal — they won't clear on retry.
+            return EngineError::io(
+                format!("cannot open slice lock '{}'", lock_path.display()),
+                &e,
+            )
+            .into_outcome(&job.job_id);
+        }
+    };
+    if let Err(e) = lock_file.try_lock_exclusive() {
+        warn!(
+            "job {}: slice lock '{}' is held by another runner — refusing to run concurrently ({e})",
+            job.job_id,
+            lock_path.display()
+        );
+        return SliceOutcome::FailedTransient(format!(
+            "job '{}' is locked by another runner (slice already in progress): {e}",
+            job.job_id
+        ));
+    }
+    info!("job {}: acquired exclusive slice lock '{}'", job.job_id, lock_path.display());
+    let _slice_lock = lock_file;
+
     let plan = phase_plan(job);
+    let fingerprint = spec_fingerprint(job);
 
     // Resume or fresh start. Corrupted state is fatal, never silently reset.
-    let mut cp = match load_checkpoint(&job.output_dir, &job.job_id) {
-        Ok(Some(cp)) => {
-            // A checkpoint for a phase not in this job's plan (e.g. Terrain
-            // checkpoint but the job now has no DEM) means the job definition
-            // changed under us — refuse rather than guess.
+    let loaded = match load_checkpoint(&job.output_dir, &job.job_id) {
+        Ok(v) => v,
+        Err(e) => return e.into_outcome(&job.job_id),
+    };
+
+    // Spec-fingerprint check (P9.C6): a checkpoint whose fingerprint
+    // differs belongs to a DIFFERENT job that reused this jobId — its redb
+    // index holds another region's nodes/ways, and resuming would blend
+    // the two into a chimera archive. Recovery path (operator-directed):
+    // refuse to resume, purge ALL stale temporary state, restart fresh in
+    // this same slice — never brick the job.
+    let loaded = match loaded {
+        Some(cp) if cp.spec_hash != fingerprint => {
+            warn!(
+                "job {}: checkpoint spec fingerprint MISMATCH (checkpoint={:#018x}, job={:#018x}) — \
+                 jobId was reused for a different region/spec. Purging stale checkpoint + index + \
+                 tmp artifacts and restarting FRESH (refusing to resume)",
+                job.job_id, cp.spec_hash, fingerprint
+            );
+            purge_job_state(&job.output_dir, &job.job_id);
+            None
+        }
+        other => other,
+    };
+
+    let mut cp = match loaded {
+        Some(cp) => {
+            // A checkpoint for a phase not in this job's plan, despite a
+            // MATCHING fingerprint, is genuine corruption (the fingerprint
+            // covers dem_path, so a legitimate spec change lands in the
+            // purge-and-restart path above) — refuse rather than guess.
             if !plan.contains(&cp.phase) {
-                return SliceOutcome::Failed(format!(
+                error!(
+                    "job {}: checkpoint phase '{}' not in this job's plan — refusing to resume",
+                    job.job_id, cp.phase
+                );
+                return SliceOutcome::FailedFatal(format!(
                     "corrupted checkpoint: phase '{}' not in this job's plan (job definition changed?)",
                     cp.phase
                 ));
             }
+            info!(
+                "job {}: resuming from durable checkpoint (phase={}, next_block={}, blocks_done={})",
+                job.job_id, cp.phase, cp.next_block, cp.blocks_done
+            );
             cp
         }
-        Ok(None) => Checkpoint {
-            job_id: job.job_id.clone(),
-            phase: plan[0],
-            next_block: 0,
-            pbf_byte_offset: 0,
-            pass2_byte_offset: 0,
-            pass3_last_way_id: 0,
-            pass5_last_tile: 0,
-            bytes_written: 0,
-            blocks_done: 0,
-        },
-        Err(e) => return SliceOutcome::Failed(e),
+        None => {
+            info!("job {}: no checkpoint on disk — fresh start (phase={})", job.job_id, plan[0]);
+            Checkpoint {
+                job_id: job.job_id.clone(),
+                spec_hash: fingerprint,
+                phase: plan[0],
+                next_block: 0,
+                pbf_byte_offset: 0,
+                pass2_byte_offset: 0,
+                pass3_last_way_id: 0,
+                pass5_last_tile: 0,
+                bytes_written: 0,
+                blocks_done: 0,
+            }
+        }
     };
 
     // Every deadline check below routes through the thermal governor
@@ -439,16 +699,16 @@ pub fn run_slice(
             Phase::Pass1Nodes => {
                 let pbf = match pbf::PbfMmap::open(Path::new(&job.pbf_path)) {
                     Ok(m) => m,
-                    Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass1: {e}")),
                 };
                 let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
                     Ok(db) => db,
-                    Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass1: {e}")),
                 };
                 let resume_offset = match usize::try_from(cp.pbf_byte_offset) {
                     Ok(o) => o,
                     Err(_) => {
-                        return SliceOutcome::Failed(format!(
+                        return SliceOutcome::FailedFatal(format!(
                             "corrupted checkpoint: pbf_byte_offset {} exceeds address space",
                             cp.pbf_byte_offset
                         ));
@@ -459,7 +719,7 @@ pub fn run_slice(
                     governor.should_yield()
                 }) {
                     Ok(s) => s,
-                    Err(e) => return SliceOutcome::Failed(format!("pass1: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass1: {e}")),
                 };
 
                 cp.pbf_byte_offset = sub.next_offset as u64;
@@ -482,7 +742,7 @@ pub fn run_slice(
                 if !sub.finished {
                     return match save_checkpoint(&job.output_dir, &cp) {
                         Ok(()) => SliceOutcome::Yielded(cp),
-                        Err(e) => SliceOutcome::Failed(e),
+                        Err(e) => e.into_outcome(&job.job_id),
                     };
                 }
                 cp.next_block = 0; // phase complete; next phase starts fresh
@@ -491,16 +751,16 @@ pub fn run_slice(
             Phase::Pass2Ways => {
                 let pbf = match pbf::PbfMmap::open(Path::new(&job.pbf_path)) {
                     Ok(m) => m,
-                    Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass2: {e}")),
                 };
                 let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
                     Ok(db) => db,
-                    Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass2: {e}")),
                 };
                 let resume_offset = match usize::try_from(cp.pass2_byte_offset) {
                     Ok(o) => o,
                     Err(_) => {
-                        return SliceOutcome::Failed(format!(
+                        return SliceOutcome::FailedFatal(format!(
                             "corrupted checkpoint: pass2_byte_offset {} exceeds address space",
                             cp.pass2_byte_offset
                         ));
@@ -511,7 +771,7 @@ pub fn run_slice(
                     governor.should_yield()
                 }) {
                     Ok(s) => s,
-                    Err(e) => return SliceOutcome::Failed(format!("pass2: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass2: {e}")),
                 };
 
                 cp.pass2_byte_offset = sub.next_offset as u64;
@@ -534,7 +794,7 @@ pub fn run_slice(
                 if !sub.finished {
                     return match save_checkpoint(&job.output_dir, &cp) {
                         Ok(()) => SliceOutcome::Yielded(cp),
-                        Err(e) => SliceOutcome::Failed(e),
+                        Err(e) => e.into_outcome(&job.job_id),
                     };
                 }
                 cp.next_block = 0;
@@ -543,14 +803,14 @@ pub fn run_slice(
             Phase::Pass3Tiles => {
                 let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
                     Ok(db) => db,
-                    Err(e) => return SliceOutcome::Failed(format!("pass3: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass3: {e}")),
                 };
 
                 let sub = match pbf::run_pass3_slice(&db, cp.pass3_last_way_id, &mut || {
                     governor.should_yield()
                 }) {
                     Ok(s) => s,
-                    Err(e) => return SliceOutcome::Failed(format!("pass3: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass3: {e}")),
                 };
 
                 cp.pass3_last_way_id = sub.last_way_id;
@@ -563,7 +823,7 @@ pub fn run_slice(
                 // complete by the time this phase runs, so it's stable).
                 let total_ways = match pbf::way_count(&db) {
                     Ok(n) => n,
-                    Err(e) => return SliceOutcome::Failed(format!("pass3: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("pass3: {e}")),
                 };
                 let frac = if total_ways == 0 {
                     1.0
@@ -579,7 +839,7 @@ pub fn run_slice(
                 if !sub.finished {
                     return match save_checkpoint(&job.output_dir, &cp) {
                         Ok(()) => SliceOutcome::Yielded(cp),
-                        Err(e) => SliceOutcome::Failed(e),
+                        Err(e) => e.into_outcome(&job.job_id),
                     };
                 }
                 cp.next_block = 0;
@@ -588,15 +848,17 @@ pub fn run_slice(
             Phase::Finalize => {
                 let db = match pbf::open_coord_db(&index_db_path(&job.output_dir, &job.job_id)) {
                     Ok(db) => db,
-                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                    Err(e) => return SliceOutcome::FailedFatal(format!("finalize: {e}")),
                 };
                 let data_path = tile_data_tmp_path(&job.output_dir, &job.job_id);
                 let total_rows = match tiles::tile_feature_row_count(&db) {
                     Ok(n) => n,
-                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                    Err(e) => return classify_finalize(e).into_outcome(&job.job_id),
                 };
 
                 // Stage 1: budget-yieldable MVT encode of every tile.
+                // I/O failures here are errno-classified (classify_finalize):
+                // ENOSPC/EIO during the payload appends surface as transient.
                 let sub = match tiles::run_finalize_encode_slice(
                     &db,
                     &data_path,
@@ -604,7 +866,7 @@ pub fn run_slice(
                     &mut || governor.should_yield(),
                 ) {
                     Ok(s) => s,
-                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                    Err(e) => return classify_finalize(e).into_outcome(&job.job_id),
                 };
 
                 cp.pass5_last_tile = sub.last_tile_id;
@@ -633,7 +895,7 @@ pub fn run_slice(
                 if !sub.finished {
                     return match save_checkpoint(&job.output_dir, &cp) {
                         Ok(()) => SliceOutcome::Yielded(cp),
-                        Err(e) => SliceOutcome::Failed(e),
+                        Err(e) => e.into_outcome(&job.job_id),
                     };
                 }
                 // Encode complete. Assembly is one atomic, idempotent block;
@@ -643,7 +905,7 @@ pub fn run_slice(
                 if slice_blocks > 0 && governor.should_yield() {
                     return match save_checkpoint(&job.output_dir, &cp) {
                         Ok(()) => SliceOutcome::Yielded(cp),
-                        Err(e) => SliceOutcome::Failed(e),
+                        Err(e) => e.into_outcome(&job.job_id),
                     };
                 }
 
@@ -653,7 +915,7 @@ pub fn run_slice(
                 let out_path = archive_path(&job.output_dir, &job.job_id);
                 let info = match tiles::assemble_archive(&db, &data_path, &out_path, bounds) {
                     Ok(i) => i,
-                    Err(e) => return SliceOutcome::Failed(format!("finalize: {e}")),
+                    Err(e) => return classify_finalize(e).into_outcome(&job.job_id),
                 };
 
                 // Encode already accounted the data section (payload
@@ -683,7 +945,7 @@ pub fn run_slice(
                     if slice_blocks > 0 && governor.should_yield() {
                         return match save_checkpoint(&job.output_dir, &cp) {
                             Ok(()) => SliceOutcome::Yielded(cp),
-                            Err(e) => SliceOutcome::Failed(e),
+                            Err(e) => e.into_outcome(&job.job_id),
                         };
                     }
                     process_sim_block(&mut cp);
@@ -702,6 +964,10 @@ pub fn run_slice(
 
     // All phases complete: purge temporary state (checkpoint + index), report.
     purge_job_state(&job.output_dir, &job.job_id);
+    info!(
+        "job {}: FINISHED ({} blocks, {} bytes written)",
+        job.job_id, cp.blocks_done, cp.bytes_written
+    );
     SliceOutcome::Finished(RunSummary {
         job_id: job.job_id.clone(),
         blocks_total: cp.blocks_done,
@@ -1024,7 +1290,7 @@ mod tests {
                     sliced = Some(s);
                     break;
                 }
-                SliceOutcome::Failed(e) => panic!("failed mid-slices: {e}"),
+                SliceOutcome::FailedFatal(e) | SliceOutcome::FailedTransient(e) => panic!("failed mid-slices: {e}"),
             }
         }
         let sliced = sliced.expect("job did not finish within 1000 slices");
@@ -1053,7 +1319,7 @@ mod tests {
         let mut job = test_job(&dir, true);
         job.pbf_path = dir.join("does-not-exist.osm.pbf").display().to_string();
         match run_slice(&job, BIG, &mut |_, _| {}) {
-            SliceOutcome::Failed(reason) => {
+            SliceOutcome::FailedFatal(reason) => {
                 assert!(reason.starts_with("pass1:"), "got: {reason}")
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -1066,7 +1332,7 @@ mod tests {
         let job = test_job(&dir, true);
         fs::write(&job.pbf_path, b"<!DOCTYPE html><html>not a pbf</html>").unwrap();
         match run_slice(&job, BIG, &mut |_, _| {}) {
-            SliceOutcome::Failed(reason) => {
+            SliceOutcome::FailedFatal(reason) => {
                 assert!(reason.contains("corrupted PBF"), "got: {reason}")
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -1083,7 +1349,7 @@ mod tests {
         )
         .unwrap();
         match run_slice(&job, BIG, &mut |_, _| {}) {
-            SliceOutcome::Failed(reason) => {
+            SliceOutcome::FailedFatal(reason) => {
                 assert!(reason.contains("corrupted checkpoint"), "got: {reason}")
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -1155,7 +1421,7 @@ mod tests {
                     assert!((last - 100.0).abs() < 0.01, "final pct = {last}");
                     return;
                 }
-                SliceOutcome::Failed(e) => panic!("{e}"),
+                SliceOutcome::FailedFatal(e) | SliceOutcome::FailedTransient(e) => panic!("{e}"),
             }
         }
         panic!("did not finish");
@@ -1180,7 +1446,7 @@ mod tests {
             match run_slice(&job, budget, &mut |_, _| {}) {
                 SliceOutcome::Yielded(_) => slices += 1,
                 SliceOutcome::Finished(s) => break s,
-                SliceOutcome::Failed(e) => panic!("failed after {slices} slices: {e}"),
+                SliceOutcome::FailedFatal(e) | SliceOutcome::FailedTransient(e) => panic!("failed after {slices} slices: {e}"),
             }
             assert!(slices < 10_000, "runaway");
         };
@@ -1287,7 +1553,7 @@ mod tests {
                     assert!(archive_path(&job.output_dir, &job.job_id).exists());
                     return;
                 }
-                SliceOutcome::Failed(e) => panic!("{e}"),
+                SliceOutcome::FailedFatal(e) | SliceOutcome::FailedTransient(e) => panic!("{e}"),
             }
         }
         panic!("did not finish");
@@ -1301,8 +1567,204 @@ mod tests {
         fs::write(&blocker, b"x").unwrap();
         job.output_dir = blocker.join("sub").to_string_lossy().into_owned();
         match run_slice(&job, BIG, &mut |_, _| {}) {
-            SliceOutcome::Failed(reason) => assert!(reason.contains("output dir"), "got: {reason}"),
+            SliceOutcome::FailedFatal(reason) => assert!(reason.contains("output dir"), "got: {reason}"),
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    // ── Slice-lock + durability tests ───────────────────────────────────
+    // Real filesystem throughout (tempfile::tempdir + std::fs): these
+    // verify atomic/locking guarantees, which mocking would vacate.
+
+    /// A second runner attempting a slice while another THREAD physically
+    /// holds the advisory lock must receive `FailedTransient` — and the
+    /// same invocation must proceed normally once the holder lets go.
+    #[test]
+    fn concurrent_runner_gets_failed_transient_while_lock_held() {
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let job = test_job(tmp.path(), true);
+        let lock_file_path = tmp.path().join(format!("{}.lock", job.job_id));
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let holder = {
+            let lock_file_path = lock_file_path.clone();
+            std::thread::spawn(move || {
+                let f = fs::File::create(&lock_file_path).unwrap();
+                f.try_lock_exclusive()
+                    .expect("holder must win the uncontended lock");
+                locked_tx.send(()).unwrap();
+                // Physically hold the flock while the main thread contends.
+                std::thread::sleep(Duration::from_millis(1_000));
+                drop(f); // flock released here
+            })
+        };
+
+        locked_rx.recv().unwrap();
+        match run_slice(&job, BIG, &mut |_, _| {}) {
+            SliceOutcome::FailedTransient(reason) => {
+                assert!(
+                    reason.contains("locked by another runner"),
+                    "transient reason must name the contention: {reason}"
+                );
+            }
+            other => panic!("expected FailedTransient while lock held, got {other:?}"),
+        }
+        // Contention must not have touched durable state: no checkpoint yet.
+        assert!(
+            load_checkpoint(&job.output_dir, &job.job_id)
+                .unwrap()
+                .is_none(),
+            "a lock-refused slice must leave no state behind"
+        );
+
+        holder.join().unwrap();
+        // Holder gone — the identical invocation now runs.
+        match run_slice(&job, TINY, &mut |_, _| {}) {
+            SliceOutcome::Yielded(_) | SliceOutcome::Finished(_) => {}
+            other => panic!("expected the job to run after release, got {other:?}"),
+        }
+    }
+
+    /// Safety logic: the lock drops with the slice's scope — after
+    /// run_slice returns, an exclusive lock on the same file succeeds
+    /// immediately (this is also what lets sequential slices on one thread
+    /// re-acquire every time).
+    #[test]
+    fn slice_lock_is_released_when_run_slice_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let job = test_job(tmp.path(), true);
+        let SliceOutcome::Yielded(_) = run_slice(&job, TINY, &mut |_, _| {}) else {
+            panic!("expected yield");
+        };
+        let f = fs::File::open(tmp.path().join(format!("{}.lock", job.job_id))).unwrap();
+        f.try_lock_exclusive()
+            .expect("lock must be free once run_slice has returned");
+    }
+
+    /// The full checkpoint save path — write, fsync, rename, parent-dir
+    /// fsync — against a real directory: a successful save leaves exactly
+    /// the final file (no `.tmp` straggler) and an overwrite reloads as
+    /// the LAST durable state.
+    #[test]
+    fn checkpoint_save_is_atomic_reloadable_and_leaves_no_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().into_owned();
+        let mut cp = Checkpoint {
+            job_id: "rider-job".into(),
+            spec_hash: 0xDEAD_BEEF,
+            phase: Phase::Pass1Nodes,
+            next_block: 3,
+            pbf_byte_offset: 4_096,
+            pass2_byte_offset: 0,
+            pass3_last_way_id: 0,
+            pass5_last_tile: 0,
+            bytes_written: 72,
+            blocks_done: 3,
+        };
+        save_checkpoint(&dir, &cp).unwrap();
+        // Overwrite with newer state — the rename must replace atomically.
+        cp.next_block = 9;
+        cp.bytes_written = 1_024;
+        save_checkpoint(&dir, &cp).unwrap();
+
+        assert!(
+            !tmp.path().join("rider-job.checkpoint.tmp").exists(),
+            "tmp file must not survive a successful save"
+        );
+        let reloaded = load_checkpoint(&dir, "rider-job").unwrap().unwrap();
+        assert_eq!(reloaded, cp, "reload must reflect the last durable save");
+    }
+
+    /// P9.C6 (closes D006): a checkpoint whose spec fingerprint doesn't
+    /// match the incoming JobSpec is never resumed AND never bricks the
+    /// job — stale state is purged and the job restarts fresh in the same
+    /// slice, then resumes normally under the new spec.
+    #[test]
+    fn spec_change_purges_stale_state_and_restarts_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut job = test_job(tmp.path(), true);
+        let SliceOutcome::Yielded(cp1) = run_slice(&job, Duration::ZERO, &mut |_, _| {}) else {
+            panic!("expected first yield");
+        };
+        assert_eq!(cp1.blocks_done, 1);
+        assert_eq!(cp1.spec_hash, spec_fingerprint(&job));
+
+        // Same jobId + output_dir, different region: the resume must be
+        // refused, stale state purged, and the job restarted fresh.
+        job.bbox = BBox::parse("11.20,47.10,11.70,47.50").unwrap();
+        let SliceOutcome::Yielded(cp2) = run_slice(&job, Duration::ZERO, &mut |_, _| {}) else {
+            panic!("expected fresh-restart yield, not a failure");
+        };
+        assert_eq!(cp2.blocks_done, 1, "fresh restart, not a resume");
+        assert_eq!(cp2.phase, Phase::Pass1Nodes);
+        assert_eq!(cp2.spec_hash, spec_fingerprint(&job), "new fingerprint adopted");
+
+        // And the NEXT slice under the new spec resumes normally.
+        let SliceOutcome::Yielded(cp3) = run_slice(&job, Duration::ZERO, &mut |_, _| {}) else {
+            panic!("expected resumed yield");
+        };
+        assert_eq!(cp3.blocks_done, 2, "same-spec resume continues");
+    }
+
+    /// The directory-fsync primitive works on a real directory handle.
+    #[test]
+    fn fsync_dir_succeeds_on_a_real_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        fsync_dir(tmp.path()).unwrap();
+    }
+
+    /// Errno classification: ENOSPC and EIO — real io::Error values built
+    /// from raw errnos, not mocks — are transient; everything else fatal.
+    #[test]
+    fn io_classifier_maps_enospc_and_eio_transient_rest_fatal() {
+        assert!(is_transient_io(&std::io::Error::from_raw_os_error(28))); // ENOSPC
+        assert!(is_transient_io(&std::io::Error::from_raw_os_error(5))); // EIO
+        assert!(!is_transient_io(&std::io::Error::from_raw_os_error(13))); // EACCES
+        assert!(!is_transient_io(&std::io::Error::from_raw_os_error(30))); // EROFS
+        assert!(!is_transient_io(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gone"
+        )));
+    }
+
+    /// Finalize-stage mapping: an ENOSPC io::Error inside FinalizeError::Io
+    /// classifies transient; a redb-style Index error ("All roots
+    /// corrupted") stays fatal with the reason preserved.
+    #[test]
+    fn finalize_error_mapping_follows_errno_classification() {
+        let t = classify_finalize(tiles::FinalizeError::Io(std::io::Error::from_raw_os_error(28)));
+        assert!(t.transient, "{t:?}");
+        let f = classify_finalize(tiles::FinalizeError::Index("All roots corrupted".into()));
+        assert!(!f.transient, "{f:?}");
+        assert!(f.reason.contains("All roots corrupted"));
+    }
+
+    /// End-to-end classification through run_slice on a REAL filesystem
+    /// failure: a read-only output dir produces EACCES at the lock create —
+    /// a condition that does NOT clear on retry and must surface as
+    /// FailedFatal, never FailedTransient.
+    #[cfg(unix)]
+    #[test]
+    fn real_eacces_write_failure_is_fatal_not_transient() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("jobdir");
+        fs::create_dir_all(&out).unwrap();
+        let mut job = test_job(tmp.path(), true);
+        job.output_dir = out.to_string_lossy().into_owned();
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = run_slice(&job, BIG, &mut |_, _| {});
+        // Restore before asserting so tempdir cleanup works either way.
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o755)).unwrap();
+        match outcome {
+            SliceOutcome::FailedFatal(reason) => assert!(
+                reason.contains("slice lock"),
+                "EACCES must surface at the lock create: {reason}"
+            ),
+            other => panic!("expected FailedFatal on EACCES, got {other:?}"),
         }
     }
 }

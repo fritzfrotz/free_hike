@@ -1,6 +1,7 @@
 import BackgroundTasks
 import Foundation
 import Capacitor
+// DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
 
 /// Layer 2 of the tri-layer bridge — Surface v1 (suspendable state machine).
 ///
@@ -152,13 +153,27 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
                         "bytesWritten": Int(summary.bytesWritten),
                     ])
                     return
-                case .failed(let reason):
+                case .failedFatal(let reason):
                     self.emitStatus("failed", jobId: jobId, slices: slices)
                     call.resolve([
                         "status": "failed",
                         "jobId": jobId,
                         "slices": slices,
                         "reason": reason,
+                        "transient": false,
+                    ])
+                    return
+                case .failedTransient(let reason):
+                    // Another runner holds the job's slice lock; durable
+                    // state untouched — surface as retryable, don't loop.
+                    CAPLog.print("⚡️ MapCompiler job \(jobId) transient refusal: \(reason)")
+                    self.emitStatus("failed", jobId: jobId, slices: slices)
+                    call.resolve([
+                        "status": "failed",
+                        "jobId": jobId,
+                        "slices": slices,
+                        "reason": reason,
+                        "transient": true,
                     ])
                     return
                 }
@@ -530,10 +545,10 @@ final class BackgroundCompileScheduler {
                     ])
                     task.setTaskCompleted(success: true)
                     return
-                case .failed(let reason):
+                case .failedFatal(let reason):
                     // Fatal per the Surface v1 contract (bad input, corrupt
-                    // state, disk). Do NOT reschedule — retrying a fatal
-                    // failure on a charger overnight is a battery/flash burn.
+                    // state). Do NOT reschedule — retrying a fatal failure
+                    // on a charger overnight is a battery/flash burn.
                     PendingJobStore.markFailed(pending, reason: reason)
                     MapCompilerPlugin.emitBackgroundEvent([
                         "state": "failed",
@@ -542,12 +557,21 @@ final class BackgroundCompileScheduler {
                     ])
                     task.setTaskCompleted(success: false)
                     return
+                case .failedTransient(let reason):
+                    // Another runner holds the job's slice lock. Durable
+                    // state is untouched: keep the record pending, hand the
+                    // window back, and let a later window retry.
+                    CAPLog.print("⚡️ BG compile transient refusal after \(slices) slices: \(reason)")
+                    self.scheduleIfPending()
+                    task.setTaskCompleted(success: false)
+                    return
                 }
             }
         }
     }
 }
 
+// DEBT(D005): iOS background shell lacks Android hardening parity: circuit breaker, single-slot enqueue guard, targeted ack with archive deletion, hard cancel, CAS terminal transitions — platforms: ios
 /// Durable record of the one queued/terminal background job. Survives
 /// process death (BGProcessingTask fires in a fresh process) as JSON beside
 /// the engine's own state, atomic-rename on write. Single-job by design:

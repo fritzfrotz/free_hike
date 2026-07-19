@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "MVT tile encoding and PMTiles v3 archive writer with Hilbert tile IDs"
 
 [dependencies]
 pbf = { workspace = true }
@@ -11,3 +13,5 @@ geom = { workspace = true }
 redb = { workspace = true }
 prost = { workspace = true }
 flate2 = { workspace = true }
+# Lifecycle tracing for finalize/assembly durability events.
+log = { workspace = true }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `terrain-tile` — dev CLI for P6.C1–C3: cut Terrain-RGB WebP tiles from a
 //! DEM GeoTIFF, or assemble the full pyramid archive.
 //!

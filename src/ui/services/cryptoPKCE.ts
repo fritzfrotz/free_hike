@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * cryptoPKCE.ts
  *
@@ -13,12 +14,12 @@
  * it the correct storage primitive for the code_verifier bridge.
  *
  * Keys used in sessionStorage:
- *   antigravity_pkce_verifier  – the raw unhashed code_verifier string
- *   antigravity_pkce_state     – the CSRF state nonce
+ *   freehike_pkce_verifier  – the raw unhashed code_verifier string
+ *   freehike_pkce_state     – the CSRF state nonce
  */
 
-const VERIFIER_SESSION_KEY = 'antigravity_pkce_verifier';
-const STATE_SESSION_KEY    = 'antigravity_pkce_state';
+const VERIFIER_SESSION_KEY = 'freehike_pkce_verifier';
+const STATE_SESSION_KEY    = 'freehike_pkce_state';
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 

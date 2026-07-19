@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * MapCompiler — JS-side interface to the Layer 2 Capacitor native plugin
  * (MapCompilerPlugin.swift / MapCompilerPlugin.kt), which wraps the UniFFI
@@ -147,12 +148,23 @@ export interface MapCompilerPlugin {
   queryBackgroundJob(): Promise<BackgroundJobQueryResult>;
 
   /**
-   * Releases a terminal (finished/failed) record — and with it the native
-   * temporary archive's claim — once the JS layer has durably imported the
-   * archive into OPFS (writable closed + byte-count verified) or surfaced
-   * the failure. Rejects if the record is still 'pending'.
+   * Releases a terminal (finished/failed) record — deleting the sandbox
+   * archive and purging leftover job state — once the JS layer has durably
+   * imported the archive into OPFS (writable closed + byte-count verified)
+   * or surfaced the failure. Targeted: rejects if `jobId` doesn't match the
+   * stored record (stale ack) or if the record is still 'pending'. Resolves
+   * `{ cleared: false }` when the store is already empty (idempotent retry).
    */
   acknowledgeBackgroundJob(options: { jobId: string }): Promise<{ cleared: boolean }>;
+
+  /**
+   * Hard-cancels the queued/running background job: stops the WorkManager
+   * chain, clears the durable record, and wipes the job's disk footprint
+   * (checkpoint, redb index, scratch files, any assembled archive). The
+   * running slice stops at its next boundary (≤ a few seconds). Rejects if
+   * the stored record is terminal — acknowledge that instead.
+   */
+  cancelBackgroundJob(): Promise<{ cancelled: boolean; jobId?: string }>;
 
   /** Smoke test: proves the Rust core is linked and callable. */
   getEngineVersion(): Promise<{ version: string }>;

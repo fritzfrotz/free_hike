@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * regionCompiler.ts — the one entry point for queuing a background region
  * compile (P9.C2/C3).

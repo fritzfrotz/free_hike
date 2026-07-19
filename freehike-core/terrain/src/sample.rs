@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Random-access elevation sampling over the windowed DEM reader.
 //!
 //! Bilinear interpolation needs the four pixel-center neighbours of an

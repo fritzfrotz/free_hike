@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Pass 3 — tile binning (Phase 4, P4.C2).
 //!
 //! Walks the [`WAYS`] table sequentially, materializes each way's Web

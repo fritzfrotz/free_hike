@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * mapData.worker.ts
  *
@@ -51,6 +52,7 @@ async function getHandle(filename: string): Promise<FileSystemSyncAccessHandle> 
 
   const root       = await navigator.storage.getDirectory();
   const fileHandle = await root.getFileHandle(filename, { create: true });
+  // BUG(B005): dev-env leaked OPFS lock, map 'load' never fires after reload while a previous worker still holds the SyncAccessHandle — severity: minor — repro: LOOPLOG P9.C2 notes
   const handle     = await fileHandle.createSyncAccessHandle();
   handles.set(filename, handle);
   console.log(`[mapData.worker] Opened SyncAccessHandle for "${filename}" (${handle.getSize()} bytes)`);

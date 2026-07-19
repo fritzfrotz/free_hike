@@ -1,11 +1,14 @@
 package com.freehike.app
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
+import java.io.File
 import uniffi.freehike.CompilationStatus
 import uniffi.freehike.CompileJob
 import uniffi.freehike.ProgressCallback
@@ -57,6 +60,7 @@ class MapCompilerPlugin : Plugin() {
         active = this
     }
 
+    // DEBT(D007): WebView reload orphans the foreground compile loop, handleOnDestroy neither cancels nor shuts down the executor (flock prevents corruption but the orphan burns CPU) — platforms: android
     override fun handleOnDestroy() {
         if (active === this) active = null
         super.handleOnDestroy()
@@ -162,7 +166,7 @@ class MapCompilerPlugin : Plugin() {
                             )
                             return@execute
                         }
-                        is CompilationStatus.Failed -> {
+                        is CompilationStatus.FailedFatal -> {
                             Log.e(TAG, "job $jobId failed after $slices slices: ${status.reason}")
                             emitStatus("failed", jobId, slices)
                             call.resolve(
@@ -171,6 +175,24 @@ class MapCompilerPlugin : Plugin() {
                                     .put("jobId", jobId)
                                     .put("slices", slices)
                                     .put("reason", status.reason)
+                                    .put("transient", false)
+                            )
+                            return@execute
+                        }
+                        is CompilationStatus.FailedTransient -> {
+                            // Another runner holds the job's slice lock (e.g.
+                            // a background window is mid-slice). Durable state
+                            // is untouched; surface it as a retryable failure
+                            // instead of looping against the lock.
+                            Log.w(TAG, "job $jobId transient refusal after $slices slices: ${status.reason}")
+                            emitStatus("failed", jobId, slices)
+                            call.resolve(
+                                JSObject()
+                                    .put("status", "failed")
+                                    .put("jobId", jobId)
+                                    .put("slices", slices)
+                                    .put("reason", status.reason)
+                                    .put("transient", true)
                             )
                             return@execute
                         }
@@ -184,6 +206,7 @@ class MapCompilerPlugin : Plugin() {
 
     /** Requests cancellation of the active job (honored between slices). */
     @PluginMethod
+    // BUG(B007): cancel aimed at the running job also cancels a queued job, cancelRequested is shared and reset at enqueue time — severity: minor — repro: startJob A, startJob B, cancelJob during A
     fun cancelJob(call: PluginCall) {
         cancelRequested.set(true)
         call.resolve(JSObject().put("requested", true))
@@ -259,6 +282,12 @@ class MapCompilerPlugin : Plugin() {
      * Queues a compile job for WorkManager execution: persists the job spec
      * durably (the worker may run in a fresh process with no WebView), then
      * enqueues the charging-constrained unique work request.
+     *
+     * Enforced single-slot invariant (P1-4): the store holds ONE record, so
+     * saving over an existing one would silently orphan a finished job's
+     * archive (or yank a pending job out from under its running worker).
+     * The authoritative check lives HERE, not in the JS layer — the JS
+     * `isBackgroundCompiling` guard only covers 'pending' and can be stale.
      */
     @PluginMethod
     fun enqueueBackgroundJob(call: PluginCall) {
@@ -276,24 +305,40 @@ class MapCompilerPlugin : Plugin() {
         val maxZoom = (call.getInt("maxZoom") ?: 14).coerceIn(0, 22)
         val jobsDir = context.filesDir.absolutePath + "/map_jobs"
 
-        PendingJobStore.save(
-            context,
-            PendingJobStore.Record(
-                state = PendingJobStore.STATE_PENDING,
-                jobId = jobId,
-                bbox = bbox,
-                minZoom = minZoom,
-                maxZoom = maxZoom,
-                pbfPath = "$jobsDir/raw/$jobId.osm.pbf",
-                demPath = "$jobsDir/raw/$jobId.dem.tif",
-                outputDir = jobsDir,
-                reason = null,
-                blocksTotal = 0,
-                bytesWritten = 0,
+        executor.execute {
+            val existing = PendingJobStore.loadAny(context)
+            if (existing != null) {
+                val remedy = if (existing.state == PendingJobStore.STATE_PENDING) {
+                    "cancel it (cancelBackgroundJob) first"
+                } else {
+                    "acknowledge it (acknowledgeBackgroundJob) first"
+                }
+                call.reject(
+                    "The single-job store already holds job '${existing.jobId}' " +
+                        "(${existing.state}) — $remedy."
+                )
+                return@execute
+            }
+
+            PendingJobStore.save(
+                context,
+                PendingJobStore.Record(
+                    state = PendingJobStore.STATE_PENDING,
+                    jobId = jobId,
+                    bbox = bbox,
+                    minZoom = minZoom,
+                    maxZoom = maxZoom,
+                    pbfPath = "$jobsDir/raw/$jobId.osm.pbf",
+                    demPath = "$jobsDir/raw/$jobId.dem.tif",
+                    outputDir = jobsDir,
+                    reason = null,
+                    blocksTotal = 0,
+                    bytesWritten = 0,
+                )
             )
-        )
-        BackgroundCompileWorker.enqueue(context)
-        call.resolve(JSObject().put("scheduled", true).put("jobId", jobId))
+            BackgroundCompileWorker.enqueue(context)
+            call.resolve(JSObject().put("scheduled", true).put("jobId", jobId))
+        }
     }
 
     /**
@@ -321,18 +366,113 @@ class MapCompilerPlugin : Plugin() {
 
     /**
      * Clears a terminal (finished/failed) record once the JS layer has
-     * imported the archive into OPFS (or shown the failure). A pending
-     * record is NOT clearable here — that is cancelJob + purge territory.
+     * imported the archive into OPFS (or shown the failure), and releases
+     * the job's disk claim: the sandbox archive (now redundant with the
+     * OPFS copy) plus any leftover checkpoint/index/scratch state.
+     *
+     * Targeted (P1-4): requires `jobId` and rejects on mismatch, so a stale
+     * acknowledge from a slow in-flight ingest can never clear a record it
+     * doesn't own. A pending record is NOT clearable here — that is
+     * cancelBackgroundJob territory.
      */
     @PluginMethod
     fun acknowledgeBackgroundJob(call: PluginCall) {
-        val record = PendingJobStore.loadAny(context)
-        if (record != null && record.state == PendingJobStore.STATE_PENDING) {
-            call.reject("Job ${record.jobId} is still pending; cancel it instead")
+        val jobId = call.getString("jobId")
+        if (jobId.isNullOrBlank()) {
+            call.reject("Missing required parameter: jobId")
             return
         }
-        PendingJobStore.clear(context)
-        call.resolve(JSObject().put("cleared", true))
+        executor.execute {
+            val record = PendingJobStore.loadAny(context)
+            when {
+                record == null -> {
+                    // Idempotent: an ack retried after a crash finds the slot
+                    // already empty. Not an error, but nothing was cleared.
+                    call.resolve(JSObject().put("cleared", false))
+                }
+                record.jobId != jobId -> {
+                    call.reject(
+                        "Stale acknowledge: store holds job '${record.jobId}', not '$jobId'"
+                    )
+                }
+                record.state == PendingJobStore.STATE_PENDING -> {
+                    call.reject("Job ${record.jobId} is still pending; cancel it instead")
+                }
+                else -> {
+                    // OPFS copy is verified-durable by the caller's contract
+                    // (writable closed + byte count checked) before this call,
+                    // so the sandbox archive is safe to release. purgeJob is a
+                    // no-op after a clean finish but sweeps the temp state a
+                    // failed job left behind.
+                    File(record.archivePath).delete()
+                    purgeJob(record.jobId, record.outputDir)
+                    PendingJobStore.clear(context)
+                    call.resolve(JSObject().put("cleared", true))
+                }
+            }
+        }
+    }
+
+    /**
+     * Hard cancellation of the background job (P1-6): stops the WorkManager
+     * chain, clears the durable record, and wipes the job's disk footprint
+     * (.checkpoint, .index.redb, .tiledata.tmp, .pmtiles.tmp via purgeJob,
+     * plus any assembled archive).
+     *
+     * Stop is slice-granular: an in-flight compileChunk cannot be
+     * interrupted and will fsync one final checkpoint when it yields. Two
+     * defenses cover that window: PendingJobStore's terminal transitions
+     * are compare-and-set on the pending record (a late markFinished/
+     * markFailed after clear() is a no-op), and a second purge sweep runs
+     * after STRAGGLER_WINDOW_MS to remove the late checkpoint file.
+     */
+    @PluginMethod
+    fun cancelBackgroundJob(call: PluginCall) {
+        executor.execute {
+            val record = PendingJobStore.loadAny(context)
+            if (record != null && record.state != PendingJobStore.STATE_PENDING) {
+                call.reject(
+                    "Job ${record.jobId} is ${record.state}; acknowledge it instead of cancelling"
+                )
+                return@execute
+            }
+
+            // Order matters: stop the chain, then clear the record (the CAS
+            // guard in PendingJobStore makes any still-running slice's
+            // terminal write a no-op from here on), then purge the files.
+            BackgroundCompileWorker.cancel(context)
+            PendingJobStore.clear(context)
+
+            val result = JSObject().put("cancelled", true)
+            if (record != null) {
+                purgeJob(record.jobId, record.outputDir)
+                File(record.archivePath).delete()
+                scheduleStragglerSweep(record.jobId, record.outputDir, record.archivePath)
+                result.put("jobId", record.jobId)
+                Log.i(TAG, "background job ${record.jobId} cancelled and purged")
+            } else {
+                Log.i(TAG, "background cancel requested with empty store; work chain stopped")
+            }
+            call.resolve(result)
+        }
+    }
+
+    /**
+     * Second purge pass after the in-flight slice window has certainly
+     * closed — the running slice may recreate `{jobId}.checkpoint` (its
+     * final durable yield) after the first purge. The Handler only
+     * dispatches; file I/O stays on the plugin's background lane.
+     */
+    private fun scheduleStragglerSweep(jobId: String, outputDir: String, archivePath: String) {
+        Handler(Looper.getMainLooper()).postDelayed({
+            executor.execute {
+                val sweptState = purgeJob(jobId, outputDir)
+                val sweptArchive = File(archivePath).delete()
+                if (sweptState || sweptArchive) {
+                    Log.i(TAG, "straggler sweep for $jobId removed late writes")
+                }
+            }
+        }, BackgroundCompileWorker.STRAGGLER_WINDOW_MS)
     }
 
     /** Adapts the UniFFI callback interface onto Capacitor's event emitter. */

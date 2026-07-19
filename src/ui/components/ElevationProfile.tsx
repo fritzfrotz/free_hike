@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { useRef, useCallback, useState } from 'react';
 import type { ElevationProfileSuccessPayload } from '../../shared/types';
 

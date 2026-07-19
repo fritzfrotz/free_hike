@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "UniFFI boundary exposing the FreeHike compiler to the Swift and Kotlin mobile shells"
 
 [lib]
 # The library name determines the native artifact names the mobile shells
@@ -16,6 +18,15 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [dependencies]
 uniffi = { workspace = true }
 compiler = { workspace = true }
+# Lifecycle tracing across the boundary (jobId-tagged logcat lines).
+log = { workspace = true }
+
+# The log-facade backend for the Android .so: routes `log` records to
+# logcat under the "freehike-core" tag. Initialized once per process at
+# the first exported-fn entry (see `ensure_logging`); other targets keep
+# the facade unbound (tests/hosts opt in themselves).
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
 
 [features]
 # Enables the `uniffi-bindgen` CLI binary used in Phase 1 to generate the

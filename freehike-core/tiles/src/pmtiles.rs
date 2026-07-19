@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! PMTiles v3 wire encoding: the 127-byte header and varint directories.
 //!
 //! Pure byte-level building blocks — no I/O, no database. The archive

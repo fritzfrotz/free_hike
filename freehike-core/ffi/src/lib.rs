@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `ffi` — the UniFFI boundary crate (Layer 3 of the tri-layer bridge).
 //!
 //! **Surface v1 — the production suspendable-state-machine contract.**
@@ -20,7 +21,11 @@
 //!   `compile_chunk` again with the **same `CompileJob`**; the engine reloads
 //!   its own checkpoint. The foreign layer never round-trips state, so it
 //!   can neither corrupt it nor lose it when iOS kills the process.
-//! - `Failed`    → fatal (corrupted checkpoint, bad input, disk error).
+//! - `FailedFatal`     → non-retryable (corrupted checkpoint/index, bad
+//!   input, non-clearing I/O like EACCES).
+//! - `FailedTransient` → the environment refused the slice (advisory slice
+//!   lock held by another runner, ENOSPC, EIO); durable state untouched —
+//!   back off and retry.
 //!
 //! Panic safety: UniFFI's generated scaffolding converts Rust panics into
 //! foreign-language errors via unwinding, which is why the workspace release
@@ -30,8 +35,27 @@ use std::time::Duration;
 
 use compiler::engine::{self, JobSpec, SliceOutcome};
 use compiler::{thermal, BBox};
+use log::{error, info, warn};
 
 uniffi::setup_scaffolding!("freehike");
+
+/// Binds the `log` facade to logcat (tag "freehike-core") once per process
+/// on Android, so every jobId-tagged lifecycle line from the core crates is
+/// greppable next to the Kotlin layer's own logs. Called at the entry of
+/// every exported function — the .so has no other guaranteed init hook.
+/// On non-Android targets this is a no-op: hosts (tests, CLIs) bind their
+/// own backend if they want the output.
+fn ensure_logging() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        #[cfg(target_os = "android")]
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Info)
+                .with_tag("freehike-core"),
+        );
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Records (plain data across the boundary — no references, no lifetimes)
@@ -113,6 +137,10 @@ impl From<engine::Phase> for CompilePhase {
 }
 
 /// Result of one execution slice.
+///
+/// Surface v1 revision (operator-directed hardening pass): the former
+/// `Failed` case is split by retryability so the shells can route failures
+/// to the right WorkManager/BGTask policy instead of guessing from strings.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum CompilationStatus {
     /// Compilation for the region is 100% complete; temporary caches purged.
@@ -120,8 +148,15 @@ pub enum CompilationStatus {
     /// The time budget expired; durable checkpoint written. Re-invoke
     /// `compile_chunk` with the same CompileJob to resume.
     Yielded { checkpoint: CheckpointState },
-    /// A fatal error occurred (e.g. disk full, corrupted payload).
-    Failed { reason: String },
+    /// A fatal error occurred (corrupted checkpoint, corrupted index, bad
+    /// input, non-clearing I/O like EACCES). Runners must NOT retry — the
+    /// same inputs fail the same way.
+    FailedFatal { reason: String },
+    /// The environment refused this slice: another runner holds the job's
+    /// slice lock, or an I/O operation hit a condition that can clear
+    /// (ENOSPC — disk full; EIO — transient device error). Durable state
+    /// is untouched; back off and retry later.
+    FailedTransient { reason: String },
 }
 
 /// Device thermal pressure, reported by the native shells so the compiler
@@ -201,7 +236,11 @@ fn to_job_spec(job: &CompileJob) -> Result<JobSpec, String> {
     if id.is_empty() {
         return Err("job_id must not be empty".to_string());
     }
-    if id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+    if id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err(format!(
             "invalid job_id {id:?}: only [A-Za-z0-9_-] allowed, max 128 chars"
         ));
@@ -223,44 +262,66 @@ fn to_job_spec(job: &CompileJob) -> Result<JobSpec, String> {
     })
 }
 
-fn to_status(outcome: SliceOutcome) -> CompilationStatus {
+fn to_status(job_id: &str, outcome: SliceOutcome) -> CompilationStatus {
     match outcome {
-        SliceOutcome::Finished(s) => CompilationStatus::Finished {
-            summary: CompileSummary {
-                job_id: s.job_id,
-                blocks_total: s.blocks_total,
-                bytes_written: s.bytes_written,
-            },
-        },
-        SliceOutcome::Yielded(cp) => CompilationStatus::Yielded {
-            checkpoint: CheckpointState {
-                job_id: cp.job_id,
-                phase: cp.phase.into(),
-                next_block: cp.next_block,
-                pbf_byte_offset: cp.pbf_byte_offset,
-                bytes_written: cp.bytes_written,
-            },
-        },
-        SliceOutcome::Failed(reason) => CompilationStatus::Failed { reason },
+        SliceOutcome::Finished(s) => {
+            info!("FFI compile_chunk({job_id}) -> Finished ({} blocks, {} bytes)", s.blocks_total, s.bytes_written);
+            CompilationStatus::Finished {
+                summary: CompileSummary {
+                    job_id: s.job_id,
+                    blocks_total: s.blocks_total,
+                    bytes_written: s.bytes_written,
+                },
+            }
+        }
+        SliceOutcome::Yielded(cp) => {
+            info!(
+                "FFI compile_chunk({job_id}) -> Yielded (phase={}, next_block={}, bytes_written={})",
+                cp.phase, cp.next_block, cp.bytes_written
+            );
+            CompilationStatus::Yielded {
+                checkpoint: CheckpointState {
+                    job_id: cp.job_id,
+                    phase: cp.phase.into(),
+                    next_block: cp.next_block,
+                    pbf_byte_offset: cp.pbf_byte_offset,
+                    bytes_written: cp.bytes_written,
+                },
+            }
+        }
+        SliceOutcome::FailedFatal(reason) => {
+            error!("FFI compile_chunk({job_id}) -> FailedFatal: {reason}");
+            CompilationStatus::FailedFatal { reason }
+        }
+        SliceOutcome::FailedTransient(reason) => {
+            warn!("FFI compile_chunk({job_id}) -> FailedTransient: {reason}");
+            CompilationStatus::FailedTransient { reason }
+        }
     }
 }
 
 /// Runs one budget-bounded slice of `job`. See module docs for the
-/// Finished / Yielded / Failed contract. Never throws: all failures are
-/// values, so foreign call sites need no try/catch ceremony.
+/// Finished / Yielded / FailedFatal / FailedTransient contract. Never
+/// throws: all failures are values, so foreign call sites need no
+/// try/catch ceremony.
 #[uniffi::export]
 pub fn compile_chunk(
     job: CompileJob,
     budget_ms: u32,
     callback: Box<dyn ProgressCallback>,
 ) -> CompilationStatus {
+    ensure_logging();
+    info!("FFI compile_chunk({}) entered (budget_ms={budget_ms})", job.job_id);
     let spec = match to_job_spec(&job) {
         Ok(s) => s,
-        Err(reason) => return CompilationStatus::Failed { reason },
+        Err(reason) => {
+            error!("FFI compile_chunk({}) rejected at spec validation: {reason}", job.job_id);
+            return CompilationStatus::FailedFatal { reason };
+        }
     };
     let budget = Duration::from_millis(u64::from(budget_ms));
     let mut on_progress = |pct: f32, status: String| callback.on_progress(pct, status);
-    to_status(engine::run_slice(&spec, budget, &mut on_progress))
+    to_status(&job.job_id, engine::run_slice(&spec, budget, &mut on_progress))
 }
 
 /// Cold-start resume detection: returns the durable checkpoint for a job if
@@ -269,15 +330,29 @@ pub fn compile_chunk(
 /// state (the next compile_chunk call surfaces the precise error).
 #[uniffi::export]
 pub fn query_checkpoint(job_id: String, output_dir: String) -> Option<CheckpointState> {
+    ensure_logging();
     match engine::load_checkpoint(&output_dir, &job_id) {
-        Ok(Some(cp)) => Some(CheckpointState {
-            job_id: cp.job_id,
-            phase: cp.phase.into(),
-            next_block: cp.next_block,
-            pbf_byte_offset: cp.pbf_byte_offset,
-            bytes_written: cp.bytes_written,
-        }),
-        _ => None,
+        Ok(Some(cp)) => {
+            info!(
+                "FFI query_checkpoint({job_id}) -> found (phase={}, next_block={})",
+                cp.phase, cp.next_block
+            );
+            Some(CheckpointState {
+                job_id: cp.job_id,
+                phase: cp.phase.into(),
+                next_block: cp.next_block,
+                pbf_byte_offset: cp.pbf_byte_offset,
+                bytes_written: cp.bytes_written,
+            })
+        }
+        Ok(None) => {
+            info!("FFI query_checkpoint({job_id}) -> none (fresh start)");
+            None
+        }
+        Err(e) => {
+            warn!("FFI query_checkpoint({job_id}) -> unreadable state ({e}); reporting none");
+            None
+        }
     }
 }
 
@@ -286,6 +361,8 @@ pub fn query_checkpoint(job_id: String, output_dir: String) -> Option<Checkpoint
 /// slices are budget-bounded, so the runner simply stops re-invoking.)
 #[uniffi::export]
 pub fn purge_job(job_id: String, output_dir: String) -> bool {
+    ensure_logging();
+    info!("FFI purge_job({job_id}) requested");
     engine::purge_job_state(&output_dir, &job_id)
 }
 
@@ -299,6 +376,8 @@ pub fn purge_job(job_id: String, output_dir: String) -> bool {
 /// state that was already elevated when the process woke).
 #[uniffi::export]
 pub fn set_thermal_state(state: ThermalState) {
+    ensure_logging();
+    info!("FFI set_thermal_state({state:?})");
     thermal::set_state(state.into());
 }
 
@@ -433,7 +512,7 @@ mod tests {
         let mut job = test_job("badbbox");
         job.bbox = "the alps".into();
         match compile_chunk(job, 300_000, Box::new(Recorder(Default::default()))) {
-            CompilationStatus::Failed { reason } => {
+            CompilationStatus::FailedFatal { reason } => {
                 assert!(reason.contains("invalid bbox"), "got: {reason}")
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -456,7 +535,7 @@ mod tests {
             let mut job = test_job("traversal");
             job.job_id = evil.to_string();
             match compile_chunk(job, 300_000, Box::new(Recorder(Default::default()))) {
-                CompilationStatus::Failed { reason } => {
+                CompilationStatus::FailedFatal { reason } => {
                     assert!(
                         reason.contains("job_id"),
                         "job_id {evil:?} rejected for the wrong reason: {reason}"
@@ -473,7 +552,7 @@ mod tests {
         job.min_zoom = 15;
         job.max_zoom = 5;
         match compile_chunk(job, 300_000, Box::new(Recorder(Default::default()))) {
-            CompilationStatus::Failed { reason } => {
+            CompilationStatus::FailedFatal { reason } => {
                 assert!(reason.contains("zoom"), "got: {reason}")
             }
             other => panic!("expected Failed, got {other:?}"),

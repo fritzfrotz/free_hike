@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import { useMapStore } from '../../store/mapStore';
 

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fast local feedback for the tracker pipeline; CI is the real enforcement.
+# Enable once per clone:  git config core.hooksPath .githooks
+node scripts/tracker-janitor.mjs --check

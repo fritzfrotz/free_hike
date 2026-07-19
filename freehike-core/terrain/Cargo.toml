@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Windowed GeoTIFF reads to Terrain-RGB WebP tiles and terrain PMTiles assembly"
 
 [dependencies]
 tiff = { workspace = true }

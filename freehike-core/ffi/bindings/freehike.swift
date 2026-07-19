@@ -897,6 +897,10 @@ public func FfiConverterTypeCompileSummary_lower(_ value: CompileSummary) -> Rus
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * Result of one execution slice.
+ *
+ * Surface v1 revision (operator-directed hardening pass): the former
+ * `Failed` case is split by retryability so the shells can route failures
+ * to the right WorkManager/BGTask policy instead of guessing from strings.
  */
 
 public enum CompilationStatus {
@@ -913,9 +917,19 @@ public enum CompilationStatus {
     case yielded(checkpoint: CheckpointState
     )
     /**
-     * A fatal error occurred (e.g. disk full, corrupted payload).
+     * A fatal error occurred (corrupted checkpoint, corrupted index, bad
+     * input, non-clearing I/O like EACCES). Runners must NOT retry — the
+     * same inputs fail the same way.
      */
-    case failed(reason: String
+    case failedFatal(reason: String
+    )
+    /**
+     * The environment refused this slice: another runner holds the job's
+     * slice lock, or an I/O operation hit a condition that can clear
+     * (ENOSPC — disk full; EIO — transient device error). Durable state
+     * is untouched; back off and retry later.
+     */
+    case failedTransient(reason: String
     )
 }
 
@@ -940,7 +954,10 @@ public struct FfiConverterTypeCompilationStatus: FfiConverterRustBuffer {
         case 2: return .yielded(checkpoint: try FfiConverterTypeCheckpointState.read(from: &buf)
         )
         
-        case 3: return .failed(reason: try FfiConverterString.read(from: &buf)
+        case 3: return .failedFatal(reason: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .failedTransient(reason: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -961,8 +978,13 @@ public struct FfiConverterTypeCompilationStatus: FfiConverterRustBuffer {
             FfiConverterTypeCheckpointState.write(checkpoint, into: &buf)
             
         
-        case let .failed(reason):
+        case let .failedFatal(reason):
             writeInt(&buf, Int32(3))
+            FfiConverterString.write(reason, into: &buf)
+            
+        
+        case let .failedTransient(reason):
+            writeInt(&buf, Int32(4))
             FfiConverterString.write(reason, into: &buf)
             
         }
@@ -1367,8 +1389,9 @@ fileprivate struct FfiConverterOptionTypeCheckpointState: FfiConverterRustBuffer
 }
 /**
  * Runs one budget-bounded slice of `job`. See module docs for the
- * Finished / Yielded / Failed contract. Never throws: all failures are
- * values, so foreign call sites need no try/catch ceremony.
+ * Finished / Yielded / FailedFatal / FailedTransient contract. Never
+ * throws: all failures are values, so foreign call sites need no
+ * try/catch ceremony.
  */
 public func compileChunk(job: CompileJob, budgetMs: UInt32, callback: ProgressCallback) -> CompilationStatus  {
     return try!  FfiConverterTypeCompilationStatus_lift(try! rustCall() {
@@ -1469,7 +1492,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_freehike_ffi_checksum_func_compile_chunk() != 52545) {
+    if (uniffi_freehike_ffi_checksum_func_compile_chunk() != 59234) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freehike_ffi_checksum_func_emit_test_progress() != 52095) {

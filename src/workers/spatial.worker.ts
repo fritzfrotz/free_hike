@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * spatial.worker.ts
  *
@@ -112,8 +113,19 @@ interface NearestResponsePayload {
 // Constants
 // ---------------------------------------------------------------------------
 
+// FreeHike's promise is 100% offline operation: no network calls after region
+// data is compiled on-device. The Overpass live-preview path below predates
+// the on-device compiler and is therefore OFF by default. It only activates
+// when a developer opts in at build time:
+//
+//   VITE_ONLINE_TRAIL_PREVIEW=true npm run dev
+//
+// Release builds must never set this flag.
+const ONLINE_TRAIL_PREVIEW: boolean =
+  import.meta.env?.VITE_ONLINE_TRAIL_PREVIEW === 'true';
+
 const OVERPASS_ENDPOINT = 'https://overpass-api.de/api/interpreter';
-const CLIENT_ID_HEADER = 'Antigravity-Hiking-App/1.0';
+const CLIENT_ID_HEADER = 'FreeHike/0.1.0';
 
 /** Overpass QL template. Placeholder `{BBOX}` is replaced at call time.     */
 const OVERPASS_QUERY_TPL = `
@@ -146,6 +158,17 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
   try {
     switch (type) {
       case 'TRAILS_FETCH_BOUNDS': {
+        if (!ONLINE_TRAIL_PREVIEW) {
+          reply(
+            id,
+            'ERROR',
+            null,
+            '[spatial.worker] Online trail preview is disabled: FreeHike is ' +
+              'offline-only. Rebuild with VITE_ONLINE_TRAIL_PREVIEW=true to ' +
+              'enable the Overpass developer preview.',
+          );
+          break;
+        }
         await handleFetchBounds(id, payload as FetchBoundsPayload);
         break;
       }

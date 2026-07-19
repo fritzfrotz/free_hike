@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { useEffect, useRef } from 'react';
 import { useCompilerStore } from '../../store/compilerStore';
 import { readHandoffProgress } from '../../services/handoffProgress';

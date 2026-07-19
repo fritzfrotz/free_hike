@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * handoffProgress.ts — imperative byte-progress bus for the background-job
  * OPFS ingestion (P9.C1).

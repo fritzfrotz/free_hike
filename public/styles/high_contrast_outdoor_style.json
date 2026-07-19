@@ -11,7 +11,8 @@
   "sources": {
     "basemap-local": {
       "type": "vector",
-      "url": "pmtiles://local/alps_basemap.pmtiles"
+      "url": "pmtiles://local/alps_basemap.pmtiles",
+      "attribution": "© OpenStreetMap contributors"
     },
     "terrain-local": {
       "type": "raster-dem",

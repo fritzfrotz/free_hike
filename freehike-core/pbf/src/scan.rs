@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Block scanner + Pass 1 (node extraction) over a memory-mapped PBF.
 //!
 //! Framing (per `fileformat.proto`): the file is a sequence of
@@ -15,6 +16,7 @@
 //! This is the same yield contract as `compiler::engine::run_slice`, which
 //! will drive this function from its Pass1Nodes phase.
 
+// DEBT(D002): node-POI extraction missing, peak names are node-tagged and invisible to the ways-only pipeline — platforms: core
 use prost::Message;
 
 use crate::proto::{Blob, BlobHeader, PrimitiveBlock, StringTable, StringTableProbe, WayBlock};

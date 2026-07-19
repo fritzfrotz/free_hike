@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `pbf` — out-of-core OSM node indexing (Phase 3).
 //!
 //! The pipeline must compile country-scale `.osm.pbf` extracts (multi-GB) on a
@@ -54,6 +55,7 @@ use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition, T
 // RAM budget
 // ---------------------------------------------------------------------------
 
+// DEBT(D003): RSS:anon CI gate missing (mem_gate.sh not yet written), Austria-scale on-device index run and iOS increased-memory entitlement pending — platforms: core
 /// The project-wide hard ceiling for compile-pipeline heap use.
 pub const RAM_CEILING_BYTES: usize = 50 * 1024 * 1024;
 

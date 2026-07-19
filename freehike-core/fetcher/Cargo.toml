@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Validated, resumable HTTPS fetching of raw OSM extracts and DEM GeoTIFFs (rustls-only, no OpenSSL)"
 
 [dependencies]
 # rustls-tls ONLY — never native-tls. Pure-Rust TLS cross-compiles cleanly to

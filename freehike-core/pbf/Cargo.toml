@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Streaming OSM PBF decoder and three-pass extraction pipeline with an on-flash redb index"
 
 [dependencies]
 # Phase 4 (P4.C2): RDP simplification + Liang-Barsky clipping + tile grid

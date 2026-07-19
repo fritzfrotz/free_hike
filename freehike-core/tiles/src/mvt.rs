@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Mapbox Vector Tile (MVT) encoding.
 //!
 //! Wire structs are hand-derived prost messages — the exact subset of

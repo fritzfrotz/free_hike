@@ -1,7 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
 // ─── Worker RPC contracts (unchanged) ────────────────────────────────────────
 
 export type WorkerRequestType =
-  | 'PING'
   | 'GEOPROCESS'
   | 'VALHALLA_ROUTE'
   | 'MAP_INIT'
@@ -19,7 +19,6 @@ export type WorkerRequestType =
   | 'MAP_CLOSE';
 
 export type WorkerResponseType =
-  | 'PONG'
   | 'SUCCESS'
   | 'ERROR'
   | 'MAP_INIT_SUCCESS'

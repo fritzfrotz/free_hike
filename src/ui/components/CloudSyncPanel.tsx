@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * CloudSyncPanel.tsx
  *
@@ -209,7 +210,7 @@ export default function CloudSyncPanel({
             <ProviderButton
               id="connect-dropbox-btn"
               label="Dropbox"
-              sublabel={syncProvider === 'dropbox' && syncEmail ? syncEmail : '/Apps/AntigravityApp/ · Offline tokens'}
+              sublabel={syncProvider === 'dropbox' && syncEmail ? syncEmail : '/Apps/FreeHike/ · Offline tokens'}
               active={syncProvider === 'dropbox' && isConnected}
               disabled={isBusy || (!providerNone && syncProvider !== 'dropbox')}
               onClick={() => {
@@ -247,7 +248,7 @@ export default function CloudSyncPanel({
             <div className="mt-4 p-3 rounded-xl bg-slate-950/40 border border-slate-800/50">
               <p className="text-[10px] text-slate-600 font-mono leading-relaxed">
                 Tokens are stored in <span className="text-slate-500">localStorage</span> scoped to this origin.
-                Your files are written exclusively to <span className="text-slate-500">/Apps/AntigravityApp/</span> — we never read your other data.
+                Your files are written exclusively to <span className="text-slate-500">/Apps/FreeHike/</span> — we never read your other data.
               </p>
             </div>
           </div>

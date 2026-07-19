@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Kill-safe, thermally governed on-device map compiler orchestrating the full OSM-to-PMTiles pipeline"
 
 [dependencies]
 pbf = { workspace = true }
@@ -11,9 +13,15 @@ pbf = { workspace = true }
 tiles = { workspace = true }
 # Thermal governance (P8.C1): governed custom ThreadPool in `thermal`.
 rayon = { workspace = true }
+# Per-job advisory slice lock (flock) — see engine::run_slice.
+fs2 = { workspace = true }
+# Lifecycle tracing (jobId-tagged) — backend lives in the ffi crate.
+log = { workspace = true }
 
 [dev-dependencies]
 # Synthetic-PBF builders for the integrated Pass-1 engine tests.
 pbf = { workspace = true, features = ["fixtures"] }
 # Tile grid math for asserting Pass-3 binning results.
 geom = { workspace = true }
+# Real temp directories for the lock/durability tests (no fs mocking).
+tempfile = { workspace = true }

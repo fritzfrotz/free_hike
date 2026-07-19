@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * opfsMover.ts — copies a file out of native Capacitor storage into OPFS.
  *

@@ -1,0 +1,28 @@
+FreeHike
+Copyright 2026 FreeHike contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes third-party data and components:
+
+OpenStreetMap data
+    Map data © OpenStreetMap contributors, available under the Open
+    Database License (ODbL) 1.0.
+    https://www.openstreetmap.org/copyright
+    https://opendatacommons.org/licenses/odbl/1-0/
+    FreeHike downloads raw OpenStreetMap extracts and compiles them into
+    map tiles on the user's device. Any produced database of OSM-derived
+    tiles remains subject to the ODbL.
+
+Noto Sans fonts
+    Copyright Google LLC. Licensed under the SIL Open Font License,
+    Version 1.1.
+    https://fonts.google.com/noto
+    https://openfontlicense.org/
+    Shipped as pre-rendered SDF glyph ranges under public/glyphs/.
+
+Valhalla routing engine
+    Copyright Valhalla contributors. Licensed under the MIT License.
+    https://github.com/valhalla/valhalla
+    Bundled as a WebAssembly build (valhalla.wasm) via the npm package
+    @jansoft/mbujkanji-valhalla-wasm.

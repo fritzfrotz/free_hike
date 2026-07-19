@@ -16,6 +16,14 @@ import uniffi.freehike.CompileSummary
  * Writes use synchronous commit(), not apply(): the worker's process may be
  * killed right after a state change, and an unflushed async write would
  * lose the terminal marker the JS layer discovers on resume.
+ *
+ * Concurrency: the worker coroutine (Dispatchers.IO) and the plugin's
+ * executor lane both mutate this store, so every mutation is
+ * `@Synchronized` and every terminal transition goes through
+ * [updatePending] — a compare-and-set on `(jobId, state == pending)`.
+ * That guard is what makes hard cancellation safe: a worker slice that was
+ * already in flight when `cancelBackgroundJob` cleared the record cannot
+ * resurrect it by persisting a late finished/failed marker.
  */
 object PendingJobStore {
 
@@ -37,6 +45,22 @@ object PendingJobStore {
         val reason: String?,
         val blocksTotal: Long,
         val bytesWritten: Long,
+        /**
+         * Circuit-breaker counter (P0-2): runs of the worker whose
+         * PREDECESSOR run ended without passing through a deliberate exit
+         * (thermal retry / constraint stop / terminal state). A predecessor
+         * that died mid-slice — SIGBUS on the mmap, LMK kill, Rust abort —
+         * never got to set [cleanStop], so its successor counts as dirty.
+         * Reset to 0 the first time a run completes a compile slice.
+         */
+        val dirtyAttempts: Int = 0,
+        /**
+         * Set just before the worker deliberately returns Result.retry()
+         * (thermal Critical) or observes isStopped (constraint lost). The
+         * next run consumes and clears it; if it is absent at run start,
+         * the previous run died and [dirtyAttempts] is incremented.
+         */
+        val cleanStop: Boolean = false,
     ) {
         fun toCompileJob() = CompileJob(
             jobId = jobId,
@@ -55,6 +79,7 @@ object PendingJobStore {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     @SuppressLint("ApplySharedPref")
+    @Synchronized
     fun save(context: Context, record: Record) {
         prefs(context).edit()
             .putString("state", record.state)
@@ -68,10 +93,13 @@ object PendingJobStore {
             .putString("reason", record.reason)
             .putLong("blocksTotal", record.blocksTotal)
             .putLong("bytesWritten", record.bytesWritten)
+            .putInt("dirtyAttempts", record.dirtyAttempts)
+            .putBoolean("cleanStop", record.cleanStop)
             .commit()
     }
 
     /** The record in any state (resume-time discovery), or null if idle. */
+    @Synchronized
     fun loadAny(context: Context): Record? {
         val p = prefs(context)
         val state = p.getString("state", null) ?: return null
@@ -87,6 +115,8 @@ object PendingJobStore {
             reason = p.getString("reason", null),
             blocksTotal = p.getLong("blocksTotal", 0),
             bytesWritten = p.getLong("bytesWritten", 0),
+            dirtyAttempts = p.getInt("dirtyAttempts", 0),
+            cleanStop = p.getBoolean("cleanStop", false),
         )
     }
 
@@ -94,22 +124,37 @@ object PendingJobStore {
     fun loadPending(context: Context): Record? =
         loadAny(context)?.takeIf { it.state == STATE_PENDING }
 
-    fun markFinished(context: Context, record: Record, summary: CompileSummary) {
-        save(
-            context,
-            record.copy(
+    /**
+     * Compare-and-set: applies `transform` only while the store still holds
+     * the PENDING record for `jobId`. Returns false — and writes nothing —
+     * if the record was cleared (hard cancel), overwritten, or already
+     * terminal. Every worker-side mutation routes through here so a
+     * cancelled job can never be resurrected by a late write.
+     */
+    @Synchronized
+    fun updatePending(context: Context, jobId: String, transform: (Record) -> Record): Boolean {
+        val current = loadAny(context) ?: return false
+        if (current.jobId != jobId || current.state != STATE_PENDING) return false
+        save(context, transform(current))
+        return true
+    }
+
+    /** Terminal success transition; false if the record is gone (cancelled). */
+    fun markFinished(context: Context, record: Record, summary: CompileSummary): Boolean =
+        updatePending(context, record.jobId) {
+            it.copy(
                 state = STATE_FINISHED,
                 blocksTotal = summary.blocksTotal.toLong(),
                 bytesWritten = summary.bytesWritten.toLong(),
             )
-        )
-    }
+        }
 
-    fun markFailed(context: Context, record: Record, reason: String) {
-        save(context, record.copy(state = STATE_FAILED, reason = reason))
-    }
+    /** Terminal failure transition; false if the record is gone (cancelled). */
+    fun markFailed(context: Context, record: Record, reason: String): Boolean =
+        updatePending(context, record.jobId) { it.copy(state = STATE_FAILED, reason = reason) }
 
     @SuppressLint("ApplySharedPref")
+    @Synchronized
     fun clear(context: Context) {
         prefs(context).edit().clear().commit()
     }

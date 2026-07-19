@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Windowed GeoTIFF DEM reader.
 //!
 //! Decodes one internal TIFF chunk at a time via `Decoder::read_chunk`, which

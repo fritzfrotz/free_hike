@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { useEffect, useRef, useState, useCallback } from 'react';
 import maplibregl from 'maplibre-gl';
 import type { WorkerRequestMessage, WorkerResponseMessage, MapInitSuccessPayload } from '../../shared/types';
@@ -431,9 +432,11 @@ export default function MapView({
         });
         const terrainPMTiles = registerSource(DEFAULT_TERRAIN);
 
+        // BUG(B003): map-mount re-render resets WebView scroll to top — severity: minor — repro: LOOPLOG A4 tap-targeting notes
         if (mapContainerRef.current) {
           setStatusMessage('Mounting map container canvas…');
 
+          // BUG(B002): hillshade/terrain detached-ArrayBuffer console error on load, pre-existing ("split sources" fix disproven 2026-07-17) — severity: major — repro: boot app, open devtools console
           map = new maplibregl.Map({
             container: mapContainerRef.current,
             // ── Phase Block-1: High-contrast 3D alpine style ─────────────

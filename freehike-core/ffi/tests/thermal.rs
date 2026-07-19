@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! FFI-boundary tests for the P8.C1 thermal contract, in their own process
 //! (integration binary) so the global thermal flag can never race the ffi
 //! crate's unit tests. Tests serialize through `guard()`, which restores
@@ -102,7 +103,8 @@ fn critical_yields_compile_chunk_and_recovery_resumes_it() {
                 slices += 1;
                 assert!(slices < 1_000, "runaway resume loop");
             }
-            CompilationStatus::Failed { reason } => panic!("resume failed: {reason}"),
+            CompilationStatus::FailedFatal { reason }
+            | CompilationStatus::FailedTransient { reason } => panic!("resume failed: {reason}"),
         }
     }
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `terrain` — DEM GeoTIFF processing (Phase 6).
 //!
 //! Pipeline (P6.C1 + P6.C2): windowed GeoTIFF reads (one internal chunk at a

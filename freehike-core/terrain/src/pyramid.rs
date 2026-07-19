@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Tile-pyramid rendering: WebMercator (z,x,y) → Terrain-RGB WebP.
 //!
 //! Per output pixel the sampler is asked for the elevation at that pixel's

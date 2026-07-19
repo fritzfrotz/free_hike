@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `fetcher` — hostile-mirror-safe downloader for raw OSM `.osm.pbf` and DEM
 //! `.tif` inputs (Phase 2).
 //!

@@ -5,8 +5,9 @@ members = ["compiler", "pbf", "terrain", "tiles", "ffi", "fetcher", "geom"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["FreeHike"]
-license = "MIT"
+authors = ["FreeHike contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/freehike/freehike"
 
 [workspace.dependencies]
 uniffi = "0.29"
@@ -37,6 +38,18 @@ image = { version = "0.25", default-features = false, features = ["webp"] }
 # works by admission control, not pool resizing. Pure Rust, no C in the
 # mobile cross-compile path.
 rayon = "1"
+# Lifecycle tracing across the FFI boundary: the `log` facade in the core
+# crates, backed by android_logger (ffi crate, Android targets only) so
+# every state transition / lock event / recovery is greppable in logcat by
+# jobId. Facade-only elsewhere — hosts opt in.
+log = "0.4"
+# Advisory per-job slice lock (`{job_id}.lock`, flock-based): serializes
+# runners across threads AND processes; the kernel releases it on process
+# death, so a crash can never wedge a job.
+fs2 = "0.4"
+# Real-filesystem test scaffolding (dev-only): the durability tests operate
+# on genuine directories/renames — never mocked fs.
+tempfile = "3"
 compiler = { path = "compiler" }
 pbf = { path = "pbf" }
 terrain = { path = "terrain" }

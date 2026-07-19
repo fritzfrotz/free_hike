@@ -2469,3 +2469,81 @@ CFBundleURLTypes).
 **Outcome:** CLOSED. Two confirmed sandbox-integrity findings (path traversal,
 GeoTIFF DoS) patched at the correct enforcement layers + one trivial manifest
 hardening. Findings 2 & 5 carried to Phase 10 as non-blocking cleanup.
+
+---
+
+## P9.C5 — Fix B001: hardcoded jobId `bg_stress_test` (2026-07-19)
+
+**Plan:**
+1. Tracker pipeline landed this session (janitor + tags + rules); B001 tagged
+   at `src/services/regionCompiler.ts` as blocker — every enqueue collides on
+   one job identity (OPFS SyncAccessHandle lock on the bound basemap +
+   checkpoint identity poisoning across different bboxes).
+2. Fix: restore the slugified+timestamped jobId line, delete the hardcode,
+   the TS6133 suppression, the TODO, and the B001 tag.
+3. Proof: `npx tsc --noEmit` clean; `grep -r bg_stress_test src/` empty;
+   `node scripts/tracker-janitor.mjs --fix && --check` clean with NO
+   resolved-but-not-buried warning (this entry's `closes` line is the burial).
+
+**Kill entry:** hardcode reverted; `jobId = bg_${slugify(regionLabel)}_${ts36}`
+restored; TODO + suppression removed. Proofs: tsc clean, zero `bg_stress_test`
+refs in src/, janitor clean post-regeneration. closes B001
+
+**Status:** CLOSED. Next chunks queued: P9.C6 (closes D006 — checkpoint
+spec fingerprint) and P9.C7 (closes D008 — foreground archive deletion),
+tracked in TaskList and TRACKER.md.
+
+---
+
+## P9.C6 — D006: checkpoint spec fingerprint + purge-and-restart recovery (2026-07-19)
+
+**Plan (operator-directed recovery semantics):**
+1. Checkpoint format v5 → v6: add `spec_hash` (FNV-1a 64 over bbox, zoom
+   range, pbf_path, dem_path). Old v5 checkpoints remain refused loudly
+   (P4 version discipline, unchanged).
+2. On fingerprint MISMATCH (same jobId reused for a different region/spec):
+   do NOT resume, do NOT brick — warn loudly, purge checkpoint + redb index
+   + tmp artifacts via purge_job_state, restart fresh in the same slice.
+3. Proof (named before implementation):
+   `spec_change_purges_stale_state_and_restarts_fresh` — yield once, mutate
+   bbox, next slice restarts at blocks_done=1/Pass1Nodes with the new
+   fingerprint, and the slice after that RESUMES (blocks_done=2);
+   existing `resume_continues_not_restarts` guards the same-spec path;
+   rider checkpoint round-trip test extended to v6.
+
+**Kill entry (P9.C6):** checkpoint v6 ships `spec_hash` (FNV-1a 64 over
+bbox/zooms/input paths); mismatch → loud warn + purge_job_state + fresh
+restart in the same slice (never resume, never brick); fresh checkpoints
+adopt the incoming fingerprint; plan-containment check retained as the
+pure-corruption guard behind a matching fingerprint. FFI surface untouched
+(CheckpointState unchanged — no bindings regen). Proofs green:
+`spec_change_purges_stale_state_and_restarts_fresh` + full workspace
+(37 compiler-lib tests). ARCHITECTURE P4 updated v5→v6. closes D006
+
+**Status:** CLOSED (green-lock ×2 via the combined session-final sweep).
+
+---
+
+## P9.C7 — D008: foreground-path sandbox archive deletion after verified OPFS copy (2026-07-19)
+
+**Plan (operator-directed verification semantics):**
+1. compilerStore.handleJobFinished: stat the sandbox archive BEFORE the
+   copy; after moveNativeFileToOPFS resolves (writer-side byte verification
+   already inside it), independently re-verify: OPFS destination file size
+   must equal the sandbox archive size.
+2. Match → Filesystem.deleteFile the sandbox copy (delete failure is logged,
+   non-fatal — that is the pre-fix status quo), then hot-swap.
+3. Mismatch → keep the sandbox copy, surface a BUG-grade console.error, and
+   skip the hot-swap (never bind a size-mismatched archive as the live map).
+4. Proof: `npx tsc --noEmit` clean; janitor clean after tag removal +
+   `--fix`; closes line below buries D008.
+
+**Kill entry (P9.C7):** handleJobFinished now stats the sandbox archive
+pre-copy, independently verifies the OPFS destination's file size equals it
+post-copy, and only then deletes the sandbox copy (delete failure logged,
+non-fatal). On mismatch: sandbox kept, BUG-grade console.error surfaced,
+hot-swap SKIPPED (a size-mismatched archive is never bound as the live
+basemap). D008 tag removed. Proofs: tsc clean, janitor clean post --fix.
+closes D008
+
+**Status:** CLOSED.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Hand-derived prost message definitions for the OSM PBF wire format —
 //! the subset Pass 1 consumes from `fileformat.proto` / `osmformat.proto`.
 //!

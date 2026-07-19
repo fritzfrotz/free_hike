@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `compiler` — orchestration core for the FreeHike on-device map compiler.
 //!
 //! `engine` holds the suspendable slice state machine (the Phase 7-shaped

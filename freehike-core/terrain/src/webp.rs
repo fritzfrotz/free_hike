@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Lossless WebP encoding of Terrain-RGB buffers.
 //!
 //! Lossless is non-negotiable for Terrain-RGB: lossy quantisation would

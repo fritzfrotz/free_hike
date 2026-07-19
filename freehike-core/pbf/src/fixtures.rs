@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Synthetic-but-wire-valid PBF builders.
 //!
 //! Shared by this crate's own tests and, via the `fixtures` cargo feature, by

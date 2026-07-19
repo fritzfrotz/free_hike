@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 import { create } from 'zustand';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { moveNativeFileToOPFS } from '../services/opfsMover';
@@ -230,6 +231,7 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
     const opfsFilename = `${job.jobId}.pmtiles`;
 
     set({ backgroundProgress: { stage: 'copying', jobId: job.jobId, error: null } });
+    // BUG(B006): progress denominator uses logical bytesWritten (index accounting) instead of the archive's real size — severity: minor — repro: watch handoff bar mismatch during background ingest
     resetHandoffProgress(job.bytesTotal);
 
     try {
@@ -287,10 +289,39 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
         path: nativeArchiveRelativePath(jobId),
         directory: Directory.Data,
       });
+      // Size of the sandbox archive, captured BEFORE the copy: the
+      // reference for the post-copy verification below.
+      const { size: sandboxBytes } = await Filesystem.stat({ path: uri });
 
       const { opfsFilename } = await moveNativeFileToOPFS({
         nativeFilePath: uri,
         opfsFilename: `${jobId}.pmtiles`,
+      });
+
+      // Independent post-copy verification (P9.C7, closes D008): the mover
+      // already byte-verifies its own writes, but the sandbox copy is only
+      // released against a second opinion — the OPFS destination's actual
+      // file size must equal the sandbox archive's size.
+      const root = await navigator.storage.getDirectory();
+      const opfsFile = await (await root.getFileHandle(opfsFilename)).getFile();
+      if (opfsFile.size !== sandboxBytes) {
+        // Keep the sandbox copy (retry stays possible) and do NOT bind a
+        // size-mismatched archive as the live basemap.
+        console.error(
+          `[compilerStore] BUG: OPFS size mismatch after copy of "${jobId}" — ` +
+            `sandbox ${sandboxBytes} bytes vs OPFS ${opfsFile.size} bytes; ` +
+            `keeping the sandbox archive and skipping the hot-swap.`,
+        );
+        return;
+      }
+
+      // Verified durable in OPFS — the sandbox copy is now redundant.
+      // A failed delete is the pre-fix status quo (a leak), never fatal.
+      await Filesystem.deleteFile({ path: uri }).catch((err: unknown) => {
+        console.error(
+          `[compilerStore] Sandbox archive delete failed for "${jobId}" (leaks the copy, non-fatal):`,
+          err,
+        );
       });
 
       useMapStore.getState().setActiveRegion({

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! WebMercator (slippy-map) tile arithmetic.
 //!
 //! Tiles address the EPSG:3857 plane, but every function here speaks

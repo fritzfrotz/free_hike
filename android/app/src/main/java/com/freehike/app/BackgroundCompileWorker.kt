@@ -23,8 +23,10 @@ import uniffi.freehike.CompilationStatus
 import uniffi.freehike.ProgressCallback
 import uniffi.freehike.ThermalState
 import uniffi.freehike.compileChunk
+import uniffi.freehike.purgeJob
 import uniffi.freehike.thermalState
 
+// DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
 /**
  * The Android background window (P8.C3 §2–3) — the WorkManager mirror of
  * the iOS `BackgroundCompileScheduler`: drives 2000ms budget-yield slices
@@ -52,10 +54,40 @@ class BackgroundCompileWorker(
         // for a device that was already hot), then keep listening.
         ThermalStateBridge.start(applicationContext)
 
-        val pending = PendingJobStore.loadPending(applicationContext)
-        if (pending == null) {
+        val loaded = PendingJobStore.loadPending(applicationContext)
+        if (loaded == null) {
             Log.i(TAG, "no pending job; nothing to do")
             return@withContext Result.success()
+        }
+
+        // ── Circuit breaker ──────────────────────────────────────────────
+        // A run whose predecessor set cleanStop (deliberate thermal retry /
+        // constraint stop) is healthy; one whose predecessor died without
+        // it — SIGBUS on the mmap, LMK kill, Rust abort — counts as dirty.
+        // runAttemptCount alone can't tell these apart: it also increments
+        // on our own deliberate Result.retry()s, so a cool-down loop on a
+        // hot device would falsely trip the breaker.
+        val record = loaded.copy(
+            cleanStop = false,
+            dirtyAttempts = if (loaded.cleanStop) loaded.dirtyAttempts else loaded.dirtyAttempts + 1,
+        )
+        PendingJobStore.save(applicationContext, record)
+
+        if (record.dirtyAttempts > MAX_DIRTY_ATTEMPTS) {
+            val reason = "Background compile aborted: $MAX_DIRTY_ATTEMPTS consecutive runs died " +
+                "without completing a slice (likely corrupt input or memory pressure)."
+            Log.e(TAG, "circuit breaker tripped for ${record.jobId} " +
+                "(runAttemptCount=$runAttemptCount): $reason")
+            PendingJobStore.markFailed(applicationContext, record, reason)
+            // Release the dead job's disk claim: checkpoint, redb index,
+            // tile-data scratch, half-written archive temp.
+            purgeJob(record.jobId, record.outputDir)
+            MapCompilerPlugin.emitBackgroundEvent(
+                state = "failed",
+                jobId = record.jobId,
+                reason = reason,
+            )
+            return@withContext Result.failure()
         }
 
         try {
@@ -67,7 +99,7 @@ class BackgroundCompileWorker(
             Log.w(TAG, "FGS promotion refused; continuing under the 10-minute cap", t)
         }
 
-        val job = pending.toCompileJob()
+        val job = record.toCompileJob()
         var slices = 0
         while (true) {
             // WorkManager's stop signal (constraint lost — e.g. charger
@@ -77,6 +109,9 @@ class BackgroundCompileWorker(
             // constraint-stopped work by itself; the return value here is
             // ignored once stopped.
             if (isStopped) {
+                PendingJobStore.updatePending(applicationContext, record.jobId) {
+                    it.copy(cleanStop = true)
+                }
                 Log.i(TAG, "worker stopped after $slices slices; checkpoint durable")
                 return@withContext Result.retry()
             }
@@ -85,12 +120,34 @@ class BackgroundCompileWorker(
                 compileChunk(job, SLICE_BUDGET_MS, LoggingProgressSink)
             } catch (t: Throwable) {
                 // UniFFI surfaces Rust panics as exceptions; treat like
-                // CompilationStatus.Failed (fatal, no retry).
-                PendingJobStore.markFailed(applicationContext, pending, "FFI panic: ${t.message}")
+                // CompilationStatus.FailedFatal (no retry) and release the
+                // job's temporary disk state.
+                val reason = "FFI panic: ${t.message}"
+                val stillOurs = PendingJobStore.markFailed(applicationContext, record, reason)
+                purgeJob(record.jobId, record.outputDir)
                 Log.e(TAG, "compileChunk threw after $slices slices", t)
+                if (stillOurs) {
+                    MapCompilerPlugin.emitBackgroundEvent(
+                        state = "failed",
+                        jobId = record.jobId,
+                        reason = reason,
+                    )
+                }
                 return@withContext Result.failure()
             }
             slices += 1
+
+            if (slices == 1) {
+                // The FFI survived a full slice, so this run is not part of
+                // a crash loop: consecutive-death accounting starts over. A
+                // job poisoned at a fixed input byte never reaches this line
+                // on later runs — the durable checkpoint resumes it right at
+                // the poison, so it dies inside its FIRST slice every time
+                // and the breaker trips after MAX_DIRTY_ATTEMPTS runs.
+                PendingJobStore.updatePending(applicationContext, record.jobId) {
+                    it.copy(dirtyAttempts = 0)
+                }
+            }
 
             when (status) {
                 is CompilationStatus.Yielded -> {
@@ -98,8 +155,12 @@ class BackgroundCompileWorker(
                     // after its one-block minimum on every call. Re-invoking
                     // in a tight loop would defeat the throttle — return
                     // retry() and let WorkManager's exponential backoff be
-                    // the cooldown.
+                    // the cooldown. Marked clean so the breaker never counts
+                    // cool-down cycles as failures.
                     if (thermalState() == ThermalState.CRITICAL) {
+                        PendingJobStore.updatePending(applicationContext, record.jobId) {
+                            it.copy(cleanStop = true)
+                        }
                         Log.i(TAG, "thermal Critical after $slices slices; backing off to cool")
                         return@withContext Result.retry()
                     }
@@ -110,29 +171,52 @@ class BackgroundCompileWorker(
                     // OPFS belongs to the JS layer: flip the durable record
                     // and notify the UI if one is alive right now.
                     val s = status.summary
-                    PendingJobStore.markFinished(applicationContext, pending, s)
-                    Log.i(TAG, "job ${pending.jobId} finished in $slices slices: ${s.blocksTotal} blocks")
+                    val stillOurs = PendingJobStore.markFinished(applicationContext, record, s)
+                    if (!stillOurs) {
+                        // Hard-cancelled while this slice ran: the record is
+                        // gone and the canceller owns cleanup. Do NOT
+                        // resurrect the record or announce the result.
+                        Log.i(TAG, "job ${record.jobId} finished but was cancelled mid-slice; dropping result")
+                        return@withContext Result.success()
+                    }
+                    Log.i(TAG, "job ${record.jobId} finished in $slices slices: ${s.blocksTotal} blocks")
                     MapCompilerPlugin.emitBackgroundEvent(
                         state = "finished",
-                        jobId = pending.jobId,
-                        archivePath = pending.archivePath,
+                        jobId = record.jobId,
+                        archivePath = record.archivePath,
                         blocksTotal = s.blocksTotal.toLong(),
                         bytesWritten = s.bytesWritten.toLong(),
                     )
                     return@withContext Result.success()
                 }
-                is CompilationStatus.Failed -> {
+                is CompilationStatus.FailedFatal -> {
                     // Fatal per the Surface v1 contract (bad input, corrupt
-                    // state, disk). Do NOT retry — re-burning the failure on
-                    // a charger overnight wastes battery and flash.
-                    PendingJobStore.markFailed(applicationContext, pending, status.reason)
-                    Log.e(TAG, "job ${pending.jobId} failed after $slices slices: ${status.reason}")
-                    MapCompilerPlugin.emitBackgroundEvent(
-                        state = "failed",
-                        jobId = pending.jobId,
-                        reason = status.reason,
-                    )
+                    // state). Do NOT retry — re-burning the failure on a
+                    // charger overnight wastes battery and flash — and
+                    // release the temporary disk state immediately.
+                    val stillOurs = PendingJobStore.markFailed(applicationContext, record, status.reason)
+                    purgeJob(record.jobId, record.outputDir)
+                    Log.e(TAG, "job ${record.jobId} failed after $slices slices: ${status.reason}")
+                    if (stillOurs) {
+                        MapCompilerPlugin.emitBackgroundEvent(
+                            state = "failed",
+                            jobId = record.jobId,
+                            reason = status.reason,
+                        )
+                    }
                     return@withContext Result.failure()
+                }
+                is CompilationStatus.FailedTransient -> {
+                    // The environment refused the slice (another runner holds
+                    // the job's slice lock). Durable state is untouched — do
+                    // NOT purge, do NOT mark failed. Back off and let the
+                    // retry chain re-enter once the contention clears; marked
+                    // clean so the circuit breaker never counts it.
+                    PendingJobStore.updatePending(applicationContext, record.jobId) {
+                        it.copy(cleanStop = true)
+                    }
+                    Log.w(TAG, "job ${record.jobId} transient refusal after $slices slices: ${status.reason}")
+                    return@withContext Result.retry()
                 }
             }
         }
@@ -192,6 +276,27 @@ class BackgroundCompileWorker(
         private val SLICE_BUDGET_MS: UInt = 2_000u
 
         /**
+         * Circuit breaker (P0-2): consecutive runs allowed to die without
+         * completing a single slice before the job is declared poisoned.
+         * "Die" means process death mid-FFI — SIGBUS from the mmap'd PBF,
+         * an LMK/OOM kill, a Rust abort — which no in-process catch can
+         * see; the only witness is the absence of the cleanStop marker on
+         * the next run. Without this cap, WorkManager reschedules the dead
+         * RUNNING worker forever: a crash loop on every charging session.
+         */
+        internal const val MAX_DIRTY_ATTEMPTS = 5
+
+        /**
+         * Upper bound on how long an already-running slice can keep
+         * touching job files after a stop/cancel request: the blocking FFI
+         * call cannot be interrupted, so it runs out its budget (plus the
+         * engine's one-block overrun) and then fsyncs one final checkpoint.
+         * Cancellation sweeps the job directory a second time after this
+         * window to catch that straggler write.
+         */
+        internal val STRAGGLER_WINDOW_MS: Long = SLICE_BUDGET_MS.toLong() * 2 + 1_000
+
+        /**
          * Queues the (single) background compile. Charging-constrained —
          * the same honest "compiles while charging" posture as the iOS
          * request's requiresExternalPower; no network constraint (raw
@@ -210,6 +315,17 @@ class BackgroundCompileWorker(
             WorkManager.getInstance(context.applicationContext)
                 .enqueueUniqueWork(WORK_NAME, ExistingWorkPolicy.KEEP, request)
             Log.i(TAG, "background compile window requested")
+        }
+
+        /**
+         * Hard cancellation (P1-6): stops the unique work chain. The worker
+         * honors the stop at its next slice boundary (≤ [STRAGGLER_WINDOW_MS]);
+         * record clearing and disk purge are the caller's responsibility
+         * (MapCompilerPlugin.cancelBackgroundJob owns that sequence).
+         */
+        fun cancel(context: Context) {
+            WorkManager.getInstance(context.applicationContext).cancelUniqueWork(WORK_NAME)
+            Log.i(TAG, "background compile work cancelled")
         }
     }
 }

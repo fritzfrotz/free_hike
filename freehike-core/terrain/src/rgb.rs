@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Terrain-RGB transformation (Mapbox encoding: base −10000, interval 0.1).
 //!
 //! `value = (elevation + 10000) * 10`, then

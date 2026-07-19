@@ -2,7 +2,7 @@
   "name": "freehike",
   "private": true,
   "version": "0.1.0",
-  "description": "Zero-cost offline hiking maps: the phone downloads raw OpenStreetMap + DEM data and compiles its own vector basemap, terrain, and routing — no servers, ever.",
+  "description": "Zero-cost offline hiking maps: the phone downloads raw OpenStreetMap + DEM data and compiles its own vector basemap, terrain, and routing \u2014 no servers, ever.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -16,7 +16,9 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "build:graph": "node scripts/build_test_graph.js"
+    "build:graph": "node scripts/build_test_graph.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@capacitor-community/background-geolocation": "^1.2.26",
@@ -49,6 +51,7 @@
     "tailwindcss": "^4.3.0",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.59.2",
-    "vite": "^8.0.12"
+    "vite": "^8.0.12",
+    "vitest": "4.1.9"
   }
 }

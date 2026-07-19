@@ -18,3 +18,20 @@ jobs:
         run: node --test scripts/tracker-janitor.test.mjs
       - name: Tracker check (tags, mirrors, forbidden patterns, TRACKER.md drift)
         run: node scripts/tracker-janitor.mjs --check
+
+  frontend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc -b
+      - name: Lint
+        run: npm run lint
+      - name: Seam tests (vitest)
+        run: npm test

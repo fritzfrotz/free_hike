@@ -23,9 +23,9 @@
 ## Open Bugs
 
 - **B002** — [major] hillshade/terrain detached-ArrayBuffer console error on load, pre-existing ("split sources" fix disproven 2026-07-17) — repro: boot app, open devtools console
-  - src/ui/components/MapView.tsx:439
+  - src/ui/components/MapView.tsx:440
 - **B003** — [minor] map-mount re-render resets WebView scroll to top — repro: LOOPLOG A4 tap-targeting notes
-  - src/ui/components/MapView.tsx:435
+  - src/ui/components/MapView.tsx:436
 - **B004** — [major] hike.pmtiles/test_graph.tar sandbox fixtures missing, region-download demo path fails — repro: tap region download in web build
   - src/ui/App.tsx:489
 - **B005** — [minor] dev-env leaked OPFS lock, map 'load' never fires after reload while a previous worker still holds the SyncAccessHandle — repro: LOOPLOG P9.C2 notes

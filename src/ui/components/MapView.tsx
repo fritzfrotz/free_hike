@@ -6,6 +6,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import mlcontour from 'maplibre-contour';
 import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
 import { useMapStore } from '../../store/mapStore';
+import { decideRegionBoot, regionFilesToVerify } from '../../services/regionBootPolicy';
 import { registerPMTilesSource, type TelemetryData } from '../../services/pmtilesRegistry';
 import DownloadProgressBar, { type DownloadProgressHandle } from './DownloadProgressBar';
 import RegionSelectorOverlay from './RegionSelectorOverlay';
@@ -554,23 +555,23 @@ export default function MapView({
                 const { activeRegion: persisted, clearActiveRegion } = useMapStore.getState();
                 if (persisted) {
                   void (async () => {
-                    // Only probe files the map isn't already bound to — the
-                    // booted defaults trivially exist (worker just opened
-                    // them), and probing an already-locked file is pointless.
-                    const toVerify = [
-                      ...(persisted.basemapFile !== DEFAULT_BASEMAP ? [persisted.basemapFile] : []),
-                      ...(persisted.terrainFile !== DEFAULT_TERRAIN ? [persisted.terrainFile] : []),
-                    ];
+                    // Decision logic lives in services/regionBootPolicy
+                    // (extracted P-FE.C1, behavior-identical); the probe and
+                    // the MapLibre call stay here.
+                    const toVerify = regionFilesToVerify(persisted, {
+                      basemapFile: DEFAULT_BASEMAP,
+                      terrainFile: DEFAULT_TERRAIN,
+                    });
                     const exists = await Promise.all(toVerify.map(opfsFileHasBytes));
-                    const missing = toVerify.filter((_, i) => !exists[i]);
-                    if (missing.length > 0) {
+                    const decision = decideRegionBoot(toVerify, exists);
+                    if (decision.action === 'clear') {
                       console.warn(
-                        `[MapView] Persisted region "${persisted.regionLabel}" dropped — missing OPFS file(s): ${missing.join(', ')}`,
+                        `[MapView] Persisted region "${persisted.regionLabel}" dropped — missing OPFS file(s): ${decision.missing.join(', ')}`,
                       );
                       clearActiveRegion();
                       return;
                     }
-                    if (toVerify.length === 0) return; // persisted region IS the default binding
+                    if (decision.action === 'noop') return; // persisted region IS the default binding
                     try {
                       await switcher.loadOfflineRegion(persisted.basemapFile, persisted.terrainFile);
                     } catch (err) {

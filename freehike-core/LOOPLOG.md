@@ -2547,3 +2547,54 @@ basemap). D008 tag removed. Proofs: tsc clean, janitor clean post --fix.
 closes D008
 
 **Status:** CLOSED.
+
+---
+
+## P-FE.C1 — Frontend test harness + first-wave seam tests (2026-07-19)
+
+**Plan / harness design (presented before implementation):**
+1. Fake OPFS (src/test/fakeOpfs.ts): in-memory byte map behind the real API
+   subset; single-handle exclusivity enforced (open SyncAccessHandle blocks
+   createWritable + other sync handles) — the B005-class swap-vs-bound-file
+   rule is load-bearing; createWritable commits swap-on-close so aborts never
+   present partial files.
+2. Fake Capacitor (src/test/fakeFilesystem.ts + vi.mock factories): backend
+   singleton; deterministic base64 chunks incl. final short chunk,
+   errorAtChunk mid-stream case, awaitable chunkGate for ordering tests.
+3. Environment: node only, NO jsdom (nothing needs DOM; navigator.storage +
+   localStorage stubbed in src/test/setup.ts). Dev-dep: vitest only.
+4. Zustand: reset pattern (src/test/resetStores.ts, setState(snapshot, true)
+   per test) — factories would be decomposition, out of scope.
+5. Pre-approved mechanical extraction: MapView cold-boot validate-before-
+   bind DECISION → src/services/regionBootPolicy.ts (pure); probe + MapLibre
+   calls stay in MapView, behavior-identical.
+Proofs (named first): per-module test files listed in Part 2 order; suite
+green ×2, tsc clean, janitor --check clean, CI green on push.
+Spec drift noted: the chunk text asks for a D008 characterization test of
+the LEAKY foreground path — D008 was closed earlier today (P9.C7), so the
+test asserts the FIXED contract (verified delete; mismatch keeps sandbox
+and skips swap) with comments citing D008/P9.C7.
+
+**Kill entry (P-FE.C1):** vitest 4.1.9 (exact-pinned; the vendored
+valhalla-wasm package peer-requires it) is the ONLY new dev-dep — no
+jsdom (node env throughout; navigator.storage/localStorage stubbed).
+Harness under src/test/ (setup.ts, fakeOpfs.ts with B005-class
+single-handle exclusivity + swap-on-close, fakeFilesystem.ts with
+short-final-chunk/errorAtChunk/chunkGate hooks, resetStores.ts snapshot
+reset). Extractions performed (exactly one, the pre-approved case):
+cold-boot validate-before-bind decision → src/services/regionBootPolicy.ts
+(regionFilesToVerify + decideRegionBoot, behavior-identical; probe and
+MapLibre calls remain in MapView). Suite: 7 files / 43 tests —
+gpxSerializer 6 (format+escaping+timestamps), opfsMover 6 (reassembly,
+chunk size, monotonic progress, mid-stream error, torn transfer,
+non-native), compilerStore 12 incl. ack-after-durable-close ordering,
+double-discovery re-entrancy, P9.C7 fixed foreground contract, and the
+B006 characterization (wrong denominator seed — flip on fix + closes
+B006), regionBootPolicy 7, storageGuard 5, handoffProgress 3, fakeOpfs
+self-test 4. Wiring: npm test / test:watch; janitor.yml gains a
+frontend-tests job (npm ci → tsc -b → eslint → vitest). Proofs: suite
+green ×2 consecutive, tsc -b clean, eslint clean, janitor --fix +
+--check clean (6 debt / 6 bugs unchanged). CI-green-on-push proof
+pending the operator's commit (git is HITL).
+
+**Status:** CLOSED locally; CI proof lands with the next push.

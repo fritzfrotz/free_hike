@@ -231,10 +231,16 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
     const opfsFilename = `${job.jobId}.pmtiles`;
 
     set({ backgroundProgress: { stage: 'copying', jobId: job.jobId, error: null } });
-    // BUG(B006): progress denominator uses logical bytesWritten (index accounting) instead of the archive's real size — severity: minor — repro: watch handoff bar mismatch during background ingest
-    resetHandoffProgress(job.bytesTotal);
 
     try {
+      // Seed the progress denominator from the archive's REAL on-disk size
+      // (P-FE.C2, closes tracker B006): the record's bytesTotal carries the
+      // engine's LOGICAL accounting (index bytes + payload), which
+      // overshoots the archive and made the bar's initial total wrong. A
+      // stat failure lands in the catch below like any other copy failure.
+      const { size: archiveBytes } = await Filesystem.stat({ path: job.archivePath });
+      resetHandoffProgress(archiveBytes);
+
       await moveNativeFileToOPFS({
         nativeFilePath: job.archivePath,
         opfsFilename,

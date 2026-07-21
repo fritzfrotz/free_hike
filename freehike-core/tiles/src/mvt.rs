@@ -44,6 +44,7 @@ pub const SAC_SCALE_KEY: &str = "sac_scale";
 /// is named. Client styles label on `["get", "name"]`.
 pub const NAME_KEY: &str = "name";
 
+const GEOM_TYPE_POINT: i32 = 1;
 const GEOM_TYPE_LINESTRING: i32 = 2;
 const CMD_MOVE_TO: u32 = 1;
 const CMD_LINE_TO: u32 = 2;
@@ -124,6 +125,34 @@ fn quantize(merc: (f64, f64), origin: (f64, f64), scale: f64) -> (i64, i64) {
 /// stream. The cursor persists across ALL segments of one feature (spec:
 /// parameter deltas are relative to the previous point of the same
 /// feature, MoveTo included). Empty result = every segment degenerate.
+/// MULTIPOINT encoding: one MoveTo command whose count covers every
+/// distinct quantized point, parameters as cursor-relative zigzag deltas
+/// (spec §4.3.4.2). Duplicate grid points are dropped — the spec forbids
+/// coincident points within a MULTIPOINT.
+fn encode_point_geometry(segments: &[Vec<(f64, f64)>], origin: (f64, f64), scale: f64) -> Vec<u32> {
+    let mut pts: Vec<(i64, i64)> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        for &v in seg {
+            let p = quantize(v, origin, scale);
+            if !pts.contains(&p) {
+                pts.push(p);
+            }
+        }
+    }
+    if pts.is_empty() {
+        return Vec::new();
+    }
+    let mut geometry = Vec::with_capacity(1 + pts.len() * 2);
+    geometry.push(command(CMD_MOVE_TO, pts.len() as u32));
+    let mut cursor = (0i64, 0i64);
+    for p in pts {
+        geometry.push(zigzag(p.0 - cursor.0));
+        geometry.push(zigzag(p.1 - cursor.1));
+        cursor = p;
+    }
+    geometry
+}
+
 fn encode_geometry(segments: &[Vec<(f64, f64)>], origin: (f64, f64), scale: f64) -> Vec<u32> {
     let mut geometry: Vec<u32> = Vec::new();
     let mut cursor = (0i64, 0i64);
@@ -193,7 +222,22 @@ pub fn encode_tile_mvt(
     let mut value_pool: HashMap<(u8, Vec<u8>), u32> = HashMap::new();
 
     for feature in features {
-        let geometry = encode_geometry(&feature.segments, origin, scale);
+        // Point features (P-CORE.C8: node POIs — every segment is a single
+        // vertex) take the POINT geometry path; anything with a real
+        // polyline stays on the LINESTRING path.
+        let is_point_feature =
+            !feature.segments.is_empty() && feature.segments.iter().all(|s| s.len() == 1);
+        let (geometry, geom_type) = if is_point_feature {
+            (
+                encode_point_geometry(&feature.segments, origin, scale),
+                GEOM_TYPE_POINT,
+            )
+        } else {
+            (
+                encode_geometry(&feature.segments, origin, scale),
+                GEOM_TYPE_LINESTRING,
+            )
+        };
         if geometry.is_empty() {
             continue;
         }
@@ -247,7 +291,7 @@ pub fn encode_tile_mvt(
         layer.features.push(Feature {
             id: feature.way_id,
             tags,
-            geom_type: GEOM_TYPE_LINESTRING,
+            geom_type,
             geometry,
         });
     }
@@ -652,5 +696,52 @@ mod tests {
                 &vec![0, 0, 2, 2, 1, 1], // all three, indices per pool order
             ],
         );
+    }
+
+    #[test]
+    fn single_vertex_features_encode_as_points() {
+        let (min_x, _min_y, max_x, max_y) = geom::tile_bounds(Z, TX, TY);
+        let unit = (max_x - min_x) / f64::from(MVT_EXTENT);
+        let at = |px: f64, py: f64| (min_x + px * unit, max_y - py * unit);
+
+        let peak = TileFeature {
+            way_id: 7,
+            layer: 2,
+            class: b"peak".to_vec(),
+            sac_scale: Vec::new(),
+            name: "Hafelekarspitze".as_bytes().to_vec(),
+            segments: vec![vec![at(100.0, 200.0)]],
+        };
+        let trail = TileFeature {
+            way_id: 8,
+            layer: 0,
+            class: b"path".to_vec(),
+            sac_scale: Vec::new(),
+            name: Vec::new(),
+            segments: vec![vec![at(0.0, 0.0), at(50.0, 0.0)]],
+        };
+
+        let payload = encode_tile_mvt(Z, TX, TY, &[peak, trail]).unwrap();
+        let tile = Tile::decode(payload.as_slice()).unwrap();
+
+        let natural = tile.layers.iter().find(|l| l.name == "natural").unwrap();
+        assert_eq!(natural.features.len(), 1);
+        let p = &natural.features[0];
+        assert_eq!(p.geom_type, GEOM_TYPE_POINT);
+        // One MoveTo command with count 1: (1 & 0x7) | (1 << 3) = 9, then
+        // two zigzag params.
+        assert_eq!(p.geometry.len(), 3);
+        assert_eq!(p.geometry[0], 9);
+        assert_eq!(p.geometry[1], 200); // zigzag(+100)
+        assert_eq!(p.geometry[2], 400); // zigzag(+200)
+        assert_eq!(
+            natural.values[1].string_value.as_deref(),
+            Some("Hafelekarspitze"),
+            "peak keeps its name attribute"
+        );
+
+        // The line feature is untouched by the point path (regression).
+        let highway = tile.layers.iter().find(|l| l.name == "highway").unwrap();
+        assert_eq!(highway.features[0].geom_type, GEOM_TYPE_LINESTRING);
     }
 }

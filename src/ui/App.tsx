@@ -45,6 +45,7 @@ import { requestPersistentStorage } from './services/storageGuard';
 import { MapCompiler } from '../plugins/MapCompiler';
 import { useMapStore } from '../store/mapStore';
 import { useCompilerStore } from '../store/compilerStore';
+import { looksLikeHtmlFallback, looksLikePmtiles } from '../services/archiveValidation';
 import type { DownloadProgressHandle } from './components/DownloadProgressBar';
 
 /** Great-circle distance between two lng/lat points, in meters (haversine). */
@@ -486,12 +487,12 @@ export default function App() {
     setMapDataError(message);
   }, []);
 
-  // BUG(B004): hike.pmtiles/test_graph.tar sandbox fixtures missing, region-download demo path fails — severity: major — repro: tap region download in web build
   // ── Phase 10: Region download orchestrator ────────────────────────────────
   //
   // Flow:
-  //   1. Fetch hike.pmtiles + test_graph.tar from our public sandbox URLs
-  //      (in production these would come from a CDN parametrised by region bbox).
+  //   1. Fetch the sandbox basemap archive (+ optional routing tar) from
+  //      /public URLs (in production these would come from a CDN
+  //      parametrised by region bbox).
   //   2. Read both responses as ArrayBuffers — bypassing the browser cache.
   //   3. Transfer them zero-copy to mapData.worker via DOWNLOAD_REGION_REQUEST.
   //   4. Listen for DOWNLOAD_REGION_SUCCESS or DOWNLOAD_REGION_ERROR.
@@ -511,24 +512,34 @@ export default function App() {
     if (regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing') return;
 
     setRegionDownloadStatus('fetching');
-    setRegionDownloadLabel('Fetching hike.pmtiles…');
+    setRegionDownloadLabel('Fetching basemap archive…');
 
     try {
       // ── Step 1: Open both fetches ───────────────────────────────────────
       // In a production build these URLs would be parametrised from the bbox;
-      // here we always fetch our Andorra sandbox files. fetch() resolves as
-      // soon as headers arrive, so opening both up front lets us size the
-      // progress bar's total before streaming either body.
-      const PMTILES_URL = '/hike.pmtiles';       // served by Vite from /public
-      const ROUTING_URL = '/test_graph.tar';     // served by Vite from /public
+      // here we fetch the REAL sandbox archive that ships under /public
+      // (P-FE.C2, closes tracker B004 — the old /hike.pmtiles never existed,
+      // so the SPA fallback served index.html as a "successful" archive).
+      // fetch() resolves as soon as headers arrive, so opening both up front
+      // lets us size the progress bar's total before streaming either body.
+      const PMTILES_URL = '/local/alps_basemap.pmtiles'; // served by Vite from /public
+      const ROUTING_URL = '/test_graph.tar';             // optional; may not exist
 
       const pmRes = await fetch(PMTILES_URL, { cache: 'no-store' });
       if (!pmRes.ok) throw new Error(`PMTiles fetch failed: ${pmRes.statusText}`);
+      if (looksLikeHtmlFallback(pmRes.headers.get('content-type'))) {
+        throw new Error(
+          `PMTiles fetch for ${PMTILES_URL} answered with HTML (SPA fallback) — archive missing from /public`,
+        );
+      }
 
       let tarRes: Response | null = null;
       try {
         const r = await fetch(ROUTING_URL, { cache: 'no-store' });
-        if (r.ok) tarRes = r;
+        // The SPA fallback answers 200 text/html for ANY missing path —
+        // treat that as "absent", not as a routing graph.
+        if (r.ok && !looksLikeHtmlFallback(r.headers.get('content-type'))) tarRes = r;
+        else console.warn('[Download] test_graph.tar unavailable; routing skipped.');
       } catch {
         // Routing tar is optional — continue with empty buffer if absent.
         console.warn('[Download] test_graph.tar unavailable; routing skipped.');
@@ -543,6 +554,11 @@ export default function App() {
       const pmtilesBuffer = await readResponseWithProgress(pmRes, (n) => {
         downloadProgressHandleRef.current?.addBytes(n);
       });
+      // Magic-byte gate (P6 discipline at the JS seam): never hand a
+      // non-PMTiles body to the worker as an archive.
+      if (!looksLikePmtiles(pmtilesBuffer)) {
+        throw new Error('Downloaded archive failed the PMTiles magic-byte check — refusing to store it');
+      }
 
       let routingBuffer = new ArrayBuffer(0);
       if (tarRes) {

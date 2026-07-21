@@ -177,14 +177,11 @@ describe('finished-record ingest — acknowledge-after-durable-close ordering', 
     expect(opfs.committedBytes('bg_race.pmtiles')).toEqual(BYTES);
   });
 
-  it('B006 (current behavior): seeds the handoff denominator from LOGICAL bytesWritten, not archive size', async () => {
-    // Tracker item B006: the record's bytesWritten is the engine's logical
-    // accounting (index bytes + payload), which exceeds the real archive
-    // size — so the progress bar's initial denominator is wrong until the
-    // mover's first onProgress overwrites it with the stat total. This
-    // test CHARACTERIZES the bug; when B006 is fixed (seed from the
-    // archive's stat size), flip this assertion deliberately and bury the
-    // id with `closes B006` in LOOPLOG.
+  it('seeds the handoff denominator from the archive stat size, not logical bytesWritten (B006 fixed)', async () => {
+    // Flipped in P-FE.C2 (closes B006): this test previously CHARACTERIZED
+    // the bug — the denominator was seeded from the record's bytesWritten,
+    // the engine's logical accounting (index bytes + payload), which
+    // overshoots the real archive. The seed now comes from Filesystem.stat.
     const uri = backend.seed('map_jobs/bg_b006.pmtiles', BYTES);
     const logicalBytes = BYTES.byteLength * 40; // engine accounting ≫ archive size
     mapCompiler.queryBackgroundJob.mockResolvedValue({
@@ -197,7 +194,8 @@ describe('finished-record ingest — acknowledge-after-durable-close ordering', 
 
     await useCompilerStore.getState().discoverBackgroundJobs();
 
-    expect(resetHandoffProgress).toHaveBeenCalledWith(logicalBytes); // ← the B006 wrong seed
+    expect(resetHandoffProgress).toHaveBeenCalledWith(BYTES.byteLength); // real size
+    expect(resetHandoffProgress).not.toHaveBeenCalledWith(logicalBytes);
     expect(mapCompiler.acknowledgeBackgroundJob).toHaveBeenCalledTimes(1);
   });
 

@@ -89,8 +89,12 @@ pub struct Node {
 
 /// The dominant node encoding: parallel arrays where `id`, `lat`, `lon` are
 /// each **delta-coded** (every element is the sint64 difference from the
-/// previous one; the first is relative to 0). `keys_vals` (tag 10) and
-/// `denseinfo` (tag 5) are skipped — Pass 1 wants coordinates only.
+/// previous one; the first is relative to 0). `keys_vals` (tag 10) is the
+/// spec's flattened tag stream — for each node in order, `(key_idx,
+/// val_idx)` StringTable pairs terminated by a single `0` (an untagged
+/// node contributes just the `0`); P-CORE.C8 decodes it for node-POI
+/// (peak) extraction, gated behind a StringTable relevance probe so
+/// peak-free blocks never pay for it. `denseinfo` (tag 5) stays skipped.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DenseNodes {
     #[prost(sint64, repeated, tag = "1")]
@@ -99,6 +103,8 @@ pub struct DenseNodes {
     pub lat: Vec<i64>,
     #[prost(sint64, repeated, tag = "9")]
     pub lon: Vec<i64>,
+    #[prost(int32, repeated, tag = "10")]
+    pub keys_vals: Vec<i32>,
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,17 @@
 @import "tailwindcss";
 
+/* Full-screen map app: the DOCUMENT never scrolls (panels scroll
+   themselves). Locking it here removes the whole failure class where a
+   map-mount re-render resets an incidental WebView document scroll to the
+   top and shifts every tap target (P-FE.C2, closes tracker B003). */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 @keyframes slideUp {
   from {
     transform: translateY(100%);

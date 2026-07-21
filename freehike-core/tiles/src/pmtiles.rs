@@ -6,10 +6,14 @@
 //!
 //! Layout produced by this writer (spec section order):
 //! `header (127) | root directory | JSON metadata | leaf directories | tile data`
-//! P5.C1 writes a **root-only** directory (leaf section present but empty)
-//! — spec-valid at any entry count, though the spec *recommends* leaf
-//! splitting once the root outgrows the initial-fetch window; that split is
-//! a logged follow-up chunk.
+//!
+//! P-CORE.C7 (closes D001): the writer now emits the full directory model —
+//! consecutive tile IDs sharing one payload coalesce into `run_length > 1`
+//! entries ([`coalesce_runs`]), and once the serialized root outgrows
+//! [`ROOT_DIR_BUDGET_BYTES`] it splits into individually-gzip'd leaf
+//! directories addressed by `run_length == 0` pointer entries in the root
+//! ([`build_directories`]). Small archives keep the root-only layout
+//! byte-for-byte (leaf section present but empty).
 
 use std::io::Write;
 
@@ -29,16 +33,84 @@ pub const COMPRESSION_GZIP: u8 = 2;
 pub const TILE_TYPE_MVT: u8 = 1;
 pub const TILE_TYPE_WEBP: u8 = 4;
 
-/// One directory entry. `offset`/`length` address the tile-data section
-/// (offset 0 = first data byte); `run_length` ≥ 1 means this payload serves
-/// that many consecutive tile IDs (P5.C1 always writes 1 — run coalescing
-/// is a logged follow-up optimization).
+/// One directory entry. In a tile directory, `offset`/`length` address the
+/// tile-data section (offset 0 = first data byte) and `run_length ≥ 1`
+/// means this payload serves that many CONSECUTIVE tile IDs. In the root of
+/// a split archive, `run_length == 0` marks a LEAF POINTER: `offset`/
+/// `length` then address the leaf-directories section instead (spec §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirEntry {
     pub tile_id: u64,
     pub offset: u64,
     pub length: u32,
     pub run_length: u32,
+}
+
+/// Split threshold: the spec recommends the root directory stay within the
+/// reader's initial fetch window (16 KiB). We compare the UNCOMPRESSED
+/// serialized root against it — conservative (the gzip'd root is smaller),
+/// deterministic, and spec-valid on both sides of the boundary.
+pub const ROOT_DIR_BUDGET_BYTES: usize = 16_384;
+
+/// First leaf-partition size tried by [`build_directories`]; doubled until
+/// the root of leaf pointers fits the budget.
+const LEAF_SIZE_START: usize = 4_096;
+
+/// Collapses consecutive entries that address the SAME payload for
+/// CONSECUTIVE tile IDs into one `run_length > 1` entry. Input must be
+/// sorted by tile ID (redb key order guarantees this upstream); dedup
+/// back-references coalesce naturally because they share offset+length.
+pub fn coalesce_runs(entries: Vec<DirEntry>) -> Vec<DirEntry> {
+    let mut out: Vec<DirEntry> = Vec::with_capacity(entries.len());
+    for e in entries {
+        if let Some(p) = out.last_mut() {
+            if e.tile_id == p.tile_id + u64::from(p.run_length)
+                && e.offset == p.offset
+                && e.length == p.length
+            {
+                p.run_length += 1;
+                continue;
+            }
+        }
+        out.push(e);
+    }
+    out
+}
+
+/// Builds the directory sections for an archive: returns
+/// `(gzip'd root, concatenated gzip'd leaves)`. Under the budget the root
+/// holds the entries directly and the leaf section is empty; over it, the
+/// entries are partitioned into leaves (each serialized + gzip'd on its
+/// own, so a reader fetches exactly one leaf per lookup) and the root
+/// holds one `run_length == 0` pointer per leaf, keyed by the leaf's first
+/// tile ID. Leaf size starts at [`LEAF_SIZE_START`] entries and doubles
+/// until the root itself fits the budget.
+pub fn build_directories(entries: &[DirEntry]) -> (Vec<u8>, Vec<u8>) {
+    let root_plain = serialize_directory(entries);
+    if root_plain.len() <= ROOT_DIR_BUDGET_BYTES {
+        return (gzip(&root_plain), Vec::new());
+    }
+
+    let mut leaf_size = LEAF_SIZE_START;
+    loop {
+        let mut leaves = Vec::new();
+        let mut root_entries: Vec<DirEntry> = Vec::with_capacity(entries.len() / leaf_size + 1);
+        for chunk in entries.chunks(leaf_size) {
+            let leaf_gz = gzip(&serialize_directory(chunk));
+            root_entries.push(DirEntry {
+                tile_id: chunk[0].tile_id,
+                offset: leaves.len() as u64, // relative to the leaf section
+                length: leaf_gz.len() as u32,
+                run_length: 0, // leaf pointer
+            });
+            leaves.extend_from_slice(&leaf_gz);
+        }
+        let root_plain = serialize_directory(&root_entries);
+        if root_plain.len() <= ROOT_DIR_BUDGET_BYTES || leaf_size >= entries.len() {
+            return (gzip(&root_plain), leaves);
+        }
+        leaf_size *= 2;
+    }
 }
 
 /// Section offsets and stats the header serializes. All offsets are
@@ -343,6 +415,106 @@ mod tests {
             .collect();
         let parsed = parse_directory(&serialize_directory(&entries));
         assert_eq!(parsed, entries);
+    }
+
+    fn entry(tile_id: u64, offset: u64, length: u32, run_length: u32) -> DirEntry {
+        DirEntry {
+            tile_id,
+            offset,
+            length,
+            run_length,
+        }
+    }
+
+    #[test]
+    fn coalesce_collapses_consecutive_identical_payloads() {
+        let coalesced = coalesce_runs(vec![
+            entry(100, 0, 10, 1),
+            entry(101, 0, 10, 1),  // run with 100
+            entry(102, 0, 10, 1),  // run with 100
+            entry(103, 20, 10, 1), // same ids run but different payload
+            entry(105, 0, 10, 1),  // same payload but id gap
+        ]);
+        assert_eq!(
+            coalesced,
+            vec![
+                entry(100, 0, 10, 3),
+                entry(103, 20, 10, 1),
+                entry(105, 0, 10, 1)
+            ]
+        );
+        // Addressed tiles are preserved through the collapse.
+        let addressed: u64 = coalesced.iter().map(|e| u64::from(e.run_length)).sum();
+        assert_eq!(addressed, 5);
+    }
+
+    #[test]
+    fn coalesce_is_identity_for_runless_input() {
+        let entries = vec![entry(10, 0, 5, 1), entry(12, 5, 6, 1), entry(20, 11, 7, 1)];
+        assert_eq!(coalesce_runs(entries.clone()), entries);
+    }
+
+    #[test]
+    fn build_directories_keeps_small_roots_leafless() {
+        let entries: Vec<DirEntry> = (0..100u64).map(|i| entry(i * 2, i * 10, 10, 1)).collect();
+        let (root_gz, leaves) = build_directories(&entries);
+        assert!(leaves.is_empty());
+        assert_eq!(parse_directory(&gunzip(&root_gz)), entries);
+    }
+
+    #[test]
+    fn build_directories_splits_oversized_roots_into_resolvable_leaves() {
+        // IDs spaced by 2 so nothing coalesces; ~30k entries serialize far
+        // past the 16 KiB root budget.
+        let entries: Vec<DirEntry> = (0..30_000u64)
+            .map(|i| entry(i * 2, (i % 7) * 100, 100, 1))
+            .collect();
+        let (root_gz, leaves) = build_directories(&entries);
+        assert!(!leaves.is_empty(), "must split");
+
+        let root = parse_directory(&gunzip(&root_gz));
+        assert!(
+            serialize_directory(&root).len() <= ROOT_DIR_BUDGET_BYTES,
+            "root of leaf pointers must fit the budget"
+        );
+        assert!(
+            root.iter().all(|e| e.run_length == 0),
+            "root holds leaf pointers only"
+        );
+        assert!(
+            root.len() < entries.len() / 100,
+            "root is a small index over leaves"
+        );
+
+        // Resolve a probe tile through its leaf, spec-style: last root entry
+        // with tile_id <= probe → gunzip that leaf slice → find the entry.
+        let probe = entries[12_345];
+        let leaf_ptr = root
+            .iter()
+            .rev()
+            .find(|e| e.tile_id <= probe.tile_id)
+            .expect("a leaf must cover the probe");
+        let start = leaf_ptr.offset as usize;
+        let leaf = parse_directory(&gunzip(&leaves[start..start + leaf_ptr.length as usize]));
+        assert_eq!(
+            leaf.iter().find(|e| e.tile_id == probe.tile_id),
+            Some(&probe),
+            "leaf lookup must return the original entry byte-exactly"
+        );
+
+        // Every entry survives the partition, in order.
+        let mut reassembled = Vec::with_capacity(entries.len());
+        for ptr in &root {
+            let s = ptr.offset as usize;
+            reassembled.extend(parse_directory(&gunzip(
+                &leaves[s..s + ptr.length as usize],
+            )));
+        }
+        assert_eq!(reassembled, entries);
+
+        // Determinism (the engine's sliced-equals-single proof rides on it).
+        let (root2, leaves2) = build_directories(&entries);
+        assert_eq!((root_gz, leaves), (root2, leaves2));
     }
 
     #[test]

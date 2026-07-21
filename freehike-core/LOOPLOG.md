@@ -2598,3 +2598,184 @@ green ×2 consecutive, tsc -b clean, eslint clean, janitor --fix +
 pending the operator's commit (git is HITL).
 
 **Status:** CLOSED locally; CI proof lands with the next push.
+
+---
+
+## P-FE.C2 — Frontend bug sweep (2026-07-20)
+
+**Plan:** close B003/B004/B005/B006 with per-bug proofs named first (flipped
+B006 seam test; new archiveValidation + opfsRetry suites; live browser
+verification for the CSS/document fix and the download URL).
+
+**Kill entry:**
+- B003: document pinned (html/body/#root height 100%, overflow hidden,
+  overscroll none) — a full-screen map app has no document scroll, so the
+  mount-reset class is gone. Browser-verified: doc not scrollable, forced
+  scrollTo(0,500) stays at 0. closes B003
+- B004: region download repointed at the real /local/alps_basemap.pmtiles
+  + P6-style hostile-response guards at the JS seam (HTML-fallback
+  content-type check on both fetches, PMTiles magic-byte gate before the
+  worker write) in new services/archiveValidation.ts (8 tests).
+  Browser-verified: URL serves bytes with "PMTiles" magic. closes B004
+- B005: bounded retry (10×150ms) on exclusive sync-handle acquisition in
+  mapData.worker via new workers/opfsRetry.ts — bridges the reload-killed
+  previous worker's teardown window; non-lock errors rethrow immediately;
+  a REAL second holder still fails loudly (4 tests against fakeOpfs's real
+  lock semantics). Browser-verified: forced reload boots to a fully
+  rendered map. closes B005
+- B006: ingest denominator now seeded from Filesystem.stat archive size,
+  not the record's logical bytesWritten; characterization test flipped to
+  pin the fix. closes B006
+- Observation → new tag B008 (minor): sprite URL rejected as relative +
+  non-vendored contour-label fontstack falls back to local glyphs.
+Proofs: vitest 53/53 (incl. flipped B006), tsc -b clean, eslint clean,
+live preview verification, janitor --fix clean.
+
+**Status:** CLOSED.
+
+---
+
+## P-NATIVE.C1 — Shell hardening: B007, D007, D005 (+ D004 partial) (2026-07-20)
+
+**Plan:**
+1. B007 (Kotlin): per-job cancellation token (AtomicReference to the RUNNING
+   job's own AtomicBoolean) — cancel can no longer strike a queued job whose
+   flag was reset at enqueue time. Proof: compileDebugKotlin + code-level
+   invariant (token created per startJob, cleared per terminal).
+2. D007 (Kotlin): handleOnDestroy stops the orphan — destroyed flag checked
+   in the slice loop (stop WITHOUT purge: a reload must keep the checkpoint
+   for resume; purge stays cancel-only), active token raised, executor
+   shutdownNow; straggler sweep guards against post-shutdown execute.
+3. D005 (Swift): full Android-parity port — PendingJobStore gains
+   dirtyAttempts/cleanStop (optional fields keep old JSON decodable),
+   NSRecursiveLock-serialized CAS updatePending, terminal transitions CAS'd;
+   scheduler window gains the circuit breaker (>5 dirty windows → markFailed
+   + purge + emit) with cleanStop marks on every deliberate exit and
+   dirty-reset after the first completed slice; enqueue single-slot guard;
+   targeted acknowledge (jobId match + archive delete + purge); new
+   cancelBackgroundJob (BGTask cancel + purge + archive delete + 5s
+   straggler sweep) registered in pluginMethods.
+4. D004 partial: swiftc -parse syntax gate over the whole Swift shell (this
+   CLT-only env cannot link Capacitor/UIKit — full build + device smokes
+   remain operator-gated; D004 tag STAYS).
+Proofs: :app:compileDebugKotlin clean, swiftc -parse clean, janitor --fix
+clean with closes B007 / closes D007 / closes D005.
+
+**Kill entry (P-NATIVE.C1):**
+- B007: cancellation is now a per-job token (AtomicReference to the RUNNING
+  loop's own AtomicBoolean, set at loop start, CAS-cleared at terminal) —
+  cancelJob strikes exactly the running job; queued jobs keep untouched
+  tokens; resolve reports whether anything was running. closes B007
+- D007: handleOnDestroy raises a destroyed flag (loop exits at the next
+  slice boundary WITHOUT purging — reload ≠ cancel, the checkpoint survives
+  for resume), cancels the active token, shutdownNow()s the executor
+  (queued loops' PluginCalls died with the WebView); straggler sweep guards
+  isShutdown. closes D007
+- D005: full Android-parity port to the iOS shell — PendingJobStore gains
+  dirtyAttempts/cleanStop (optional fields keep pre-parity JSON decoding),
+  NSRecursiveLock serialization, CAS updatePending with markFinished/
+  markFailed as guarded terminal transitions (anti-resurrection);
+  BGProcessingTask window gains the circuit breaker (>5 dirty windows →
+  markFailed + purge + emit; dirty reset after first completed slice;
+  cleanStop marks on expiration / thermal-Critical / failedTransient
+  handbacks); enqueue enforces the single-slot invariant natively;
+  acknowledge is jobId-targeted and deletes the sandbox archive + purges;
+  new cancelBackgroundJob (BGTask cancel + clear + purge + archive delete
+  + 5s straggler sweep) registered in pluginMethods. closes D005
+- D004 partial: swiftc -parse clean over MapCompilerPlugin/AppDelegate/
+  MainViewController. Full build/link + device smokes remain OPERATOR-GATED
+  (CLT-only env, no iphoneos SDK) — D004 tag stays open by design.
+Proofs: :app:compileDebugKotlin clean, swiftc -parse ×3 clean, janitor
+--fix clean.
+
+**Status:** CLOSED (D004 remains open, correctly).
+
+---
+
+## P-CORE.C7 — PMTiles leaf directories + run-length coalescing (D001) (2026-07-20)
+
+**Plan:**
+1. pmtiles.rs gains two pure policies: `coalesce_runs` (consecutive tile
+   IDs sharing one payload collapse into a run_length>1 entry) and
+   `build_directories` (root serialized ≤ 16,384 bytes UNCOMPRESSED —
+   conservative reading of the spec's initial-fetch recommendation — else
+   iterative leaf split: chunks of 4096 entries doubling until the root of
+   run_length=0 leaf pointers fits; each leaf individually gzip'd per the
+   internal-compression rule).
+2. finalize.rs assemble_archive: coalesce → build_directories → header
+   gains real leaf_dirs_length, n_addressed_tiles = Σ run_length,
+   n_tile_entries = post-coalesce count; layout header|root|metadata|
+   leaves|data.
+3. Proofs (named first): golden run-length serialization; coalesce unit
+   cases (runs, dedup back-references, non-consecutive ids); root-only
+   path unchanged for small fixtures (existing tests must stay green
+   verbatim); `adjacent_identical_payloads_coalesce_into_runs` (10-run →
+   1 entry, addressed=10/entries=1/contents=1); 
+   `oversized_root_splits_into_leaf_directories` (30k entries → leaf
+   section non-empty, root ≤ budget, probe tile resolved through its leaf
+   byte-exactly, assembly deterministic); ignored Innsbruck e2e band
+   re-check.
+
+**Kill entry (P-CORE.C7):** pmtiles.rs gains `coalesce_runs` (consecutive
+tile IDs sharing a payload → run_length>1; dedup back-references coalesce
+naturally) and `build_directories` (root ≤ 16,384 serialized bytes
+UNCOMPRESSED — conservative spec reading — else iterative leaf split:
+4096-entry chunks doubling until the run_length=0 pointer root fits; each
+leaf individually gzip'd). assemble_archive wires both: real
+leaf_dirs_length, n_addressed_tiles = Σ run_length, n_tile_entries =
+post-coalesce count; layout header|root|metadata|leaves|data. Proofs: 6
+new tests (coalesce unit cases incl. id-gap and payload-change breaks;
+root-only identity under budget; 30k-entry split with spec-style probe
+resolution through a leaf, full partition reassembly, and byte-identical
+determinism; archive-level run test 10→1 entry with addressed=10; leaf
+archive with data-follows-leaves layout + idempotent re-assembly).
+Existing root-only tests green VERBATIM (small fixtures untouched);
+ignored Innsbruck e2e green — 1030 entries, band unchanged, 12 yields.
+Full ladder: 17 workspace suites, clippy -D warnings, fmt. JS-reader
+note: leaf resolution follows the spec the pmtiles v4 reader implements
+natively; live render continues to validate the root-only path. closes D001
+
+**Status:** CLOSED.
+
+**Kill entry (P-CORE.C8):**
+- D002: node-POI (peak) pipeline is REAL end to end — DenseNodes keys_vals
+  decoded behind a StringTable relevance probe (peak-free blocks never pay;
+  the P2 prefilter discipline), Pass 1 extracts natural=peak nodes with
+  names into the new sparse POIS table (same durability ordering as
+  coords: flush before offset report, idempotent upserts), Pass 3's tail
+  drains them via run_poi_binning into single-vertex TileFeatures rows in
+  the natural layer (class=peak, node ids carry POI_FEATURE_ID_BIT so the
+  overlapping OSM id spaces can't collide), and the MVT encoder gained the
+  POINT geometry path (MULTIPOINT MoveTo, spec §4.3.4.2). No FFI surface
+  change, no checkpoint format change (extraction rides Pass 1's existing
+  cursor; binning is one idempotent block like Finalize assembly). Proofs:
+  pass1 extraction + probe tests, binning + id-bit + idempotence test,
+  MVT point wire test with line regression, engine e2e (blocks accounting
+  + archive), REAL Innsbruck: 619 peaks extracted → blocks 93085→93704,
+  tiles 1030→1032, e2e green. closes D002
+- D003: freehike-core/scripts/mem_gate.sh written per manual L3a — samples
+  dirty-anon (macOS vmmap Physical footprint / Linux RssAnon) across the
+  spawned command's process tree, warm-builds the default cargo driver
+  unsampled so rustc never pollutes the gate, fail-hard over the limit.
+  Live run: peak 61MB vs the 50MB ceiling with the Innsbruck TEST-BINARY
+  driver — the threshold was NOT touched (manual forbids); the overshoot
+  is attributed to libtest/cargo harness overhead the budget never
+  budgeted for, and the harness-free CLI driver + in-process allocator
+  second opinion are rescoped into NEW D009 (with the Austria on-device
+  run + iOS increased-memory entitlement; sites: mem_gate.sh header +
+  MapCompilerPlugin.swift). The default invocation currently FAILS LOUDLY
+  by design. closes D003
+- B002: timeboxed investigation — CANNOT REPRODUCE on current main: two
+  full boots (fresh server + forced reload), terrain + hillshade +
+  contours all rendering, zero detached-ArrayBuffer errors, against a
+  documented 6-per-load as of 2026-07-17. Root-cause hypothesis: the
+  error was a symptom of the pre-P9.C4 silent HTTP-fallback path feeding
+  raster-dem tiles through MapLibre's remote-tile pipeline; the
+  OPFS-worker source allocates a fresh buffer per read, so the
+  double-transfer can't alias. Closed as verified-unreproducible; the
+  disproven-fix history stays in agent memory + this log for any
+  resurfacing. closes B002
+Ladder: 17 workspace suites green, clippy -D warnings clean, fmt clean,
+Innsbruck e2e green, aarch64-linux-android ffi check clean.
+
+**Status:** CLOSED.

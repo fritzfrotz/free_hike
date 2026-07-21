@@ -33,6 +33,38 @@ use crate::{
 pub const TILE_FEATURES: TableDefinition<(u8, u32, u32, u64), &[u8]> =
     TableDefinition::new("TileFeatures");
 
+/// High-bit marker on the key's feature-id slot for NODE-derived features
+/// (peaks): OSM node and way id spaces overlap numerically, so without it
+/// a peak node could collide with a way binned into the same tile. Real
+/// OSM ids stay far below 2^63.
+pub const POI_FEATURE_ID_BIT: u64 = 1 << 63;
+
+/// Drains the sparse [`crate::POIS`] table into point rows of
+/// [`TILE_FEATURES`] (P-CORE.C8, closes D002): each peak becomes a
+/// single-vertex feature in the `natural` layer with `class=peak`, keyed
+/// by its z14 tile and `node_id | POI_FEATURE_ID_BIT`. Idempotent
+/// (last-write-wins upserts) — safe to re-run on any Pass-3 resume.
+/// Returns the number of POIs binned.
+pub fn run_poi_binning(db: &Database) -> Result<u64, IndexError> {
+    let pois = crate::all_pois(db)?;
+    if pois.is_empty() {
+        return Ok(0);
+    }
+    let rows: Vec<PendingFeature> = pois
+        .into_iter()
+        .map(|(node_id, x, y, name)| {
+            let (tx, ty) = geom::mercator_to_tile(x, y, BASE_TILE_ZOOM);
+            (
+                (BASE_TILE_ZOOM, tx, ty, node_id | POI_FEATURE_ID_BIT),
+                encode_tile_segments(2 /* natural */, b"peak", b"", &name, &[vec![(x, y)]]),
+            )
+        })
+        .collect();
+    let n = rows.len() as u64;
+    insert_tile_features_batched(db, rows, crate::DEFAULT_BATCH_SIZE)?;
+    Ok(n)
+}
+
 /// The fixed zoom Pass 3 bins at — the base vector-tile level; overview
 /// zooms are derived later from these tiles, not re-binned from raw ways.
 pub const BASE_TILE_ZOOM: u8 = 14;
@@ -881,6 +913,38 @@ mod tests {
         assert!(
             matches!(&err, IndexError::InvalidInput(m) if m.contains("no tag record")),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn poi_binning_creates_point_features_with_id_bit() {
+        let dir = tmp_dir("poi-bin");
+        let db = crate::open_coord_db(&dir.join("idx.redb")).unwrap();
+        let merc = crate::web_mercator(11.3908, 47.2757);
+        crate::insert_pois(&db, &[(4_242, merc, b"Patscherkofel".to_vec())]).unwrap();
+
+        assert_eq!(run_poi_binning(&db).unwrap(), 1);
+        let (tx, ty) = geom::mercator_to_tile(merc.0, merc.1, BASE_TILE_ZOOM);
+        let feats = get_tile_features(&db, BASE_TILE_ZOOM, tx, ty).unwrap();
+        assert_eq!(feats.len(), 1);
+        let f = &feats[0];
+        assert_eq!(
+            f.way_id,
+            4_242 | POI_FEATURE_ID_BIT,
+            "node ids carry the POI bit"
+        );
+        assert_eq!(f.layer, 2, "peaks live in the natural layer");
+        assert_eq!(f.class, b"peak".to_vec());
+        assert_eq!(f.name, b"Patscherkofel".to_vec());
+        assert_eq!(f.segments, vec![vec![merc]], "single-vertex point geometry");
+
+        // Idempotent re-run (Pass-3 resume path): still exactly one row.
+        assert_eq!(run_poi_binning(&db).unwrap(), 1);
+        assert_eq!(
+            get_tile_features(&db, BASE_TILE_ZOOM, tx, ty)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

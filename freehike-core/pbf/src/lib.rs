@@ -40,8 +40,8 @@ pub use scan::{
     RELEVANT_TAG_KEYS,
 };
 pub use tile::{
-    decode_tile_segments, encode_tile_segments, get_tile_features, run_pass3_slice, Pass3Slice,
-    BASE_TILE_ZOOM, TILE_FEATURES,
+    decode_tile_segments, encode_tile_segments, get_tile_features, run_pass3_slice,
+    run_poi_binning, Pass3Slice, BASE_TILE_ZOOM, POI_FEATURE_ID_BIT, TILE_FEATURES,
 };
 
 use std::fmt;
@@ -49,13 +49,14 @@ use std::fs::File;
 use std::path::Path;
 
 use memmap2::Mmap;
-use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition, TableError};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableError,
+};
 
 // ---------------------------------------------------------------------------
 // RAM budget
 // ---------------------------------------------------------------------------
 
-// DEBT(D003): RSS:anon CI gate missing (mem_gate.sh not yet written), Austria-scale on-device index run and iOS increased-memory entitlement pending — platforms: core
 /// The project-wide hard ceiling for compile-pipeline heap use.
 pub const RAM_CEILING_BYTES: usize = 50 * 1024 * 1024;
 
@@ -101,6 +102,15 @@ pub const WAYS: TableDefinition<u64, &[u8]> = TableDefinition::new("Ways");
 /// redb's table-type mismatch — refuse rather than guess, same posture as
 /// the checkpoint version gate.
 pub const WAY_TAGS: TableDefinition<u64, RawWayTagsValue> = TableDefinition::new("WayTags");
+
+/// Node POIs (P-CORE.C8, closes D002): `node_id → (merc_x, merc_y, name)`
+/// for `natural=peak` nodes — the one node-tagged feature class the
+/// ways-only pipeline was blind to (peak names). Sparse by nature (an
+/// Alpine extract holds hundreds, not millions), written by Pass 1 behind
+/// a StringTable relevance probe, drained into point `TileFeatures` rows
+/// at the end of Pass 3, and purged with the rest of the per-job index.
+/// `name` may be empty (unnamed summit) — still rendered as a peak.
+pub const POIS: TableDefinition<u64, (f64, f64, &'static [u8])> = TableDefinition::new("Pois");
 
 /// Raw [`WAY_TAGS`] row shape: `(layer, class, sac_scale, name)`. The
 /// `'static` lifetimes are only the redb schema marker — reads and writes
@@ -328,6 +338,61 @@ pub fn get_coord(db: &Database, node_id: u64) -> Result<Option<(f64, f64)>, Inde
 pub fn coord_count(db: &Database) -> Result<u64, IndexError> {
     let tx = db.begin_read().map_err(db_err)?;
     let table = match tx.open_table(COORDINATES) {
+        Ok(t) => t,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(db_err(e)),
+    };
+    table.len().map_err(db_err)
+}
+
+/// Upserts peak POIs in ONE write transaction — the table is sparse (an
+/// extract's peak count is bounded by geology, not data volume), so the
+/// batched-commit machinery the node/way tables need would be ceremony.
+/// Last-write-wins upserts keep re-scanned blocks idempotent, same as
+/// Pass 1's coordinate inserts.
+pub fn insert_pois(db: &Database, pois: &[(u64, (f64, f64), Vec<u8>)]) -> Result<u64, IndexError> {
+    if pois.is_empty() {
+        return Ok(0);
+    }
+    let tx = db.begin_write().map_err(db_err)?;
+    {
+        let mut table = tx.open_table(POIS).map_err(db_err)?;
+        for (id, (x, y), name) in pois {
+            table
+                .insert(id, (*x, *y, name.as_slice()))
+                .map_err(db_err)?;
+        }
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(pois.len() as u64)
+}
+
+/// One [`all_pois`] row: `(node_id, merc_x, merc_y, name)`.
+pub type PoiRow = (u64, f64, f64, Vec<u8>);
+
+/// Every POI, ascending node id: `(node_id, merc_x, merc_y, name)`.
+/// Materializes the whole table — sound ONLY because peaks are sparse
+/// (hundreds per Alpine extract); never copy this pattern for node/way
+/// tables.
+pub fn all_pois(db: &Database) -> Result<Vec<PoiRow>, IndexError> {
+    let tx = db.begin_read().map_err(db_err)?;
+    let table = match tx.open_table(POIS) {
+        Ok(t) => t,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(db_err(e)),
+    };
+    let mut out = Vec::new();
+    for row in table.iter().map_err(db_err)? {
+        let (k, v) = row.map_err(db_err)?;
+        let (x, y, name) = v.value();
+        out.push((k.value(), x, y, name.to_vec()));
+    }
+    Ok(out)
+}
+
+pub fn poi_count(db: &Database) -> Result<u64, IndexError> {
+    let tx = db.begin_read().map_err(db_err)?;
+    let table = match tx.open_table(POIS) {
         Ok(t) => t,
         Err(TableError::TableDoesNotExist(_)) => return Ok(0),
         Err(e) => return Err(db_err(e)),

@@ -433,11 +433,10 @@ export default function MapView({
         });
         const terrainPMTiles = registerSource(DEFAULT_TERRAIN);
 
-        // BUG(B003): map-mount re-render resets WebView scroll to top — severity: minor — repro: LOOPLOG A4 tap-targeting notes
         if (mapContainerRef.current) {
           setStatusMessage('Mounting map container canvas…');
 
-          // BUG(B002): hillshade/terrain detached-ArrayBuffer console error on load, pre-existing ("split sources" fix disproven 2026-07-17) — severity: major — repro: boot app, open devtools console
+          // BUG(B008): style asset gaps, sprite URL rejected as relative by MapLibre and a contour-label fontstack is not in the vendored glyph set (local glyph fallback renders digits) — severity: minor — repro: boot dev app, console shows sprite error + glyph range warnings
           map = new maplibregl.Map({
             container: mapContainerRef.current,
             // ── Phase Block-1: High-contrast 3D alpine style ─────────────

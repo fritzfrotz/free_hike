@@ -126,6 +126,59 @@ pub fn synthetic_pbf_with_ways(
     node_groups: &[&[(i64, i64, i64)]],
     way_groups: &[&[FixtureWay<'_>]],
 ) -> Vec<u8> {
+    synthetic_pbf_with_ways_and_peaks(node_groups, way_groups, &[])
+}
+
+/// One peak node for [`peak_dense_block`]: `(node_id, lat_units,
+/// lon_units, name)` — empty name = unnamed summit.
+pub type FixturePeak<'a> = (i64, i64, i64, &'a [u8]);
+
+/// Dense block whose nodes carry `natural=peak` (+ optional `name`) tags:
+/// the `keys_vals` inverse of Pass 1's POI extraction, with the
+/// StringTable laid out so the relevance probe fires.
+pub fn peak_dense_block(peaks: &[FixturePeak<'_>]) -> PrimitiveBlock {
+    let mut strings: Vec<Vec<u8>> = vec![
+        Vec::new(), // index 0 reserved (the keys_vals terminator)
+        b"natural".to_vec(),
+        b"peak".to_vec(),
+        b"name".to_vec(),
+    ];
+    let mut dense = DenseNodes::default();
+    let (mut pid, mut plat, mut plon) = (0i64, 0i64, 0i64);
+    for &(id, lat, lon, name) in peaks {
+        dense.id.push(id - pid);
+        dense.lat.push(lat - plat);
+        dense.lon.push(lon - plon);
+        (pid, plat, plon) = (id, lat, lon);
+        dense.keys_vals.push(1); // natural
+        dense.keys_vals.push(2); // peak
+        if !name.is_empty() {
+            strings.push(name.to_vec());
+            dense.keys_vals.push(3); // name
+            dense.keys_vals.push((strings.len() - 1) as i32);
+        }
+        dense.keys_vals.push(0); // node's tag list ends
+    }
+    PrimitiveBlock {
+        stringtable: Some(StringTable { s: strings }),
+        primitivegroup: vec![PrimitiveGroup {
+            nodes: vec![],
+            dense: Some(dense),
+        }],
+        granularity: None,
+        lat_offset: None,
+        lon_offset: None,
+    }
+}
+
+/// Full fixture with a peak-bearing dense block appended after the plain
+/// node blocks (still nodes-before-ways). Empty `peaks` emits no block —
+/// [`synthetic_pbf_with_ways`] delegates here.
+pub fn synthetic_pbf_with_ways_and_peaks(
+    node_groups: &[&[(i64, i64, i64)]],
+    way_groups: &[&[FixtureWay<'_>]],
+    peaks: &[FixturePeak<'_>],
+) -> Vec<u8> {
     let mut bytes = frame(
         "OSMHeader",
         &Blob {
@@ -136,6 +189,9 @@ pub fn synthetic_pbf_with_ways(
     );
     for group in node_groups {
         bytes.extend_from_slice(&frame("OSMData", &data_blob(&dense_block(group, None))));
+    }
+    if !peaks.is_empty() {
+        bytes.extend_from_slice(&frame("OSMData", &data_blob(&peak_dense_block(peaks))));
     }
     for ways in way_groups {
         bytes.extend_from_slice(&way_block(ways));

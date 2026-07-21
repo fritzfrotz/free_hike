@@ -22,7 +22,7 @@
 //! finished entry set, re-orders payloads into ascending-tile-ID (Hilbert)
 //! order — making the archive genuinely `clustered` per spec, with dedup
 //! entries pointing back at first occurrences — and writes
-//! `header | root directory | metadata | (empty leaf section) | tile data`
+//! `header | root directory | metadata | leaf directories | tile data`
 //! to a temp file, fsyncs, and renames. Killed after the rename, a resume
 //! simply re-assembles byte-identical output.
 
@@ -43,7 +43,9 @@ use pbf::IndexError;
 
 use crate::hilbert::{tile_id, tile_id_to_zxy};
 use crate::mvt::encode_tile_mvt;
-use crate::pmtiles::{encode_header, gzip, serialize_directory, DirEntry, Header, HEADER_BYTES};
+use crate::pmtiles::{
+    build_directories, coalesce_runs, encode_header, gzip, DirEntry, Header, HEADER_BYTES,
+};
 
 /// Finalize bookkeeping: PMTiles tile ID → `(offset, length)` of the
 /// gzipped MVT payload in the temporary data file. Lives in the same
@@ -434,7 +436,12 @@ pub fn assemble_archive(
         max_zoom = BASE_TILE_ZOOM;
     }
 
-    let root_dir = gzip(&serialize_directory(&dir));
+    // D001: collapse consecutive-ID identical payloads into runs, then let
+    // the directory builder decide root-only vs. leaf split.
+    let dir = coalesce_runs(dir);
+    let n_addressed_tiles: u64 = dir.iter().map(|e| u64::from(e.run_length)).sum();
+    let n_tile_entries = dir.len() as u64;
+    let (root_dir, leaf_dirs) = build_directories(&dir);
     // TileJSON vector_layers: one entry per taxonomy layer, each carrying
     // the per-feature `class` attribute (P5.C2). Listing all four
     // unconditionally is deliberate — styles reference them statically and
@@ -467,8 +474,7 @@ pub fn assemble_archive(
     let root_dir_offset = HEADER_BYTES as u64;
     let metadata_offset = root_dir_offset + root_dir.len() as u64;
     let leaf_dirs_offset = metadata_offset + metadata.len() as u64;
-        // DEBT(D001): PMTiles writer is root-directory-only; leaf splitting and run-length coalescing needed at scale — platforms: core
-    let tile_data_offset = leaf_dirs_offset; // leaf section present but empty
+    let tile_data_offset = leaf_dirs_offset + leaf_dirs.len() as u64;
     let (west, south, east, north) = bounds_deg;
 
     let header = Header {
@@ -477,11 +483,11 @@ pub fn assemble_archive(
         metadata_offset,
         metadata_length: metadata.len() as u64,
         leaf_dirs_offset,
-        leaf_dirs_length: 0,
+        leaf_dirs_length: leaf_dirs.len() as u64,
         tile_data_offset,
         tile_data_length: data_len,
-        n_addressed_tiles: entries.len() as u64,
-        n_tile_entries: entries.len() as u64,
+        n_addressed_tiles,
+        n_tile_entries,
         n_tile_contents: copy_order.len() as u64,
         clustered: true,
         tile_compression: crate::pmtiles::COMPRESSION_GZIP,
@@ -500,6 +506,7 @@ pub fn assemble_archive(
     out.write_all(&encode_header(&header)).map_err(io_err)?;
     out.write_all(&root_dir).map_err(io_err)?;
     out.write_all(&metadata).map_err(io_err)?;
+    out.write_all(&leaf_dirs).map_err(io_err)?;
 
     if !copy_order.is_empty() {
         let mut data = File::open(data_path).map_err(io_err)?;
@@ -527,20 +534,19 @@ pub fn assemble_archive(
     #[cfg(unix)]
     {
         let dir = out_path.parent().unwrap_or_else(|| Path::new("."));
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io_err)?;
+        File::open(dir).and_then(|d| d.sync_all()).map_err(io_err)?;
     }
     info!(
-        "finalize: archive assembled at '{}' ({} entries, {} bytes, rename + dir fsync durable)",
+        "finalize: archive assembled at '{}' ({n_tile_entries} entries / {n_addressed_tiles} addressed tiles, \
+         {} leaf-dir bytes, {} bytes total, rename + dir fsync durable)",
         out_path.display(),
-        entries.len(),
+        leaf_dirs.len(),
         tile_data_offset + data_len
     );
 
     Ok(ArchiveInfo {
-        addressed_tiles: entries.len() as u64,
-        tile_entries: entries.len() as u64,
+        addressed_tiles: n_addressed_tiles,
+        tile_entries: n_tile_entries,
         tile_contents: copy_order.len() as u64,
         tile_data_bytes: data_len,
         archive_bytes: tile_data_offset + data_len,
@@ -978,5 +984,110 @@ mod tests {
         assert_eq!(tile_feature_row_count(&db).unwrap(), 0);
         seed_dummy_rows(&db);
         assert_eq!(tile_feature_row_count(&db).unwrap(), 3);
+    }
+
+    /// Seeds TILE_ENTRIES directly (bypassing the encode stage) — the
+    /// assembly-stage contract is entry-set → archive, so driving it from
+    /// the committed table is the honest unit boundary.
+    fn seed_entries(db: &Database, entries: &[(u64, u64, u64)]) {
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(TILE_ENTRIES).unwrap();
+            for &(tid, off, len) in entries {
+                t.insert(tid, (off, len)).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    /// D001: consecutive tile IDs sharing one payload assemble into a
+    /// single run_length entry; header stats keep the addressed count.
+    #[test]
+    fn adjacent_identical_payloads_coalesce_into_runs() {
+        let dir = tmp_dir("runs");
+        let db = pbf::open_coord_db(&dir.join("job.index.redb")).unwrap();
+        let rows: Vec<(u64, u64, u64)> = (1_000..1_010).map(|tid| (tid, 0, 50)).collect();
+        seed_entries(&db, &rows);
+        let data_path = dir.join("job.tiledata.tmp");
+        std::fs::write(&data_path, vec![7u8; 50]).unwrap();
+
+        let out = dir.join("job.pmtiles");
+        let info = assemble_archive(&db, &data_path, &out, BBOX).unwrap();
+        assert_eq!(info.addressed_tiles, 10);
+        assert_eq!(
+            info.tile_entries, 1,
+            "ten consecutive ids collapse to one run entry"
+        );
+        assert_eq!(info.tile_contents, 1);
+
+        let bytes = std::fs::read(&out).unwrap();
+        let h = parse_header(&bytes);
+        assert_eq!((h.addressed, h.entries, h.contents), (10, 1, 1));
+        assert_eq!(h.leaf.1, 0, "tiny archive stays root-only");
+        let root = parse_directory(&gunzip(
+            &bytes[h.root.0 as usize..(h.root.0 + h.root.1) as usize],
+        ));
+        assert_eq!(root.len(), 1);
+        assert_eq!((root[0].tile_id, root[0].run_length), (1_000, 10));
+        assert_eq!(h.data.0 + h.data.1, bytes.len() as u64, "data ends at EOF");
+    }
+
+    /// D001: an entry set whose serialized root exceeds the 16 KiB budget
+    /// splits into leaf directories; a probe tile resolves through its
+    /// leaf byte-exactly and the data section still ends at EOF.
+    #[test]
+    fn oversized_root_splits_into_leaf_archive() {
+        let dir = tmp_dir("leaves");
+        let db = pbf::open_coord_db(&dir.join("job.index.redb")).unwrap();
+        // IDs spaced by 2 → no coalescing; one shared payload → full dedup.
+        let rows: Vec<(u64, u64, u64)> = (0..30_000u64).map(|i| (i * 2, 0, 50)).collect();
+        seed_entries(&db, &rows);
+        let data_path = dir.join("job.tiledata.tmp");
+        std::fs::write(&data_path, vec![9u8; 50]).unwrap();
+
+        let out = dir.join("job.pmtiles");
+        let info = assemble_archive(&db, &data_path, &out, BBOX).unwrap();
+        assert_eq!(info.tile_entries, 30_000);
+        assert_eq!(info.tile_contents, 1);
+
+        let bytes = std::fs::read(&out).unwrap();
+        let h = parse_header(&bytes);
+        assert!(h.leaf.1 > 0, "root must have split into leaves");
+        assert_eq!(
+            h.data.0,
+            h.leaf.0 + h.leaf.1,
+            "data follows the leaf section"
+        );
+        assert_eq!(h.data.0 + h.data.1, bytes.len() as u64, "data ends at EOF");
+        assert_eq!(h.data.1, 50, "single dedup'd payload");
+
+        let root = parse_directory(&gunzip(
+            &bytes[h.root.0 as usize..(h.root.0 + h.root.1) as usize],
+        ));
+        assert!(
+            root.iter().all(|e| e.run_length == 0),
+            "root holds leaf pointers"
+        );
+        assert!(
+            crate::pmtiles::serialize_directory(&root).len()
+                <= crate::pmtiles::ROOT_DIR_BUDGET_BYTES,
+            "root fits the initial-fetch budget"
+        );
+
+        // Spec-style resolve of tile id 24_690 (= entry #12_345).
+        let probe_id = 24_690u64;
+        let ptr = root.iter().rev().find(|e| e.tile_id <= probe_id).unwrap();
+        let start = (h.leaf.0 + ptr.offset) as usize;
+        let leaf = parse_directory(&gunzip(&bytes[start..start + ptr.length as usize]));
+        let hit = leaf
+            .iter()
+            .find(|e| e.tile_id == probe_id)
+            .expect("probe resolves");
+        assert_eq!((hit.offset, hit.length, hit.run_length), (0, 50, 1));
+
+        // Idempotent re-assembly stays byte-identical (crash-resume path).
+        let out2 = dir.join("job2.pmtiles");
+        assemble_archive(&db, &data_path, &out2, BBOX).unwrap();
+        assert_eq!(std::fs::read(&out2).unwrap(), bytes);
     }
 }

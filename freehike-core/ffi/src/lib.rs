@@ -265,7 +265,10 @@ fn to_job_spec(job: &CompileJob) -> Result<JobSpec, String> {
 fn to_status(job_id: &str, outcome: SliceOutcome) -> CompilationStatus {
     match outcome {
         SliceOutcome::Finished(s) => {
-            info!("FFI compile_chunk({job_id}) -> Finished ({} blocks, {} bytes)", s.blocks_total, s.bytes_written);
+            info!(
+                "FFI compile_chunk({job_id}) -> Finished ({} blocks, {} bytes)",
+                s.blocks_total, s.bytes_written
+            );
             CompilationStatus::Finished {
                 summary: CompileSummary {
                     job_id: s.job_id,
@@ -311,17 +314,26 @@ pub fn compile_chunk(
     callback: Box<dyn ProgressCallback>,
 ) -> CompilationStatus {
     ensure_logging();
-    info!("FFI compile_chunk({}) entered (budget_ms={budget_ms})", job.job_id);
+    info!(
+        "FFI compile_chunk({}) entered (budget_ms={budget_ms})",
+        job.job_id
+    );
     let spec = match to_job_spec(&job) {
         Ok(s) => s,
         Err(reason) => {
-            error!("FFI compile_chunk({}) rejected at spec validation: {reason}", job.job_id);
+            error!(
+                "FFI compile_chunk({}) rejected at spec validation: {reason}",
+                job.job_id
+            );
             return CompilationStatus::FailedFatal { reason };
         }
     };
     let budget = Duration::from_millis(u64::from(budget_ms));
     let mut on_progress = |pct: f32, status: String| callback.on_progress(pct, status);
-    to_status(&job.job_id, engine::run_slice(&spec, budget, &mut on_progress))
+    to_status(
+        &job.job_id,
+        engine::run_slice(&spec, budget, &mut on_progress),
+    )
 }
 
 /// Cold-start resume detection: returns the durable checkpoint for a job if

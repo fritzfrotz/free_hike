@@ -2,6 +2,7 @@ import BackgroundTasks
 import Foundation
 import Capacitor
 // DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
+// DEBT(D009): mem gate needs a harness-free CLI driver plus the in-process allocator peak counter, an Austria-scale on-device run, and the iOS increased-memory entitlement — platforms: ios,core
 
 /// Layer 2 of the tri-layer bridge — Surface v1 (suspendable state machine).
 ///
@@ -25,6 +26,7 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "enqueueBackgroundJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "queryBackgroundJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "acknowledgeBackgroundJob", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cancelBackgroundJob", returnType: CAPPluginReturnPromise),
     ]
 
     /// The live plugin instance, if the WebView is up. The background
@@ -253,6 +255,21 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
         let maxZoom = UInt8(max(0, min(call.getInt("maxZoom") ?? 14, 22)))
         let jobsDir = defaultJobsDir()
 
+        // Enforced single-slot invariant (D005 parity): saving over an
+        // existing record would orphan a finished job's archive or yank a
+        // pending job out from under its scheduler window. The check lives
+        // HERE, not in JS — the JS guard only covers 'pending' and can be
+        // stale.
+        if let existing = PendingJobStore.loadAny() {
+            let remedy = existing.state == .pending
+                ? "cancel it (cancelBackgroundJob) first"
+                : "acknowledge it (acknowledgeBackgroundJob) first"
+            call.reject(
+                "The single-job store already holds job '\(existing.jobId)' (\(existing.state.rawValue)) — \(remedy)."
+            )
+            return
+        }
+
         let record = PendingJobStore.Record(
             state: .pending,
             jobId: jobId,
@@ -264,7 +281,9 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             outputDir: jobsDir,
             reason: nil,
             blocksTotal: nil,
-            bytesWritten: nil
+            bytesWritten: nil,
+            dirtyAttempts: 0,
+            cleanStop: false
         )
 
         do {
@@ -304,15 +323,77 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     /// Clears a terminal (finished/failed) record once the JS layer has
-    /// imported the archive into OPFS (or shown the failure). A pending
-    /// record is NOT clearable here — that is `cancelJob` + purge territory.
+    /// imported the archive into OPFS (or shown the failure), and releases
+    /// the job's disk claim: the sandbox archive (now redundant with the
+    /// OPFS copy) plus leftover checkpoint/index/scratch state.
+    ///
+    /// Targeted (D005 parity): requires `jobId` and rejects on mismatch, so
+    /// a stale acknowledge from a slow in-flight ingest can never clear a
+    /// record it doesn't own. A pending record is NOT clearable here — that
+    /// is `cancelBackgroundJob` territory.
     @objc func acknowledgeBackgroundJob(_ call: CAPPluginCall) {
-        if let record = PendingJobStore.loadAny(), record.state == .pending {
-            call.reject("Job \(record.jobId) is still pending; cancel it instead")
+        guard let jobId = call.getString("jobId"), !jobId.isEmpty else {
+            call.reject("Missing required parameter: jobId")
             return
         }
-        PendingJobStore.clear()
-        call.resolve(["cleared": true])
+        ffiQueue.async {
+            guard let record = PendingJobStore.loadAny() else {
+                // Idempotent: a retried ack finds the slot already empty.
+                call.resolve(["cleared": false])
+                return
+            }
+            guard record.jobId == jobId else {
+                call.reject("Stale acknowledge: store holds job '\(record.jobId)', not '\(jobId)'")
+                return
+            }
+            guard record.state != .pending else {
+                call.reject("Job \(record.jobId) is still pending; cancel it instead")
+                return
+            }
+            try? FileManager.default.removeItem(atPath: record.archivePath)
+            _ = purgeJob(jobId: record.jobId, outputDir: record.outputDir)
+            PendingJobStore.clear()
+            call.resolve(["cleared": true])
+        }
+    }
+
+    /// Hard cancellation of the background job (D005 parity): cancels the
+    /// queued BGProcessingTask request, clears the durable record (the
+    /// store's CAS terminal transitions make any still-running slice's late
+    /// write a no-op), and wipes the job's disk footprint — with a second
+    /// straggler sweep after the in-flight slice window has closed.
+    @objc func cancelBackgroundJob(_ call: CAPPluginCall) {
+        ffiQueue.async {
+            let record = PendingJobStore.loadAny()
+            if let record, record.state != .pending {
+                call.reject("Job \(record.jobId) is \(record.state.rawValue); acknowledge it instead of cancelling")
+                return
+            }
+
+            BGTaskScheduler.shared.cancel(
+                taskRequestWithIdentifier: BackgroundCompileScheduler.taskIdentifier
+            )
+            PendingJobStore.clear()
+
+            var result: [String: Any] = ["cancelled": true]
+            if let record {
+                _ = purgeJob(jobId: record.jobId, outputDir: record.outputDir)
+                try? FileManager.default.removeItem(atPath: record.archivePath)
+                result["jobId"] = record.jobId
+
+                let jobId = record.jobId
+                let outputDir = record.outputDir
+                let archivePath = record.archivePath
+                DispatchQueue.global(qos: .utility).asyncAfter(
+                    deadline: .now() + BackgroundCompileScheduler.stragglerWindowSeconds
+                ) {
+                    _ = purgeJob(jobId: jobId, outputDir: outputDir)
+                    try? FileManager.default.removeItem(atPath: archivePath)
+                }
+                CAPLog.print("⚡️ background job \(jobId) cancelled and purged")
+            }
+            call.resolve(result)
+        }
     }
 
     private func emitStatus(_ state: String, jobId: String, slices: Int) {
@@ -429,6 +510,18 @@ final class BackgroundCompileScheduler {
     /// checkpoint fsync overhead stays negligible.
     static let sliceBudgetMs: UInt32 = 2_000
 
+    /// Circuit breaker (D005 parity with Android's P0-2 fix): consecutive
+    /// windows allowed to die without completing a single slice before the
+    /// job is declared poisoned. "Die" = process death mid-FFI (SIGBUS,
+    /// Jetsam kill, Rust abort) — the only witness is the absent cleanStop
+    /// marker at the next window's start.
+    static let maxDirtyAttempts = 5
+
+    /// Straggler-sweep delay after a hard cancel: the in-flight slice may
+    /// fsync one more checkpoint after the first purge (stop is honored at
+    /// slice granularity, ≤ ~2× the slice budget).
+    static let stragglerWindowSeconds: TimeInterval = 5
+
     /// FFI work happens off the scheduler's callback thread, one lane, no
     /// overlap with itself.
     private let queue = DispatchQueue(label: "app.freehike.mapcompiler.bgtask", qos: .utility)
@@ -483,8 +576,36 @@ final class BackgroundCompileScheduler {
         // first slice — the notification observer only covers changes.
         ThermalStateBridge.pushCurrentState()
 
+        guard let loaded = PendingJobStore.loadPending() else {
+            task.setTaskCompleted(success: true)
+            return
+        }
+
+        // ── Circuit breaker (D005 parity) ───────────────────────────────
+        // A window whose predecessor set cleanStop (deliberate expiration /
+        // thermal / transient handback) is healthy; one whose predecessor
+        // died mid-FFI counts as dirty. Consume the marker, then check.
+        let wasCleanStop = loaded.cleanStop ?? false
+        PendingJobStore.updatePending(jobId: loaded.jobId) { r in
+            r.cleanStop = false
+            if !wasCleanStop { r.dirtyAttempts = (r.dirtyAttempts ?? 0) + 1 }
+        }
         guard let pending = PendingJobStore.loadPending() else {
             task.setTaskCompleted(success: true)
+            return
+        }
+        if (pending.dirtyAttempts ?? 0) > BackgroundCompileScheduler.maxDirtyAttempts {
+            let reason = "Background compile aborted: \(BackgroundCompileScheduler.maxDirtyAttempts) " +
+                "consecutive windows died without completing a slice (likely corrupt input or memory pressure)."
+            CAPLog.print("⚡️ BG compile circuit breaker tripped for \(pending.jobId)")
+            PendingJobStore.markFailed(pending, reason: reason)
+            _ = purgeJob(jobId: pending.jobId, outputDir: pending.outputDir)
+            MapCompilerPlugin.emitBackgroundEvent([
+                "state": "failed",
+                "jobId": pending.jobId,
+                "reason": reason,
+            ])
+            task.setTaskCompleted(success: false)
             return
         }
 
@@ -503,6 +624,8 @@ final class BackgroundCompileScheduler {
             var slices = 0
             while true {
                 if expiration.isRaised {
+                    // Deliberate handback — never counts toward the breaker.
+                    PendingJobStore.updatePending(jobId: pending.jobId) { $0.cleanStop = true }
                     CAPLog.print("⚡️ BG window expired after \(slices) slices; checkpoint durable, rescheduling")
                     self.scheduleIfPending()
                     task.setTaskCompleted(success: false)
@@ -516,6 +639,16 @@ final class BackgroundCompileScheduler {
                 )
                 slices += 1
 
+                if slices == 1 {
+                    // The FFI survived a full slice, so this window is not
+                    // part of a crash loop: consecutive-death accounting
+                    // starts over. A job poisoned at a fixed input byte
+                    // resumes right at the poison and never reaches this
+                    // line on later windows — the breaker trips after
+                    // maxDirtyAttempts.
+                    PendingJobStore.updatePending(jobId: pending.jobId) { $0.dirtyAttempts = 0 }
+                }
+
                 switch status {
                 case .yielded:
                     // Thermal governance: under Critical the engine yields
@@ -523,6 +656,7 @@ final class BackgroundCompileScheduler {
                     // in a tight loop would defeat the throttle — hand the
                     // window back and let a later window resume cold.
                     if thermalState() == .critical {
+                        PendingJobStore.updatePending(jobId: pending.jobId) { $0.cleanStop = true }
                         CAPLog.print("⚡️ BG compile paused at thermal Critical after \(slices) slices")
                         self.scheduleIfPending()
                         task.setTaskCompleted(success: false)
@@ -535,11 +669,19 @@ final class BackgroundCompileScheduler {
                     // the copy into OPFS belongs to the JS layer (P7 seam):
                     // mark the record finished for resume-time discovery and
                     // notify the UI if one is alive right now.
-                    PendingJobStore.markFinished(pending, summary: summary)
+                    let stillOurs = PendingJobStore.markFinished(pending, summary: summary)
+                    guard stillOurs else {
+                        // Hard-cancelled while this slice ran: the record is
+                        // gone and the canceller owns cleanup — do NOT
+                        // resurrect it or announce the result.
+                        CAPLog.print("⚡️ BG job \(pending.jobId) finished but was cancelled mid-slice; dropping result")
+                        task.setTaskCompleted(success: true)
+                        return
+                    }
                     MapCompilerPlugin.emitBackgroundEvent([
                         "state": "finished",
                         "jobId": pending.jobId,
-                        "archivePath": "\(pending.outputDir)/\(pending.jobId).pmtiles",
+                        "archivePath": pending.archivePath,
                         "blocksTotal": Int(summary.blocksTotal),
                         "bytesWritten": Int(summary.bytesWritten),
                     ])
@@ -548,19 +690,24 @@ final class BackgroundCompileScheduler {
                 case .failedFatal(let reason):
                     // Fatal per the Surface v1 contract (bad input, corrupt
                     // state). Do NOT reschedule — retrying a fatal failure
-                    // on a charger overnight is a battery/flash burn.
-                    PendingJobStore.markFailed(pending, reason: reason)
-                    MapCompilerPlugin.emitBackgroundEvent([
-                        "state": "failed",
-                        "jobId": pending.jobId,
-                        "reason": reason,
-                    ])
+                    // on a charger overnight is a battery/flash burn — and
+                    // release the temporary disk state immediately.
+                    let stillOurs = PendingJobStore.markFailed(pending, reason: reason)
+                    _ = purgeJob(jobId: pending.jobId, outputDir: pending.outputDir)
+                    if stillOurs {
+                        MapCompilerPlugin.emitBackgroundEvent([
+                            "state": "failed",
+                            "jobId": pending.jobId,
+                            "reason": reason,
+                        ])
+                    }
                     task.setTaskCompleted(success: false)
                     return
                 case .failedTransient(let reason):
                     // Another runner holds the job's slice lock. Durable
-                    // state is untouched: keep the record pending, hand the
-                    // window back, and let a later window retry.
+                    // state is untouched: keep the record pending, mark the
+                    // handback clean, and let a later window retry.
+                    PendingJobStore.updatePending(jobId: pending.jobId) { $0.cleanStop = true }
                     CAPLog.print("⚡️ BG compile transient refusal after \(slices) slices: \(reason)")
                     self.scheduleIfPending()
                     task.setTaskCompleted(success: false)
@@ -571,12 +718,17 @@ final class BackgroundCompileScheduler {
     }
 }
 
-// DEBT(D005): iOS background shell lacks Android hardening parity: circuit breaker, single-slot enqueue guard, targeted ack with archive deletion, hard cancel, CAS terminal transitions — platforms: ios
 /// Durable record of the one queued/terminal background job. Survives
 /// process death (BGProcessingTask fires in a fresh process) as JSON beside
 /// the engine's own state, atomic-rename on write. Single-job by design:
 /// Surface v1 compiles one region at a time; a queue is product-layer
 /// territory (Phase 9).
+///
+/// Hardening parity with the Android store (P-NATIVE.C1, closes D005):
+/// every mutation is lock-serialized, and every terminal transition is a
+/// compare-and-set on `(jobId, state == .pending)` via [updatePending] — a
+/// slice that was in flight when a hard cancel cleared the record cannot
+/// resurrect it with a late finished/failed write.
 enum PendingJobStore {
     enum State: String, Codable {
         case pending, finished, failed
@@ -594,6 +746,16 @@ enum PendingJobStore {
         var reason: String?
         var blocksTotal: UInt32?
         var bytesWritten: UInt64?
+        /// Circuit-breaker counter: background windows whose PREDECESSOR
+        /// died without a deliberate exit (expiration / thermal / transient
+        /// handback all set `cleanStop`). Optional so pre-parity JSON
+        /// records keep decoding.
+        var dirtyAttempts: Int?
+        /// Set just before every deliberate window handback; consumed (and
+        /// cleared) at the next window's start.
+        var cleanStop: Bool?
+
+        var archivePath: String { "\(outputDir)/\(jobId).pmtiles" }
 
         func toCompileJob() -> CompileJob {
             CompileJob(
@@ -608,11 +770,17 @@ enum PendingJobStore {
         }
     }
 
+    /// Serializes plugin-queue vs. scheduler-queue mutations. Recursive:
+    /// the CAS helper calls load/save while holding it.
+    private static let lock = NSRecursiveLock()
+
     private static var url: URL {
         URL(fileURLWithPath: defaultJobsDir()).appendingPathComponent("background_job.json")
     }
 
     static func save(_ record: Record) throws {
+        lock.lock()
+        defer { lock.unlock() }
         let dir = URL(fileURLWithPath: defaultJobsDir())
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(record)
@@ -621,6 +789,8 @@ enum PendingJobStore {
 
     /// The record in any state (resume-time discovery).
     static func loadAny() -> Record? {
+        lock.lock()
+        defer { lock.unlock() }
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(Record.self, from: data)
     }
@@ -631,22 +801,42 @@ enum PendingJobStore {
         return record
     }
 
-    static func markFinished(_ record: Record, summary: CompileSummary) {
-        var r = record
-        r.state = .finished
-        r.blocksTotal = summary.blocksTotal
-        r.bytesWritten = summary.bytesWritten
+    /// Compare-and-set: applies `transform` only while the store still
+    /// holds the PENDING record for `jobId`. Returns false — writing
+    /// nothing — if the record was cleared (hard cancel), overwritten, or
+    /// already terminal.
+    @discardableResult
+    static func updatePending(jobId: String, _ transform: (inout Record) -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var r = loadAny(), r.jobId == jobId, r.state == .pending else { return false }
+        transform(&r)
         try? save(r)
+        return true
     }
 
-    static func markFailed(_ record: Record, reason: String) {
-        var r = record
-        r.state = .failed
-        r.reason = reason
-        try? save(r)
+    /// Terminal success transition; false if the record is gone (cancelled).
+    @discardableResult
+    static func markFinished(_ record: Record, summary: CompileSummary) -> Bool {
+        updatePending(jobId: record.jobId) { r in
+            r.state = .finished
+            r.blocksTotal = summary.blocksTotal
+            r.bytesWritten = summary.bytesWritten
+        }
+    }
+
+    /// Terminal failure transition; false if the record is gone (cancelled).
+    @discardableResult
+    static func markFailed(_ record: Record, reason: String) -> Bool {
+        updatePending(jobId: record.jobId) { r in
+            r.state = .failed
+            r.reason = reason
+        }
     }
 
     static func clear() {
+        lock.lock()
+        defer { lock.unlock() }
         try? FileManager.default.removeItem(at: url)
     }
 }

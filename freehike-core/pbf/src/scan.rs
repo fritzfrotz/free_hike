@@ -16,7 +16,6 @@
 //! This is the same yield contract as `compiler::engine::run_slice`, which
 //! will drive this function from its Pass1Nodes phase.
 
-// DEBT(D002): node-POI extraction missing, peak names are node-tagged and invisible to the ways-only pipeline — platforms: core
 use prost::Message;
 
 use crate::proto::{Blob, BlobHeader, PrimitiveBlock, StringTable, StringTableProbe, WayBlock};
@@ -396,6 +395,7 @@ pub fn run_pass1_slice(
 ) -> Result<Pass1Slice, IndexError> {
     let mut scanner = BlockScanner::resume(pbf, resume_offset);
     let mut buffer: Vec<(u64, (f64, f64))> = Vec::new();
+    let mut poi_buffer: Vec<(u64, (f64, f64), Vec<u8>)> = Vec::new();
     let mut nodes_indexed = 0u64;
     let mut blocks_scanned = 0u32;
 
@@ -405,6 +405,12 @@ pub fn run_pass1_slice(
             Some(block) => {
                 if let BlockKind::Data(pb) = &block.kind {
                     extract_node_coords(pb, &mut buffer)?;
+                    // Node-POI extraction (P-CORE.C8, closes D002), gated
+                    // behind a StringTable probe so peak-free blocks never
+                    // pay for keys_vals decoding.
+                    if block_mentions_peak(pb) {
+                        extract_peak_pois(pb, &mut poi_buffer)?;
+                    }
                 }
                 blocks_scanned += 1;
                 if buffer.len() >= DEFAULT_BATCH_SIZE {
@@ -419,8 +425,10 @@ pub fn run_pass1_slice(
     };
 
     // Flush BEFORE reporting the offset: the checkpointed resume point must
-    // never run ahead of what is durably in the index.
+    // never run ahead of what is durably in the index. POIs flush after
+    // coords under the same rule; both upsert idempotently on re-scan.
     nodes_indexed += insert_coords_batched(db, buffer.drain(..), DEFAULT_BATCH_SIZE)?;
+    crate::insert_pois(db, &poi_buffer)?;
 
     Ok(Pass1Slice {
         next_offset: scanner.offset(),
@@ -428,6 +436,91 @@ pub fn run_pass1_slice(
         nodes_indexed,
         blocks_scanned,
     })
+}
+
+/// StringTable relevance probe for the POI pass: only a block whose table
+/// interns both `natural` and `peak` can hold a peak node — everything
+/// else skips keys_vals decoding entirely (the P2 prefilter discipline).
+fn block_mentions_peak(block: &PrimitiveBlock) -> bool {
+    match &block.stringtable {
+        Some(st) => st.s.iter().any(|s| s == b"natural") && st.s.iter().any(|s| s == b"peak"),
+        None => false,
+    }
+}
+
+/// Walks DenseNodes `keys_vals` in parallel with the delta-decoded id/coord
+/// arrays and collects `natural=peak` nodes as `(id, (x, y), name)`.
+///
+/// `keys_vals` per spec: for each node in order, `(key_idx, val_idx)` pairs
+/// terminated by one `0`; an entirely-untagged group omits the array. An
+/// exhausted stream simply leaves the remaining nodes untagged (some
+/// writers trim trailing zeros); an OUT-OF-RANGE StringTable index is a
+/// typed error — that is corruption, not style.
+fn extract_peak_pois(
+    block: &PrimitiveBlock,
+    out: &mut Vec<(u64, (f64, f64), Vec<u8>)>,
+) -> Result<(), IndexError> {
+    let Some(st) = &block.stringtable else {
+        return Ok(());
+    };
+    let granularity = i64::from(block.granularity.unwrap_or(100));
+    let lat_offset = block.lat_offset.unwrap_or(0);
+    let lon_offset = block.lon_offset.unwrap_or(0);
+    let project = |lon_units: i64, lat_units: i64| {
+        web_mercator(
+            1e-9 * (lon_offset + granularity * lon_units) as f64,
+            1e-9 * (lat_offset + granularity * lat_units) as f64,
+        )
+    };
+    let string_at = |idx: i32| -> Result<&[u8], IndexError> {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|i| st.s.get(i))
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                IndexError::InvalidInput(format!(
+                    "corrupted DenseNodes: keys_vals index {idx} outside StringTable ({} entries)",
+                    st.s.len()
+                ))
+            })
+    };
+
+    for group in &block.primitivegroup {
+        let Some(dense) = &group.dense else { continue };
+        if dense.keys_vals.is_empty() {
+            continue;
+        }
+        let (mut id, mut lat, mut lon) = (0i64, 0i64, 0i64);
+        let mut kv = dense.keys_vals.iter();
+        for i in 0..dense.id.len() {
+            id += dense.id[i];
+            lat += dense.lat[i];
+            lon += dense.lon[i];
+
+            let mut is_peak = false;
+            let mut name: Vec<u8> = Vec::new();
+            while let Some(&key_idx) = kv.next() {
+                if key_idx == 0 {
+                    break; // this node's tag list ends
+                }
+                let Some(&val_idx) = kv.next() else { break };
+                let key = string_at(key_idx)?;
+                let val = string_at(val_idx)?;
+                if key == b"natural" && val == b"peak" {
+                    is_peak = true;
+                } else if key == b"name" {
+                    name = val.to_vec();
+                }
+            }
+            if is_peak {
+                let node_id = u64::try_from(id).map_err(|_| {
+                    IndexError::InvalidInput(format!("corrupted DenseNodes: negative node id {id}"))
+                })?;
+                out.push((node_id, project(lon, lat), name));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,5 +1549,66 @@ mod tests {
         println!(
             "real-extract pass1: {total_nodes} nodes / {total_blocks} blocks / {slices} slices"
         );
+    }
+
+    #[test]
+    fn pass1_extracts_peak_pois_behind_the_probe() {
+        let dir = tmp_dir("pois");
+        let pbf_path = dir.join("peaks.osm.pbf");
+        std::fs::write(
+            &pbf_path,
+            crate::fixtures::synthetic_pbf_with_ways_and_peaks(
+                &[&[(10, 472_700_000, 113_900_000)]],
+                &[],
+                &[
+                    (500_000, 472_756_000, 113_910_000, b"Hafelekarspitze"),
+                    (500_001, 472_800_000, 113_950_000, b""),
+                ],
+            ),
+        )
+        .unwrap();
+        let pbf = PbfMmap::open(&pbf_path).unwrap();
+        let db = crate::open_coord_db(&dir.join("idx.redb")).unwrap();
+
+        let sub = run_pass1_slice(&pbf, &db, 0, &mut || false).unwrap();
+        assert!(sub.finished);
+        // The plain node AND both peak nodes land in COORDINATES (peaks are
+        // ordinary nodes first, POIs second).
+        assert_eq!(crate::coord_count(&db).unwrap(), 3);
+
+        let pois = crate::all_pois(&db).unwrap();
+        assert_eq!(pois.len(), 2);
+        assert_eq!(pois[0].0, 500_000);
+        assert_eq!(pois[0].3, b"Hafelekarspitze".to_vec());
+        assert_eq!(
+            pois[1].3,
+            Vec::<u8>::new(),
+            "unnamed summit still extracted"
+        );
+        let want = crate::web_mercator(
+            1e-9 * (100 * 113_910_000i64) as f64,
+            1e-9 * (100 * 472_756_000i64) as f64,
+        );
+        assert_eq!(
+            (pois[0].1, pois[0].2),
+            want,
+            "POI coords use the block projection"
+        );
+
+        // Idempotent re-scan (the crash-resume path): same two rows.
+        let again = run_pass1_slice(&pbf, &db, 0, &mut || false).unwrap();
+        assert!(again.finished);
+        assert_eq!(crate::poi_count(&db).unwrap(), 2);
+    }
+
+    #[test]
+    fn peak_probe_rejects_blocks_without_the_strings() {
+        let plain = crate::fixtures::dense_block(&[(1, 0, 0)], None);
+        assert!(
+            !block_mentions_peak(&plain),
+            "peak-free block must skip keys_vals"
+        );
+        let peaks = crate::fixtures::peak_dense_block(&[(2, 0, 0, b"X")]);
+        assert!(block_mentions_peak(&peaks));
     }
 }

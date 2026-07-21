@@ -26,6 +26,7 @@
  * the lifetime of the worker so repeated reads incur zero open/close overhead.
  */
 
+import { createSyncHandleWithRetry } from './opfsRetry';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
@@ -52,8 +53,11 @@ async function getHandle(filename: string): Promise<FileSystemSyncAccessHandle> 
 
   const root       = await navigator.storage.getDirectory();
   const fileHandle = await root.getFileHandle(filename, { create: true });
-  // BUG(B005): dev-env leaked OPFS lock, map 'load' never fires after reload while a previous worker still holds the SyncAccessHandle — severity: minor — repro: LOOPLOG P9.C2 notes
-  const handle     = await fileHandle.createSyncAccessHandle();
+  // Bounded retry (P-FE.C2, closes tracker B005): a reload-killed previous
+  // worker can hold the exclusive lock for a beat while the browser tears
+  // it down; retrying bridges that gap, while a REAL second holder still
+  // fails loudly after the budget.
+  const handle     = await createSyncHandleWithRetry(fileHandle, filename);
   handles.set(filename, handle);
   console.log(`[mapData.worker] Opened SyncAccessHandle for "${filename}" (${handle.getSize()} bytes)`);
   return handle;

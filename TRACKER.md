@@ -6,34 +6,17 @@
 
 ## Open Debt
 
-- **D001** — PMTiles writer is root-directory-only; leaf splitting and run-length coalescing needed at scale — platforms: core
-  - freehike-core/tiles/src/finalize.rs:470
-- **D002** — node-POI extraction missing, peak names are node-tagged and invisible to the ways-only pipeline — platforms: core
-  - freehike-core/pbf/src/scan.rs:19
-- **D003** — RSS:anon CI gate missing (mem_gate.sh not yet written), Austria-scale on-device index run and iOS increased-memory entitlement pending — platforms: core
-  - freehike-core/pbf/src/lib.rs:58
 - **D004** — iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
   - android/app/src/main/java/com/freehike/app/BackgroundCompileWorker.kt:29
   - ios/App/App/MapCompilerPlugin.swift:4
-- **D005** — iOS background shell lacks Android hardening parity: circuit breaker, single-slot enqueue guard, targeted ack with archive deletion, hard cancel, CAS terminal transitions — platforms: ios
-  - ios/App/App/MapCompilerPlugin.swift:574
-- **D007** — WebView reload orphans the foreground compile loop, handleOnDestroy neither cancels nor shuts down the executor (flock prevents corruption but the orphan burns CPU) — platforms: android
-  - android/app/src/main/java/com/freehike/app/MapCompilerPlugin.kt:63
+- **D009** — mem gate needs a harness-free CLI driver plus the in-process allocator peak counter, an Austria-scale on-device run, and the iOS increased-memory entitlement — platforms: ios,core
+  - freehike-core/scripts/mem_gate.sh:28
+  - ios/App/App/MapCompilerPlugin.swift:5
 
 ## Open Bugs
 
-- **B002** — [major] hillshade/terrain detached-ArrayBuffer console error on load, pre-existing ("split sources" fix disproven 2026-07-17) — repro: boot app, open devtools console
-  - src/ui/components/MapView.tsx:440
-- **B003** — [minor] map-mount re-render resets WebView scroll to top — repro: LOOPLOG A4 tap-targeting notes
-  - src/ui/components/MapView.tsx:436
-- **B004** — [major] hike.pmtiles/test_graph.tar sandbox fixtures missing, region-download demo path fails — repro: tap region download in web build
-  - src/ui/App.tsx:489
-- **B005** — [minor] dev-env leaked OPFS lock, map 'load' never fires after reload while a previous worker still holds the SyncAccessHandle — repro: LOOPLOG P9.C2 notes
-  - src/workers/mapData.worker.ts:55
-- **B006** — [minor] progress denominator uses logical bytesWritten (index accounting) instead of the archive's real size — repro: watch handoff bar mismatch during background ingest
-  - src/store/compilerStore.ts:234
-- **B007** — [minor] cancel aimed at the running job also cancels a queued job, cancelRequested is shared and reset at enqueue time — repro: startJob A, startJob B, cancelJob during A
-  - android/app/src/main/java/com/freehike/app/MapCompilerPlugin.kt:209
+- **B008** — [minor] style asset gaps, sprite URL rejected as relative by MapLibre and a contour-label fontstack is not in the vendored glyph set (local glyph fallback renders digits) — repro: boot dev app, console shows sprite error + glyph range warnings
+  - src/ui/components/MapView.tsx:439
 
 ## Rule Exemptions
 

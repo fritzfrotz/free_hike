@@ -39,8 +39,20 @@ class MapCompilerPlugin : Plugin() {
     /** Single background lane for FFI work — never block the WebView/main thread. */
     private val executor = Executors.newSingleThreadExecutor()
 
-    /** Cancellation flag for the active job, checked between slices. */
-    private val cancelRequested = AtomicBoolean(false)
+    /**
+     * Cancellation token of the job whose loop is RUNNING right now
+     * (P-NATIVE.C1, closes B007): each startJob owns a fresh token, set as
+     * active when its loop starts and cleared at its terminal — so a cancel
+     * strikes exactly the running job, never a queued one whose flag the
+     * old shared-AtomicBoolean design reset at enqueue time.
+     */
+    private val activeCancel = java.util.concurrent.atomic.AtomicReference<AtomicBoolean?>(null)
+
+    /** Raised by handleOnDestroy (closes D007): the WebView is gone, so any
+     *  running/queued foreground loop must stop WITHOUT purging — the
+     *  durable checkpoint stays for the next session's resume. */
+    @Volatile
+    private var destroyed = false
 
     override fun load() {
         // The UniFFI bindings load libfreehike_ffi.so themselves via JNA on
@@ -60,8 +72,16 @@ class MapCompilerPlugin : Plugin() {
         active = this
     }
 
-    // DEBT(D007): WebView reload orphans the foreground compile loop, handleOnDestroy neither cancels nor shuts down the executor (flock prevents corruption but the orphan burns CPU) — platforms: android
     override fun handleOnDestroy() {
+        // P-NATIVE.C1 (closes D007): stop the orphan instead of letting it
+        // burn CPU headless. The in-flight FFI slice cannot be interrupted,
+        // but the loop observes `destroyed` at its next boundary and exits
+        // without purging (reload ≠ cancel: the checkpoint must survive for
+        // resume). shutdownNow drops queued loops whose PluginCalls died
+        // with the WebView.
+        destroyed = true
+        activeCancel.get()?.set(true)
+        executor.shutdownNow()
         if (active === this) active = null
         super.handleOnDestroy()
     }
@@ -121,12 +141,20 @@ class MapCompilerPlugin : Plugin() {
             outputDir = jobsDir,
         )
 
-        cancelRequested.set(false)
+        val cancelToken = AtomicBoolean(false)
         executor.execute {
+            activeCancel.set(cancelToken)
             try {
                 var slices = 0
                 while (true) {
-                    if (cancelRequested.get()) {
+                    if (destroyed) {
+                        // WebView torn down mid-loop: stop WITHOUT purging
+                        // (checkpoint survives for resume); the PluginCall
+                        // died with the bridge, so nothing to resolve.
+                        Log.i(TAG, "job $jobId loop stopped by plugin destroy after $slices slices; checkpoint kept")
+                        return@execute
+                    }
+                    if (cancelToken.get()) {
                         purgeJob(jobId, job.outputDir)
                         Log.i(TAG, "job $jobId cancelled after $slices slices; state purged")
                         emitStatus("cancelled", jobId, slices)
@@ -200,16 +228,19 @@ class MapCompilerPlugin : Plugin() {
                 }
             } catch (t: Throwable) {
                 call.reject("FFI compileChunk failed: ${t.message}", t as? Exception)
+            } finally {
+                activeCancel.compareAndSet(cancelToken, null)
             }
         }
     }
 
-    /** Requests cancellation of the active job (honored between slices). */
+    /** Requests cancellation of the RUNNING job (honored between slices).
+     *  A queued job keeps its own untouched token (B007 fix). */
     @PluginMethod
-    // BUG(B007): cancel aimed at the running job also cancels a queued job, cancelRequested is shared and reset at enqueue time — severity: minor — repro: startJob A, startJob B, cancelJob during A
     fun cancelJob(call: PluginCall) {
-        cancelRequested.set(true)
-        call.resolve(JSObject().put("requested", true))
+        val token = activeCancel.get()
+        token?.set(true)
+        call.resolve(JSObject().put("requested", token != null))
     }
 
     /**
@@ -465,6 +496,7 @@ class MapCompilerPlugin : Plugin() {
      */
     private fun scheduleStragglerSweep(jobId: String, outputDir: String, archivePath: String) {
         Handler(Looper.getMainLooper()).postDelayed({
+            if (executor.isShutdown) return@postDelayed // plugin destroyed (D007)
             executor.execute {
                 val sweptState = purgeJob(jobId, outputDir)
                 val sweptArchive = File(archivePath).delete()

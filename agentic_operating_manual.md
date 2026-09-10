@@ -1,5 +1,10 @@
 # FreeHike Agentic Operating Manual
 
+> v1 (retired 2026-09-09) — built everything up to v0.1 finish-line start.
+> v2.1 (active, 2026-09-09) — see Part 3. v2 (mandatory hand-coding as
+> training) was drafted and dropped before first use as artificial slowdown.
+> Parts 1–2 remain binding mechanics; v2.1 changes the operator's role, not the loop.
+
 **Scope:** All agent-driven work on the `freehike-core` Rust workspace (the zero-cost
 edge-compute compiler defined in
 `research/On-Device Map Compilation - Feasibility, Architecture, and Implementation Plan.md`).
@@ -220,10 +225,21 @@ protocol recognizes.
 | FFI crate / bridge | ● | ● | | | ● |
 | **Phase exit** | ● | ● | ● | ● | ● |
 
-### Reporting format (end of every loop)
+### Reporting format (end of every loop; v2.1 amendment — see Part 3.2)
+
+Every close-report opens with the review summary, ranked by risk:
 
 ```
-CHUNK P<x>.C<y> — <status: CLOSED | ESCALATED | IN PROGRESS>
+REVIEW SUMMARY (ranked by risk)
+1. What changed and why, in plain language: …
+2. What's tricky or dangerous; what could break silently: …
+3. What is NOT tested, and what would convince a skeptic it works: …
+4. Anything uncertain ("I don't know" is a valid entry): …
+Load-bearing: yes|no — storage | sync | checkpoint/resume | compile
+              pipeline correctness | memory budget | on-disk/wire
+              formats | architecture
+
+CHUNK P<x>.C<y> — <status: AGENT-CLOSED | ESCALATED | IN PROGRESS>
 Steps: <used>/<budget>   Pivots: <n>
 Ladder: L1 ✅  L2 ✅  L3a ✅  L3b —  L4 —   (× 2 consecutive: yes/no)
 Diff: <files changed, +/- lines>
@@ -231,4 +247,84 @@ Open risks / notes: <anything the human should know>
 Next: <proposed next chunk>
 ```
 
+Load-bearing diffs (storage, sync, checkpoint/resume, compile pipeline
+correctness, memory budget, on-disk/wire formats, architecture — this
+list is the single definition; AGENTS.md points here) are flagged as
+such: those get real reading and a cross-model audit before merge.
+Two-speed review is the standard; 100% comprehension of every diff is
+not. `AGENT-CLOSED` = tests green-locked (§1.4), close proposed.
+`OPERATOR-CLOSED` is written only in the LOOPLOG, by or on behalf of the
+operator (§3.1).
+
 Escalations always include verbatim failing output — never a paraphrase.
+
+---
+
+## Part 3 — Operator Interaction Contract (v2.1)
+
+### 3.0 Role shift
+
+The human moves from orchestrator to decision-maker/auditor. Agent
+proposes with trade-offs; human calls it; agent implements; human
+reviews the close-report's risk summary against the diff, at a depth
+the human chooses, with at least one challenge.
+
+### 3.1 Collaboration mode
+
+Default is DECISION mode unless the operator says "just do it":
+
+* Before implementing anything: present the approach as a decision —
+  options, trade-offs, recommendation and why. Then STOP and wait.
+  DECISION mode gates entry to the EXECUTE phase of a chunk. Inside an
+  approved chunk, §1.2 AUTONOMOUS actions stay autonomous; the §1.5 HITL
+  gates are unchanged. The §1.1 LOOPLOG plan entry is written after the
+  call and records the chosen option. A load-bearing choice discovered
+  mid-chunk returns to DECISION mode before the chunk continues.
+* Load-bearing choices: also steelman the losing option and state what
+  would make the recommendation wrong.
+* Ask the operator for a prediction before significant steps: "What do
+  you expect this to do / where do you think it breaks?" "Significant" =
+  any load-bearing change per the §2 Reporting format.
+* Never mark an item done on your own say-so. The agent's §2 report
+  status is `AGENT-CLOSED` (tests green-locked per §1.4, close
+  proposed). `OPERATOR-CLOSED` is written only in the LOOPLOG, by or on
+  behalf of the operator.
+* Verification is the operator's: they define "done" and "proven".
+  Propose tests; never weaken or delete a failing test to pass.
+* Answer questions in words; never answer a question by editing files.
+* If the operator flags something unclear, switch to explain mode until
+  they can evaluate it. Operator hand-coding happens on demand only —
+  blind spot or real bug — never as exercise.
+
+"just do it" = full delegation for that task only; review still happens.
+
+### 3.2 Review summary (amendment to Part 2 reporting format)
+
+Folded into §2 Reporting format. Every close-report opens with the
+ranked review summary defined there.
+
+### 3.3 Honesty contract
+
+* Disagree when you disagree, plainly, before doing any work on it.
+* Never open a response by agreeing. Start with the actual assessment.
+* If pushed back on and right: hold and re-argue. Concede to arguments,
+  never to pressure or repetition.
+* If pushed back on and wrong: concede specifically — name what was
+  wrong, don't just flip.
+* Distinguish "broken" vs "works but I'd do it differently" vs "style".
+* "I don't know" / "I can't verify this" IS the answer when true.
+* When scope, timeline, or premise looks unrealistic: flag once,
+  concretely, with what would have to be cut. Then respect the call.
+
+### 3.4 E/D marking
+
+Checklist items (the numbered steps of the §1.1 plan entry) are marked
+[E] (judgment work: decisions, test design, verification, reviews —
+operator owns) or [D] (delegate: agent executes, operator audits).
+Decided upfront, never in the moment.
+
+### 3.5 Predictions
+
+Load-bearing decisions carry a prediction ("expect …; wrong if …") in
+`docs/decision-ledger.md` and are scored at checkpoints. First checkpoint:
+2026-09-22 (DL-001).

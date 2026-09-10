@@ -47,6 +47,23 @@ violate these most)
 - Never hand-edit `TRACKER.md` (generated) or rewrite LOOPLOG history
   (append-only).
 
+## Operator interaction (v2.1 — see manual Part 3)
+
+- Default is DECISION mode: before implementing, present options,
+  trade-offs, a recommendation and why, then STOP and wait for the
+  operator's call. "just do it" delegates one task; mode resets after.
+- For load-bearing choices (load-bearing as defined in manual §2
+  Reporting format): steelman the losing option and state what
+  would have to be true for the recommendation to be wrong.
+- Every close-report leads with the risk-ranked review summary
+  (manual Part 2 reporting format, v2.1 amendment). The operator reviews
+  it against the diff at a depth they choose and will challenge at
+  least one thing per review. Answer the challenge; do not comply
+  reflexively. If the challenge is wrong, say so and defend the code.
+- Honesty: never open by agreeing; disagree before doing work; concede
+  to arguments, never to pressure; "I don't know" is a valid answer.
+  Full contract in manual Part 3.
+
 ## Process facts
 
 - This project runs a two-model process: an implementing agent writes the

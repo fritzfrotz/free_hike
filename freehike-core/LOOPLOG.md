@@ -2779,3 +2779,53 @@ Ladder: 17 workspace suites green, clippy -D warnings clean, fmt clean,
 Innsbruck e2e green, aarch64-linux-android ffi check clean.
 
 **Status:** CLOSED.
+
+## P-PROCESS.C1 — Operating manual v2.1: Operator Interaction Contract (2026-09-10)
+
+**Type:** process amendment, not a code chunk. HITL gate (manual edit)
+approved by the operator in chat 2026-09-10 after a decision memo with
+six calls; all six recorded here.
+
+**Files:** `agentic_operating_manual.md`, `docs/decision-ledger.md` (new),
+`AGENTS.md` (separate HITL edit, diff shown and approved before writing),
+this entry.
+
+**Changes:**
+- Cap block after the H1: v1 retired 2026-09-09; v2.1 active; v2
+  (mandatory hand-coding) dropped before first use; Parts 1–2 remain
+  binding mechanics, v2.1 changes the operator's role, not the loop.
+- §2 Reporting format amended in place (one format, not two): every
+  close-report opens with a risk-ranked REVIEW SUMMARY (changed/why,
+  tricky/silent-break, not-tested/skeptic, uncertain) plus a
+  `Load-bearing: yes|no` line; load-bearing diffs get real reading and a
+  cross-model audit before merge.
+- New Part 3 (3.0 role shift, 3.1 collaboration mode, 3.2 pointer to §2,
+  3.3 honesty contract, 3.4 E/D marking, 3.5 predictions).
+
+**Operator calls (decision memo → decisions):**
+1. Cap block after the H1, third line added.
+2. DECISION mode gates entry to a chunk's EXECUTE phase (per chunk, not
+   per edit); §1.2 AUTONOMOUS holds inside an approved chunk; plan entry
+   written after the call; a load-bearing choice discovered mid-chunk
+   returns to DECISION mode.
+3. Report status renamed `CLOSED` → `AGENT-CLOSED` (tests green-locked,
+   close proposed); `OPERATOR-CLOSED` is written only in the LOOPLOG by
+   or on behalf of the operator. Grepped first: nothing parses `CLOSED`
+   literally (janitor: 0 hits; only other hit is a socket constant in
+   the minified Valhalla WASM glue), so the rename is safe.
+   Load-bearing list extended to storage, sync, checkpoint/resume,
+   compile pipeline correctness, memory budget, on-disk/wire formats,
+   architecture; manual §2 owns the one list, AGENTS.md points to it.
+4. Review-summary text lives in §2; 3.2 is a pointer.
+5. `docs/decision-ledger.md` created with operator-supplied content
+   (DL-001 methodology v2.1, checkpoint 2026-09-22; DL-002 map-first
+   re-scope, checkpoint 2026-10-20; backlog). `D-###` prefix later renamed `DL-###` —
+   verified the janitor's tracker regex is `[DB]\d{3,}`, so ledger IDs
+   cannot be mistaken for debt IDs mechanically.
+6. AGENTS.md "Operator interaction" block written after diff approval,
+   with the load-bearing parenthetical replaced by a pointer to §2.
+
+**Verification:** none mechanical applies (prose). Janitor `--check` to be
+run at session close; no tracker tags touched.
+
+**Status:** AGENT-CLOSED (operator's close pending per §3.1).

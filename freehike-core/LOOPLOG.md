@@ -2829,3 +2829,174 @@ this entry.
 run at session close; no tracker tags touched.
 
 **Status:** AGENT-CLOSED (operator's close pending per §3.1).
+
+## P-FE.C3 — Frontend sovereignty cleanup, CSP, mechanical rule P10a (2026-09-11)
+
+**Context:** Sovereignty audit 2026-09-10 (chat): after ingestion the WebView
+must make no request to any host but its own origin. Structural findings
+carried to later chunks: (1) the fetcher crate is not wired into the FFI or
+the native shells — no raw-region download exists on device (chunk 2);
+(2) the engine's Terrain phase inside a job is still the simulated stub and
+the phone renders bundled `alps_*.pmtiles`, not compiled output (chunk 3 /
+D4 below). Demo region per DL-003 (operator-amended): Portugal via Geofabrik.
+
+**Operator calls (DECISION mode, 2026-09-11):** D1 excise (routing,
+Overpass, elevation, saved routes, cloud sync, legacy download all go).
+D2 delete list approved + gpxSerializer.ts and its test; delete tests of
+every deleted subsystem; report honest before/after counts, no "monotonic"
+reasoning. D3 remove flatbush. D4 NOT decided — bundled-PMTiles provisioning
+site (`mapData.worker.ts` initFiles) untouched until the operator picks
+among expanded options (memo at chunk end). D5 `connect-src 'self'` meta
+only. D6 P10 text approved; rule is plain `https?://`, no allowlist, zero
+exemptions. Operator prediction: breaks at the OPFS-linked map in proof 3
+after deletions + CSP, not at test level; wrong if proof 3 passes three
+cold boots clean. Agent prediction: nothing at test level; one unexpected
+CSP report from inside MapLibre in proof 3.
+
+**Chat-authorized deviation (logged per manual §1.6):** operator asked for a
+public-mirror check; `WebFetch` + `curl -I` against
+download.openstreetmap.fr were run 2026-09-10 (network outside the §1.2
+whitelist). Result recorded in DL-003's history; superseded by the Portugal
+amendment, whose Geofabrik verification is still to be run in chunk 2.
+
+**Files (declared):** index.html, src/ui/App.tsx, src/ui/components/MapView.tsx,
+src/shared/types.ts, src/store/mapStore.ts, src/workers/mapData.worker.ts
+(DOWNLOAD_REGION handler only — NOT initFiles), package.json, package-lock.json,
+ARCHITECTURE.md (P10 block only), src/test/sovereignty.test.ts (new),
+LOOPLOG.md, TRACKER.md (generated).
+Plan revision (1 file, logged): vite.config.ts — its `/valhalla.js` alias
+points at a deleted file. `scripts/copy_valhalla_wasm.mjs` and
+`scripts/build_test_graph.js` are NOT deleted (not on the approved list);
+their package.json hooks are removed so they cannot re-create the WASM.
+
+**Deletions (D2):** src/workers/routing.worker.ts, src/workers/spatial.worker.ts,
+src/valhalla.js, public/valhalla.wasm (untracked build copy),
+src/experimental/{DropboxSync.ts,GoogleDriveSync.ts,README.md},
+src/ui/components/{CloudSyncPanel,ElevationProfile,SavedRoutesPanel,DownloadProgressBar}.tsx,
+src/ui/services/{syncDB,cryptoPKCE,gpxSerializer}.ts, src/ui/services/gpxSerializer.test.ts,
+src/shared/db.ts.
+src/experimental/ per file, what it was: DropboxSync.ts — Dropbox OAuth 2.0
+PKCE token exchange/refresh + GPX/manifest upload to /Apps/FreeHike (network
+sync only). GoogleDriveSync.ts — Google OAuth 2.0 PKCE token exchange/refresh +
+Drive `drive.file` folder/upload (network sync only). README.md — note that
+both providers need self-registered app credentials. None contains anything
+but cloud-sync code.
+
+**Steps [E]/[D]:**
+1. [D] Append this plan entry.
+2. [D] Write `src/test/sovereignty.test.ts` (CSP meta exact; no `https?://`
+   in non-test src). Run vitest → both RED before any deletion (proof 2).
+3. [D] Insert P10 + P10a into ARCHITECTURE.md (approved text). Run janitor
+   `--check` → must FAIL at overpass/terrarium/pmtiles.io/dropbox/google
+   sites (proof 1 red; output recorded below).
+4. [D] Deletions.
+5. [D] App.tsx rewrite without the excised subsystems; header "worker"
+   pill now driven by the mapData worker (the only worker left).
+6. [D] MapView.tsx: remove spatial/routing/elevation/download-mode code
+   and chrome; keep OPFS boot, region switcher, contours, GPS, location
+   presets, telemetry HUD.
+7. [D] types.ts, mapStore.ts, mapData.worker.ts (DOWNLOAD_REGION only),
+   vite.config.ts alias, package.json hooks + `npm uninstall flatbush`.
+8. [D] index.html CSP meta.
+9. [D] `tsc -b`, `npx eslint .`, `npm test`, janitor `--check` → green.
+10. [E] Proof 3: three cold boots in the preview with CSP live — map renders
+    from OPFS, zero CSP reports, only same-origin network. Screenshot.
+11. [D] janitor `--fix`, kill entry, D4 options memo → STOP.
+Step budget: 25.
+
+**Progress entry (P-FE.C3, 2026-09-11) — IN PROGRESS, blocked on D4:**
+- Proof 2 RED before deletions: 18 offending lines (dropbox ×4, google ×6,
+  gpxSerializer ×5, pmtiles.io ×1, overpass ×1, terrarium ×1) + missing CSP
+  meta. Proof 1 RED at the same 18 lines under P10a.
+- Deletions executed (16 files, incl. gpxSerializer.ts + its 6-test suite);
+  App.tsx rewritten (1,134 → 449 lines); MapView.tsx excised by asserted
+  line ranges (1,894 → 1,001 lines); types.ts reduced to the mapData RPC
+  contract; mapStore drops regionDownloadStatus/Label; mapData.worker drops
+  the DOWNLOAD_REGION handler + writeRegionToOPFS (initFiles UNTOUCHED —
+  D4). flatbush uninstalled; predev/prebuild/build:graph hooks removed;
+  vite.config.ts alias to the deleted valhalla.js removed (plan revision).
+  CSP meta `connect-src 'self'` added to index.html.
+- Two type-resolution fixes after the first ladder run: the new test needs
+  `/// <reference types="node" />` (tsconfig.app types = vite/client only);
+  MapView's `GeoJSON.Feature` global namespace stopped resolving once the
+  routing/spatial imports went — replaced with an explicit
+  `import type { Feature } from 'geojson'`.
+- Ladder: `tsc -b` clean, `eslint .` clean. vitest 9 files / 49 tests:
+  48 pass, 1 FAIL — the pmtiles.io line at mapData.worker.ts:242, inside
+  the provisioning site reserved for D4. Janitor `--check`: the same single
+  line. Before this chunk: 9 files / 53 tests; the delta is −6 (deleted
+  gpxSerializer suite) +2 (sovereignty). TRACKER.md regenerated (2 debt,
+  1 bug, 0 exemptions; no tags added).
+- Proof 3 (preview, CSP live): three cold boots; every boot logged both
+  archives "Serving … from its OPFS-backed worker source"; console filtered
+  for "Content Security Policy" / "Refused": zero hits on all three; network
+  log across the three boots: only http://localhost:5173 and blob: URLs.
+  Boots 1 and 3 screenshot-verified rendering (hillshade + contours +
+  basemap); boot 2's 8-second screenshot caught the boot overlay because the
+  preview pane suspends rAF while idle (known trap) — its OPFS serving logs
+  and error-free console are the evidence for that boot. Only errors on any
+  boot: the pre-existing B008 sprite/glyph messages.
+- Predictions scored: operator ("breaks at the OPFS-linked map") — wrong,
+  proof 3 passed three cold boots clean. Agent ("one unexpected CSP report
+  from MapLibre") — wrong, zero reports.
+- Not done, by instruction: the pmtiles.io seed branch and the /local/
+  bundled-archive provisioning in initFiles (D4 memo to operator).
+- Flagged for the operator (no action taken): `@jansoft/mbujkanji-valhalla-wasm`
+  and `flatgeobuf` are now unreferenced dependencies; `scripts/copy_valhalla_wasm.mjs`
+  and `scripts/build_test_graph.js` are orphaned; package.json's description
+  still promises routing.
+Steps used: 21/25. Pivots: 0.
+
+**Kill entry (P-FE.C3, 2026-09-11) — AGENT-CLOSED:**
+- D4 decided by the operator: option (c). `public/local/` moved to
+  `dev_assets/local/` (untracked archives; `dev_assets/README.md` added);
+  a dev-only Vite plugin (`apply: 'serve'`, `freehike-dev-local-archives`)
+  serves `/local/<file>` from there and answers a real 404 (text/plain,
+  never the SPA fallback) for a miss. `vite build` verified: dist contains
+  zero `.pmtiles` and no `dist/local`, so a Capacitor bundle cannot ship
+  the archives. The pmtiles.io seed branch and the legacy `hike.pmtiles`
+  MAP_INIT fallback are deleted; MAP_INIT now requires `filenames`. Native
+  builds boot to the "Map data unavailable" banner until the compiler binds
+  a real archive — ugly but true. The MapLibre `load`-with-empty-sources
+  question is NOT chased here (chunk 3, per operator); agent prediction on
+  it stands as written in the progress entry.
+- Flagged items, all executed on operator approval:
+  `@jansoft/mbujkanji-valhalla-wasm` and `flatgeobuf` uninstalled;
+  `scripts/copy_valhalla_wasm.mjs` and `scripts/build_test_graph.js`
+  deleted; package.json description no longer promises routing.
+  OWED (separate Finish Line item, not this chunk): README.md still claims
+  on-device routing (lines 32 and 45) — provenance-grade it or cut it.
+- Review challenge answered: grep of MapView.tsx + App.tsx for
+  route|routing|valhalla|elevation|sync|savedRoutes|download|overpass →
+  every hit is `SyncAccessHandle` / `async` / `synchronous`, the
+  contour placeholder's "0m-elevation tile" comment, or the "Syncing
+  binary file buffers" boot status. Zero survivors; nothing removed.
+- Proof 1 GREEN: janitor `--check` clean ×2 (2 debt, 1 bug, 0 exemptions,
+  0 warnings). Proof 2 GREEN: sovereignty suite passes ×2. Ladder ×2:
+  `tsc -b` clean, `eslint .` clean, vitest 9 files / 49 tests / 49
+  passing on both runs. Before the chunk: 9 files / 53 tests (−6 deleted
+  gpxSerializer suite, +2 sovereignty).
+- Proof 3 re-run under D4c: OPFS wiped from a same-origin non-app page,
+  cold boot → both archives "Provisioned … from dev assets", zero
+  "Content Security Policy" / "Refused" console hits, map rendered
+  (screenshot after a frame pump; the first 10-second screenshot caught
+  the boot overlay — preview rAF suspension, known trap). Only errors: the
+  pre-existing B008 sprite messages and the deliberate 404 probe.
+- Predictions scored (operator wording, verbatim): operator predicted
+  breakage at the OPFS-linked map in proof 3, wrong; agent predicted one
+  CSP report from MapLibre, wrong. Preview only, native boot untested until
+  chunk 4 airplane-mode smoke. No asterisk on either.
+- Open note, not investigated by instruction: why `GeoJSON.Feature` (global
+  namespace) resolved in MapView before the excision and not after;
+  replaced with an explicit `import type { Feature } from 'geojson'`.
+- Step budget: self-extended 25 → 40 (§1.4, logged): the operator added
+  D4c plus four flagged items after the plan entry. Steps used: 31/40.
+  Pivots: 0.
+- Diff (source, excluding package-lock.json):  29 files changed, 233 insertions(+), 5363 deletions(-)
+  package-lock.json alone:  1 file changed, 2754 insertions(+), 14264 deletions(-)
+- Promotion valve: the durable lesson is already promoted — P10 + P10a in
+  ARCHITECTURE.md (HITL-approved this chunk). Nothing else in this entry
+  has permanent applicability beyond what P10 states.
+- Not closed by this chunk: B008 (sprite/glyph), D004, D009 untouched.
+
+**Status:** AGENT-CLOSED (operator commit + OPERATOR-CLOSED pending).

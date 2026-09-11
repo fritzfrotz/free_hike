@@ -9,18 +9,11 @@ export interface OfflineRegion {
   terrainFile: string;
 }
 
-/** State machine for the fetch-and-write-to-OPFS pipeline of a new region. */
-export type RegionDownloadStatus = 'idle' | 'fetching' | 'writing' | 'done' | 'error';
-
 interface MapState {
   /** The offline region MapLibre's basemap/terrain sources are currently bound to. */
   activeRegion: OfflineRegion | null;
   /** Whether the camera is auto-following the live GPS fix. */
   isTrackingCamera: boolean;
-  /** Coarse status of an in-flight region download — cheap to render on. */
-  regionDownloadStatus: RegionDownloadStatus;
-  /** Human-readable label for the current download step. */
-  regionDownloadLabel: string;
   /** P9.C3 — true while the map is in custom-region selection mode (fixed
    *  reticle overlay; user pans/zooms the map beneath it). Lives here, not
    *  in component state, because RegionPicker (App) enters the mode and
@@ -32,8 +25,6 @@ interface MapState {
    *  next cold boot falls back to the style's default archives. */
   clearActiveRegion: () => void;
   setTrackingCamera: (tracking: boolean) => void;
-  setRegionDownloadStatus: (status: RegionDownloadStatus) => void;
-  setRegionDownloadLabel: (label: string) => void;
   setSelectingRegion: (selecting: boolean) => void;
 }
 
@@ -41,7 +32,7 @@ interface MapState {
  * Map-centric global state: the active offline region and GPS lock status.
  * Deliberately excludes high-frequency data (byte counters, GPS coordinate
  * streams) — those live in refs local to the components that render them,
- * bypassing React/Zustand re-renders entirely (see DownloadProgressBar).
+ * bypassing React/Zustand re-renders entirely (see BackgroundHandoffBar).
  *
  * P9.C2 — `activeRegion` (and only it, see partialize) survives app
  * restarts via zustand/persist over localStorage: a background-compiled
@@ -59,20 +50,16 @@ export const useMapStore = create<MapState>()(
     (set) => ({
       activeRegion: null,
       isTrackingCamera: false,
-      regionDownloadStatus: 'idle',
-      regionDownloadLabel: '',
       isSelectingRegion: false,
 
       setActiveRegion: (region) => set({ activeRegion: region }),
       clearActiveRegion: () => set({ activeRegion: null }),
       setTrackingCamera: (tracking) => set({ isTrackingCamera: tracking }),
-      setRegionDownloadStatus: (status) => set({ regionDownloadStatus: status }),
-      setRegionDownloadLabel: (label) => set({ regionDownloadLabel: label }),
       setSelectingRegion: (selecting) => set({ isSelectingRegion: selecting }),
     }),
     {
       name: 'freehike-active-region',
-      // Transient UI state (download status, camera lock) must NOT be
+      // Transient UI state (camera lock, selection mode) must NOT be
       // resurrected on boot — only the region binding is durable.
       partialize: (s) => ({ activeRegion: s.activeRegion }),
     },

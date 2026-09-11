@@ -1,52 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type {
-  WorkerRequestMessage,
-  WorkerResponseMessage,
-  SyncProvider,
-  SyncConnectionStatus,
-  SyncMetadata,
-  SyncManifestRecord,
-  CachedTrailFeature,
-  RouteCalculateSuccessPayload,
-  ElevationProfileRequestPayload,
-  ElevationProfileSuccessPayload,
-  DownloadRegionRequestPayload,
-  DownloadRegionSuccessPayload,
-} from '../shared/types';
 import MapView from './components/MapView';
-import CloudSyncPanel from './components/CloudSyncPanel';
-import ElevationProfile from './components/ElevationProfile';
-import { retrieveAndClearState } from './services/cryptoPKCE';
-import {
-  buildGoogleAuthUrl,
-  exchangeGoogleCode,
-  getGoogleUserInfo,
-  syncToGoogle,
-  disconnectGoogle,
-  loadGoogleTokenRecord,
-} from '../experimental/GoogleDriveSync';
-import {
-  buildDropboxAuthUrl,
-  exchangeDropboxCode,
-  getDropboxUserInfo,
-  syncToDropbox,
-  disconnectDropbox,
-  loadDropboxTokenRecord,
-} from '../experimental/DropboxSync';
-import { saveSyncMetadata, loadSyncMetadata, clearSyncMetadata } from './services/syncDB';
-import { featuresToGpx } from './services/gpxSerializer';
-import SavedRoutesPanel from './components/SavedRoutesPanel';
 import BackgroundHandoffBar from './components/BackgroundHandoffBar';
 import RegionPicker from './components/RegionPicker';
-import { saveRoute, deleteRoute } from '../shared/db';
-import type { SavedRoute } from '../shared/db';
 import { requestPersistentStorage } from './services/storageGuard';
 import { MapCompiler } from '../plugins/MapCompiler';
-import { useMapStore } from '../store/mapStore';
 import { useCompilerStore } from '../store/compilerStore';
-import { looksLikeHtmlFallback, looksLikePmtiles } from '../services/archiveValidation';
-import type { DownloadProgressHandle } from './components/DownloadProgressBar';
 
 /** Great-circle distance between two lng/lat points, in meters (haversine). */
 function haversineMeters(a: { lng: number; lat: number }, b: { lng: number; lat: number }): number {
@@ -60,41 +19,6 @@ function haversineMeters(a: { lng: number; lat: number }, b: { lng: number; lat:
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-/**
- * Reads a fetch Response body to completion, reporting each chunk's byte
- * length via onChunk. Used to drive DownloadProgressBar's ref-based sink
- * with real network progress instead of a single opaque arrayBuffer() await.
- */
-async function readResponseWithProgress(
-  res: Response,
-  onChunk: (bytes: number) => void,
-): Promise<ArrayBuffer> {
-  if (!res.body) {
-    const buffer = await res.arrayBuffer();
-    onChunk(buffer.byteLength);
-    return buffer;
-  }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      total += value.byteLength;
-      onChunk(value.byteLength);
-    }
-  }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return merged.buffer;
-}
-
 /** Formats a whole-second duration as HH:MM:SS. */
 function formatElapsed(totalSeconds: number): string {
   const h = Math.floor(totalSeconds / 3600);
@@ -106,6 +30,8 @@ function formatElapsed(totalSeconds: number): string {
 
 export default function App() {
   // ── Background worker health (drives the header status pill) ────────────────
+  // P-FE.C3: the mapData (OPFS) worker is the only worker left after the
+  // sovereignty cleanup; the pill reports its readiness.
   const [workerReady, setWorkerReady] = useState(false);
 
   // ── Native compiler state (granular selectors — App only re-renders when
@@ -113,43 +39,10 @@ export default function App() {
   const isCompiling  = useCompilerStore((s) => s.isCompiling);
   const currentPhase = useCompilerStore((s) => s.currentPhase);
 
-  // ── Cloud sync state ─────────────────────────────────────────────────────────
-  const [syncProvider, setSyncProvider] = useState<SyncProvider>('none');
-  const [syncStatus,   setSyncStatus]   = useState<SyncConnectionStatus>('disconnected');
-  const [syncMetadata, setSyncMetadata] = useState<SyncMetadata | null>(null);
-  const [syncEmail,    setSyncEmail]    = useState<string | null>(null);
-
-  // ── Offline Routing state (Phase 5) ──────────────────────────────────────────
-  const [calculatedRoute, setCalculatedRoute] = useState<{
-    coordinatesBuffer: ArrayBuffer;
-    distanceMeters: number;
-  } | null>(null);
-  const [routingWorker, setRoutingWorker] = useState<Worker | null>(null);
-
-  // ── Elevation profile state (Phase 7/8) ───────────────────────────────────────
-  const [elevationProfileData, setElevationProfileData] = useState<ElevationProfileSuccessPayload | null>(null);
-  /** Index of the coordinate point the user is hovering over in ElevationProfile. */
-  const [hoveredElevIndex, setHoveredElevIndex] = useState<number | null>(null);
-  /** Ref to the spatial worker so we can post to it from the routing handler. */
-  const spatialWorkerRef = useRef<Worker | null>(null);
-
-  // ── Phase 10: Offline Download Manager state ───────────────────────────────
-  // The coarse status/label live in useMapStore (App never subscribes to
-  // them — it only writes via getState(), so a fetch/writing transition
-  // re-renders MapView, which reads them directly, not App). Byte-level
-  // progress never touches React or Zustand state at all; it's pushed
-  // straight into DownloadProgressBar's ref via this imperative handle.
-  const downloadProgressHandleRef = useRef<DownloadProgressHandle | null>(null);
-  /** Ref to the mapData worker — needed to send DOWNLOAD_REGION_REQUEST. */
-  const mapDataWorkerRef = useRef<Worker | null>(null);
-
   // ── P9.C2: Region Picker sheet ───────────────────────────────────────────
   const [isRegionPickerOpen, setIsRegionPickerOpen] = useState(false);
   const isBackgroundCompiling = useCompilerStore((s) => s.isBackgroundCompiling);
 
-  // ── Phase 11: Route State Management state ───────────────────────────────
-  const [isSavedRoutesOpen, setIsSavedRoutesOpen] = useState(false);
-  const [savedRoutesRefreshKey, setSavedRoutesRefreshKey] = useState(0);
   const [isStorageDurable, setIsStorageDurable] = useState<boolean | null>(null);
 
   // ── User-facing error banners (surfaced instead of console-only logging) ────
@@ -169,166 +62,12 @@ export default function App() {
   const tripStatusRef = useRef<TripStatus>('idle');
   const lastTripPositionRef = useRef<{ lng: number; lat: number } | null>(null);
 
-  // ── Effect 1: OAuth callback interception + existing token restoration ───────
-  //
-  // Strategy: Startup URL interception on window.location.search.
-  // When Google/Dropbox redirect back, the URL carries ?code=...&state=...
-  // We read these params, validate the state nonce against sessionStorage,
-  // perform the token exchange, then clean the address bar via history.replaceState.
-  //
-  // If no callback params are found, we check localStorage for an existing
-  // token and restore the connection state from IDB sync metadata.
+  // ── Persistent storage request (durable OPFS) ───────────────────────────────
   useEffect(() => {
-    const params        = new URLSearchParams(window.location.search);
-    const code          = params.get('code');
-    const returnedState = params.get('state');
-
-    if (code && returnedState) {
-      // Validate CSRF state nonce — retrieveAndClearState() removes it from
-      // sessionStorage so it cannot be replayed.
-      const storedState = retrieveAndClearState();
-      if (storedState !== returnedState) {
-        console.error('[OAuth] State nonce mismatch — discarding callback.');
-        return;
-      }
-
-      // Clean the authorization code from the address bar immediately.
-      history.replaceState({}, '', window.location.pathname);
-
-      const isGoogle  = returnedState.startsWith('g_');
-      const isDropbox = returnedState.startsWith('dbx_');
-
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setSyncStatus('connecting');
-
-      if (isGoogle) {
-        setSyncProvider('google');
-        (async () => {
-          try {
-            const record = await exchangeGoogleCode(code);
-            const info   = await getGoogleUserInfo(record.accessToken);
-            setSyncEmail(info.email);
-            setSyncStatus('connected');
-            const manifest = await loadSyncMetadata();
-            if (manifest) setSyncMetadata(manifest.metadata);
-          } catch (err) {
-            console.error('[OAuth] Google exchange failed:', err);
-            setSyncStatus('error');
-          }
-        })();
-        return;
-      }
-
-      if (isDropbox) {
-        setSyncProvider('dropbox');
-        (async () => {
-          try {
-            const record = await exchangeDropboxCode(code);
-            const info   = await getDropboxUserInfo(record.accessToken);
-            setSyncEmail(info.email);
-            setSyncStatus('connected');
-            const manifest = await loadSyncMetadata();
-            if (manifest) setSyncMetadata(manifest.metadata);
-          } catch (err) {
-            console.error('[OAuth] Dropbox exchange failed:', err);
-            setSyncStatus('error');
-          }
-        })();
-        return;
-      }
-
-      // Unknown state prefix — discard silently.
-      return;
-    }
-
-    // ── No callback code: attempt to restore an existing connection ───────────
-    const googleRecord  = loadGoogleTokenRecord();
-    const dropboxRecord = loadDropboxTokenRecord();
-
-    if (googleRecord) {
-      setSyncProvider('google');
-      setSyncStatus('connected');
-      // Restore email + metadata from IDB; token refresh happens lazily on sync.
-      (async () => {
-        try {
-          const manifest = await loadSyncMetadata();
-          if (manifest) {
-            setSyncMetadata(manifest.metadata);
-            if (manifest.metadata.accountEmail) setSyncEmail(manifest.metadata.accountEmail);
-          }
-        } catch { /* non-critical */ }
-      })();
-      return;
-    }
-
-    if (dropboxRecord) {
-      setSyncProvider('dropbox');
-      setSyncStatus('connected');
-      (async () => {
-        try {
-          const manifest = await loadSyncMetadata();
-          if (manifest) {
-            setSyncMetadata(manifest.metadata);
-            if (manifest.metadata.accountEmail) setSyncEmail(manifest.metadata.accountEmail);
-          }
-        } catch { /* non-critical */ }
-      })();
-    }
-
-    // Check and request persistent storage (durable storage)
     (async () => {
       const status = await requestPersistentStorage();
       setIsStorageDurable(status.isPersistent);
     })();
-  }, []);
-
-  // ── Offline Routing Worker lifecycle (Phase 5) ─────────────────────────────
-  useEffect(() => {
-    const worker = new Worker(
-      new URL('../workers/routing.worker.ts', import.meta.url),
-      { type: 'module' },
-    );
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setRoutingWorker(worker);
-
-    const handleMessage = (event: MessageEvent<WorkerResponseMessage>) => {
-      const { type, payload } = event.data;
-      if (type === 'ROUTE_CALCULATE_SUCCESS') {
-        const { coordinatesBuffer, distanceMeters } = payload as RouteCalculateSuccessPayload;
-        // Save route for rendering on the map (needs a clone — we're transferring below).
-        // coordinatesBuffer is detached after transfer, so clone it first for the map.
-        const mapBuffer = coordinatesBuffer.slice(0);
-        setCalculatedRoute({ coordinatesBuffer: mapBuffer, distanceMeters });
-
-        // ── Phase 8: Chain → spatial worker for elevation profiling ──────────
-        // Build a Float64Array view over the original buffer and transfer it
-        // zero-copy to the spatial worker.
-        const spatialWorker = spatialWorkerRef.current;
-        if (spatialWorker && coordinatesBuffer.byteLength >= 16) {
-          const coordsForElevation = new Float64Array(coordinatesBuffer);
-          const elevReqId = Math.random().toString(36).substring(2, 9);
-          const elevReq: WorkerRequestMessage = {
-            id: elevReqId,
-            type: 'ELEVATION_PROFILE_REQUEST',
-            payload: { coordinates: coordsForElevation } satisfies ElevationProfileRequestPayload,
-          };
-          spatialWorker.postMessage(elevReq, [coordsForElevation.buffer]);
-          console.log(
-            '%c[Main Thread] Dispatched ELEVATION_PROFILE_REQUEST',
-            'color:#818cf8;font-weight:bold;',
-            { points: coordsForElevation.length / 2 },
-          );
-        }
-      }
-    };
-
-    worker.addEventListener('message', handleMessage);
-    console.log('%c[Main Thread] Routing Worker initialized.', 'color:#3b82f6;font-weight:bold;');
-
-    return () => {
-      worker.removeEventListener('message', handleMessage);
-      worker.terminate();
-    };
   }, []);
 
   // ── Active Trip HUD: elapsed-time ticker ───────────────────────────────────
@@ -378,11 +117,6 @@ export default function App() {
     setElapsedSeconds(0);
     setActiveDistanceMeters(0);
     lastTripPositionRef.current = null;
-  }, []);
-
-  // ── Elevation hover callback (memoised) ───────────────────────────────────
-  const handleElevHover = useCallback((index: number | null) => {
-    setHoveredElevIndex(index);
   }, []);
 
   // ── Phase 1 debug: MapCompiler wiring (WebView → Capacitor → UniFFI → Rust) ─
@@ -487,347 +221,6 @@ export default function App() {
     setMapDataError(message);
   }, []);
 
-  // ── Phase 10: Region download orchestrator ────────────────────────────────
-  //
-  // Flow:
-  //   1. Fetch the sandbox basemap archive (+ optional routing tar) from
-  //      /public URLs (in production these would come from a CDN
-  //      parametrised by region bbox).
-  //   2. Read both responses as ArrayBuffers — bypassing the browser cache.
-  //   3. Transfer them zero-copy to mapData.worker via DOWNLOAD_REGION_REQUEST.
-  //   4. Listen for DOWNLOAD_REGION_SUCCESS or DOWNLOAD_REGION_ERROR.
-  //   5. Advance the download state machine accordingly.
-  const handleRegionDownload = useCallback(async () => {
-    const worker = mapDataWorkerRef.current;
-    if (!worker) {
-      console.error('[Download] mapData worker not available.');
-      return;
-    }
-    const {
-      regionDownloadStatus,
-      setRegionDownloadStatus,
-      setRegionDownloadLabel,
-      setActiveRegion,
-    } = useMapStore.getState();
-    if (regionDownloadStatus === 'fetching' || regionDownloadStatus === 'writing') return;
-
-    setRegionDownloadStatus('fetching');
-    setRegionDownloadLabel('Fetching basemap archive…');
-
-    try {
-      // ── Step 1: Open both fetches ───────────────────────────────────────
-      // In a production build these URLs would be parametrised from the bbox;
-      // here we fetch the REAL sandbox archive that ships under /public
-      // (P-FE.C2, closes tracker B004 — the old /hike.pmtiles never existed,
-      // so the SPA fallback served index.html as a "successful" archive).
-      // fetch() resolves as soon as headers arrive, so opening both up front
-      // lets us size the progress bar's total before streaming either body.
-      const PMTILES_URL = '/local/alps_basemap.pmtiles'; // served by Vite from /public
-      const ROUTING_URL = '/test_graph.tar';             // optional; may not exist
-
-      const pmRes = await fetch(PMTILES_URL, { cache: 'no-store' });
-      if (!pmRes.ok) throw new Error(`PMTiles fetch failed: ${pmRes.statusText}`);
-      if (looksLikeHtmlFallback(pmRes.headers.get('content-type'))) {
-        throw new Error(
-          `PMTiles fetch for ${PMTILES_URL} answered with HTML (SPA fallback) — archive missing from /public`,
-        );
-      }
-
-      let tarRes: Response | null = null;
-      try {
-        const r = await fetch(ROUTING_URL, { cache: 'no-store' });
-        // The SPA fallback answers 200 text/html for ANY missing path —
-        // treat that as "absent", not as a routing graph.
-        if (r.ok && !looksLikeHtmlFallback(r.headers.get('content-type'))) tarRes = r;
-        else console.warn('[Download] test_graph.tar unavailable; routing skipped.');
-      } catch {
-        // Routing tar is optional — continue with empty buffer if absent.
-        console.warn('[Download] test_graph.tar unavailable; routing skipped.');
-      }
-
-      const pmTotal  = Number(pmRes.headers.get('content-length'))  || 0;
-      const tarTotal = tarRes ? Number(tarRes.headers.get('content-length')) || 0 : 0;
-      // Byte-level progress bypasses React/Zustand entirely — pushed
-      // straight into DownloadProgressBar's ref sink (see Task 2).
-      downloadProgressHandleRef.current?.reset(pmTotal + tarTotal);
-
-      const pmtilesBuffer = await readResponseWithProgress(pmRes, (n) => {
-        downloadProgressHandleRef.current?.addBytes(n);
-      });
-      // Magic-byte gate (P6 discipline at the JS seam): never hand a
-      // non-PMTiles body to the worker as an archive.
-      if (!looksLikePmtiles(pmtilesBuffer)) {
-        throw new Error('Downloaded archive failed the PMTiles magic-byte check — refusing to store it');
-      }
-
-      let routingBuffer = new ArrayBuffer(0);
-      if (tarRes) {
-        setRegionDownloadLabel('Fetching test_graph.tar…');
-        routingBuffer = await readResponseWithProgress(tarRes, (n) => {
-          downloadProgressHandleRef.current?.addBytes(n);
-        });
-      }
-
-      // ── Step 2: Hand buffers to the worker (zero-copy transfer) ──────────
-      setRegionDownloadStatus('writing');
-      setRegionDownloadLabel('Writing to OPFS…');
-
-      const reqId = Math.random().toString(36).substring(2, 9);
-      const req: WorkerRequestMessage = {
-        id:      reqId,
-        type:    'DOWNLOAD_REGION_REQUEST',
-        payload: {
-          pmtilesBuffer,
-          routingBuffer,
-          regionLabel: 'Andorra',
-        } satisfies DownloadRegionRequestPayload,
-      };
-
-      // ── Step 3: One-shot response listener ────────────────────────────
-      const onWorkerMessage = (event: MessageEvent<WorkerResponseMessage>) => {
-        const { id, type, payload, error } = event.data;
-        if (id !== reqId) return;
-        worker.removeEventListener('message', onWorkerMessage);
-
-        if (type === 'DOWNLOAD_REGION_SUCCESS') {
-          const result = payload as DownloadRegionSuccessPayload;
-          setRegionDownloadStatus('done');
-          setRegionDownloadLabel('');
-          console.log(
-            '%c[Download] DOWNLOAD_REGION_SUCCESS',
-            'color:#10b981;font-weight:bold;',
-            result,
-          );
-          // Hot-swap the live PMTiles source — MapView observes this and
-          // calls loadOfflineRegion() without tearing down the map/WebGL
-          // context. No region-specific terrain is fetched by this pipeline
-          // yet, so the default terrain source is kept as-is.
-          setActiveRegion({
-            regionLabel: result.regionLabel,
-            basemapFile: 'active_map.pmtiles',
-            terrainFile: 'alps_terrain.pmtiles',
-          });
-          // Auto-reset to idle after 3 s so the panel can be re-used.
-          setTimeout(() => setRegionDownloadStatus('idle'), 3_000);
-        } else {
-          throw new Error(error ?? 'DOWNLOAD_REGION_ERROR from worker');
-        }
-      };
-
-      worker.addEventListener('message', onWorkerMessage);
-      // Transfer both ArrayBuffers zero-copy — main thread relinquishes ownership.
-      worker.postMessage(req, [pmtilesBuffer, routingBuffer]);
-
-    } catch (err) {
-      console.error('[Download] Region download failed:', err);
-      setRegionDownloadStatus('error');
-      setRegionDownloadLabel('');
-      // Auto-reset to idle after 4 s.
-      setTimeout(() => setRegionDownloadStatus('idle'), 4_000);
-    }
-  }, []);
-
-  // ── Phase 11: Route State Management actions ──────────────────────────────
-  const handleSaveHike = useCallback(async (title: string) => {
-    if (!calculatedRoute || !elevationProfileData) {
-      throw new Error('No active route or elevation profile to save.');
-    }
-
-    // Reconstruct flat coordinate array from coordinatesBuffer
-    const coordsArray = new Float64Array(calculatedRoute.coordinatesBuffer.slice(0));
-
-    const routeData: SavedRoute = {
-      title,
-      timestamp: Date.now(),
-      coordinates: coordsArray,
-      totalAscent: elevationProfileData.totalAscent,
-      totalDescent: elevationProfileData.totalDescent,
-      elevations: elevationProfileData.elevations,
-    };
-
-    await saveRoute(routeData);
-    setSavedRoutesRefreshKey(prev => prev + 1);
-  }, [calculatedRoute, elevationProfileData]);
-
-  const handleLoadRoute = useCallback((route: SavedRoute) => {
-    // Zero-copy transfer slice so we can construct a fresh ArrayBuffer
-    const coordsBuffer = route.coordinates.buffer.slice(0) as ArrayBuffer;
-
-    setCalculatedRoute({
-      coordinatesBuffer: coordsBuffer,
-      distanceMeters: 0,
-    });
-
-    setElevationProfileData({
-      totalAscent: route.totalAscent,
-      totalDescent: route.totalDescent,
-      elevations: route.elevations,
-    });
-  }, []);
-
-  const handleDeleteRoute = useCallback(async (id: number) => {
-    await deleteRoute(id);
-    setSavedRoutesRefreshKey(prev => prev + 1);
-  }, []);
-
-  // ── Spatial worker elevation response handler (Phase 8) ───────────────────
-  // spatialWorkerRef is populated via onSpatialWorkerReady from MapView.
-  // We use a stable ref-listener pattern: attach once when the ref is set.
-  const spatialListenerAttached = useRef(false);
-  const handleSpatialElevation = useCallback(
-    (event: MessageEvent<WorkerResponseMessage>) => {
-      const { type, payload } = event.data;
-      if (type === 'ELEVATION_PROFILE_SUCCESS') {
-        const profile = payload as ElevationProfileSuccessPayload;
-        setElevationProfileData(profile);
-        console.log(
-          '%c[Main Thread] ELEVATION_PROFILE_SUCCESS',
-          'color:#34d399;font-weight:bold;',
-          { ascent: profile.totalAscent.toFixed(0), descent: profile.totalDescent.toFixed(0) },
-        );
-      }
-    },
-    [],
-  );
-
-
-  // ── Cloud sync handlers ──────────────────────────────────────────────────────
-
-  const handleConnectGoogle = async () => {
-    try {
-      const url = await buildGoogleAuthUrl();
-      window.location.href = url;
-    } catch (err) {
-      console.error('[Auth] Failed to build Google auth URL:', err);
-      setSyncStatus('error');
-    }
-  };
-
-  const handleConnectDropbox = async () => {
-    try {
-      const url = await buildDropboxAuthUrl();
-      window.location.href = url;
-    } catch (err) {
-      console.error('[Auth] Failed to build Dropbox auth URL:', err);
-      setSyncStatus('error');
-    }
-  };
-
-  const handleDisconnect = () => {
-    if (syncProvider === 'google')  disconnectGoogle();
-    if (syncProvider === 'dropbox') disconnectDropbox();
-    clearSyncMetadata().catch(console.error);
-    setSyncProvider('none');
-    setSyncStatus('disconnected');
-    setSyncMetadata(null);
-    setSyncEmail(null);
-  };
-
-  const handleSyncNow = async () => {
-    if (syncStatus !== 'connected') return;
-    setSyncStatus('syncing');
-
-    try {
-      // 1. Read the spatial index feature cache from OPFS (FlatGeobuf format).
-      const features: CachedTrailFeature[] = [];
-      try {
-        const root       = await navigator.storage.getDirectory();
-        const fileHandle = await root.getFileHandle('trails_features.fgb');
-        const file       = await fileHandle.getFile();
-        const buffer     = await file.arrayBuffer();
-        const uint8Array = new Uint8Array(buffer);
-        const { geojson: fgbGeojson } = await import('flatgeobuf');
-        for await (const feature of fgbGeojson.deserialize(uint8Array)) {
-          const properties = (feature.properties || {}) as Record<string, unknown>;
-          const geometry = feature.geometry;
-          if (geometry && geometry.type === 'LineString') {
-            const coordsFlat: number[] = [];
-            for (const pt of geometry.coordinates) {
-              coordsFlat.push(pt[0], pt[1]);
-            }
-            // Compute bounding box
-            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-            for (const pt of geometry.coordinates) {
-              if (pt[0] < minX) minX = pt[0];
-              if (pt[1] < minY) minY = pt[1];
-              if (pt[0] > maxX) maxX = pt[0];
-              if (pt[1] > maxY) maxY = pt[1];
-            }
-            features.push({
-              id: Number(properties.id || 0),
-              name: String(properties.name || 'Unnamed Trail'),
-              highway: String(properties.highway || 'path'),
-              coords: coordsFlat,
-              minX,
-              minY,
-              maxX,
-              maxY,
-            });
-          }
-        }
-      } catch (err) {
-        console.warn('Failed to read or deserialize trails_features.fgb:', err);
-        // trails_features.fgb is absent if no Overpass scan has run yet.
-        // Proceed with empty GPX — the sync still validates the pipeline.
-      }
-
-      // 2. Serialise to GPX 1.1 and build metadata manifest.
-      const gpxContent = featuresToGpx(features);
-      const metaJson   = JSON.stringify({
-        syncedAt:     new Date().toISOString(),
-        featureCount: features.length,
-        provider:     syncProvider,
-        appVersion:   '3.0.0-phase4',
-      }, null, 2);
-
-      // 3. Upload to the connected provider.
-      let uploadResult: { filesUploaded: number; totalBytes: number };
-      if (syncProvider === 'google') {
-        uploadResult = await syncToGoogle(gpxContent, metaJson);
-      } else if (syncProvider === 'dropbox') {
-        uploadResult = await syncToDropbox(gpxContent, metaJson);
-      } else {
-        throw new Error('No provider connected.');
-      }
-
-      // 4. Persist the outcome to IndexedDB.
-      const newMetadata: SyncMetadata = {
-        provider:     syncProvider,
-        accountEmail: syncEmail ?? undefined,
-        lastSynced:   new Date().toISOString(),
-        lastFileSize: uploadResult.totalBytes,
-        filesUploaded: uploadResult.filesUploaded,
-      };
-
-      const tokenRecord =
-        syncProvider === 'google'  ? loadGoogleTokenRecord()  :
-        syncProvider === 'dropbox' ? loadDropboxTokenRecord()  : null;
-
-      if (tokenRecord) {
-        const manifest: SyncManifestRecord = {
-          id:          'sync_manifest',
-          metadata:    newMetadata,
-          tokenRecord,
-        };
-        await saveSyncMetadata(manifest);
-      }
-
-      setSyncMetadata(newMetadata);
-      setSyncStatus('connected');
-
-      console.log(
-        '%c[Sync] Upload complete.',
-        'color:#10b981;font-weight:bold;',
-        uploadResult,
-      );
-    } catch (err) {
-      console.error('[Sync] Upload failed:', err);
-      setSyncStatus('error');
-      // Revert to 'connected' after 3 s so the user can retry.
-      setTimeout(() => setSyncStatus('connected'), 3_000);
-    }
-  };
-
   // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
@@ -840,7 +233,7 @@ export default function App() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
             </svg>
             <span>
-              <strong>Storage warning:</strong> Storage is not persistent. Your offline map data and route caches are at risk of being evicted silently if your device runs low on disk space.
+              <strong>Storage warning:</strong> Storage is not persistent. Your offline map data is at risk of being evicted silently if your device runs low on disk space.
             </span>
           </div>
         </div>
@@ -908,24 +301,6 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-4">
-          {/* Sync status indicator */}
-          {syncStatus !== 'disconnected' && (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900/60 border border-slate-800">
-              <span className={[
-                'h-2 w-2 rounded-full',
-                syncStatus === 'connected' ? 'bg-indigo-400 animate-pulse' :
-                syncStatus === 'syncing'   ? 'bg-teal-400 animate-ping'    :
-                syncStatus === 'error'     ? 'bg-rose-500'                  :
-                                             'bg-amber-400 animate-pulse',
-              ].join(' ')} />
-              <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wide">
-                {syncStatus === 'connected' ? `${syncProvider === 'google' ? 'Drive' : 'Dropbox'} linked` :
-                 syncStatus === 'syncing'   ? 'Syncing…' :
-                 syncStatus === 'error'     ? 'Sync error' : 'Connecting…'}
-              </span>
-            </div>
-          )}
-
           {/* Region Picker trigger (P9.C2) — pulses while the OS owns a queued compile */}
           <button
             onClick={() => setIsRegionPickerOpen(true)}
@@ -944,17 +319,6 @@ export default function App() {
             {isBackgroundCompiling ? 'Compiling…' : 'New Region'}
           </button>
 
-          {/* My Hikes HUD Trigger */}
-          <button
-            onClick={() => setIsSavedRoutesOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-900/60 hover:bg-slate-800/80 border border-slate-800 text-xs text-slate-300 font-semibold cursor-pointer transition-all active:scale-95"
-          >
-            <svg className="h-3.5 w-3.5 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
-            </svg>
-            My Hikes
-          </button>
-
           {/* Worker status indicator */}
           <div className="flex items-center space-x-2">
             <span className={`h-2.5 w-2.5 rounded-full ${workerReady ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} />
@@ -968,46 +332,18 @@ export default function App() {
       {/* ── Background compile → OPFS handoff banner (P9.C1) ──────────────── */}
       <BackgroundHandoffBar />
 
-      {/* ── Map + Elevation Panel ──────────────────────────────────────────── */}
+      {/* ── Map ─────────────────────────────────────────────────────────────── */}
       <section className="w-full max-w-6xl mb-8 relative">
         <MapView
-          routingWorker={routingWorker}
-          calculatedRoute={calculatedRoute}
-          clearRoute={() => {
-            setCalculatedRoute(null);
-            setElevationProfileData(null);
-            setHoveredElevIndex(null);
-          }}
-          hoveredElevIndex={hoveredElevIndex}
-          onSpatialWorkerReady={(worker) => {
-            spatialWorkerRef.current = worker;
+          onMapDataWorkerReady={() => {
             // Drives the header status pill: "connected" means the real
-            // spatial worker is up, not a placeholder heartbeat.
+            // OPFS worker is up, not a placeholder heartbeat.
             setWorkerReady(true);
-            // Attach the elevation response listener exactly once.
-            if (!spatialListenerAttached.current) {
-              worker.addEventListener('message', handleSpatialElevation);
-              spatialListenerAttached.current = true;
-            }
-          }}
-          onMapDataWorkerReady={(worker) => {
-            mapDataWorkerRef.current = worker;
           }}
           onLocationPermissionDenied={handleLocationPermissionDenied}
           onMapDataError={handleMapDataError}
           onPositionUpdate={handlePositionUpdate}
-          onRegionDownload={handleRegionDownload}
-          onDownloadProgressReady={(handle) => {
-            downloadProgressHandleRef.current = handle;
-          }}
         />
-        {elevationProfileData && (
-          <ElevationProfile
-            data={elevationProfileData}
-            onHoverIndex={handleElevHover}
-            onSaveHike={handleSaveHike}
-          />
-        )}
       </section>
 
       {/* ── Active Trip HUD ────────────────────────────────────────────────── */}
@@ -1078,18 +414,6 @@ export default function App() {
         </div>
       </section>
 
-      {/* ── Cloud Sync Panel ────────────────────────────────────────────────── */}
-      <CloudSyncPanel
-        syncProvider={syncProvider}
-        syncStatus={syncStatus}
-        syncMetadata={syncMetadata}
-        syncEmail={syncEmail}
-        onConnectGoogle={handleConnectGoogle}
-        onConnectDropbox={handleConnectDropbox}
-        onDisconnect={handleDisconnect}
-        onSyncNow={handleSyncNow}
-      />
-
       {/* ── Footer ─────────────────────────────────────────────────────────── */}
       <footer className="w-full max-w-6xl text-center border-t border-slate-900 pt-6 mt-8 text-xs text-slate-600">
         <p>© 2026 FreeHike contributors. Built with uncompromised client autonomy.</p>
@@ -1118,15 +442,6 @@ export default function App() {
       <RegionPicker
         isOpen={isRegionPickerOpen}
         onClose={() => setIsRegionPickerOpen(false)}
-      />
-
-      {/* ── Saved Routes Drawer Panel ───────────────────────────────────────── */}
-      <SavedRoutesPanel
-        isOpen={isSavedRoutesOpen}
-        onClose={() => setIsSavedRoutesOpen(false)}
-        onLoadRoute={handleLoadRoute}
-        onDeleteRoute={handleDeleteRoute}
-        refreshKey={savedRoutesRefreshKey}
       />
 
     </div>

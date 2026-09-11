@@ -82,6 +82,6 @@ DerivedData/
 # Agent session workspace
 .claude/
 
-# Installed from npm (@jansoft/mbujkanji-valhalla-wasm) by
-# scripts/copy_valhalla_wasm.mjs on predev/prebuild — never commit.
-public/valhalla.wasm
+# Preview-only pre-compiled archives (see dev_assets/README.md). Covered by
+# the *.pmtiles rule above; listed here so the intent is explicit.
+dev_assets/local/*.pmtiles

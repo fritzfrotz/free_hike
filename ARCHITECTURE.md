@@ -159,6 +159,20 @@ paths: src/**
 poll `ProcessInfo.thermalState` / Android `THERMAL_STATUS` and voluntarily downshift at
 `.serious`. Honest UX on iOS: "will compile while charging" — never a fake ETA.
 
+**P10 — Sovereign runtime.** After region ingestion the WebView makes no
+request to any host but its own origin: no live tile, elevation, trail,
+routing or sync endpoint. Enforced at runtime by `connect-src 'self'` in
+index.html and at CI by P10a. Ingestion itself is native (fetcher crate,
+P6); the `INTERNET` permission exists for that step alone.
+
+```
+rule-id: P10a
+forbidden-pattern: https?://
+paths: src/**
+# No allowlist and no exemptions: an absolute URL under src/ is a
+# sovereignty violation by definition. Test files are scanned too.
+```
+
 ## 3. Memory-Constraint Summary
 
 | Constraint | Value | Enforcement |

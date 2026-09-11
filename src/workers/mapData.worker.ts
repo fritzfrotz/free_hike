@@ -4,8 +4,7 @@
  *
  * Responsibilities:
  *   MAP_INIT             – open SyncAccessHandles for the initial OPFS file set
- *                          (filenames supplied in the payload; falls back to
- *                          'hike.pmtiles' for backward compatibility).
+ *                          (filenames supplied in the payload — required).
  *   MAP_READ_BYTES       – serve arbitrary byte ranges to WorkerPMTilesSource.
  *                          The request payload now includes a `filename` field
  *                          so the correct SyncAccessHandle is selected from the
@@ -13,9 +12,6 @@
  *   LOAD_OFFLINE_REGION  – open SyncAccessHandles for newly chosen region files
  *                          (called by MapView.loadOfflineRegion before swapping
  *                          MapLibre source URLs).
- *   DOWNLOAD_REGION_REQUEST \u2013 receive zero-copy ArrayBuffer pair from main thread,
- *                          write them to OPFS entirely off-thread, then open
- *                          the freshly written files so subsequent reads work.
  *
  * Storage strategy (Phase 11)
  * \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -30,8 +26,6 @@ import { createSyncHandleWithRetry } from './opfsRetry';
 import type {
   WorkerRequestMessage,
   WorkerResponseMessage,
-  DownloadRegionRequestPayload,
-  DownloadRegionSuccessPayload,
   MapInitSuccessPayload,
 } from '../shared/types';
 
@@ -96,12 +90,10 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       // on the OS files, preventing NoModificationAllowedError concurrency collision.
       closeAllHandles();
 
-      // Accept an optional filenames array from the caller.
-      // Fall back to the legacy single-file path for backward compatibility.
-      const filenames: string[] =
-        Array.isArray(payload?.filenames) && payload.filenames.length > 0
-          ? payload.filenames
-          : ['hike.pmtiles'];
+      const filenames: string[] = Array.isArray(payload?.filenames) ? payload.filenames : [];
+      if (filenames.length === 0) {
+        throw new Error('MAP_INIT: payload.filenames must be a non-empty array.');
+      }
 
       const provisionFailures = await initFiles(filenames);
 
@@ -199,22 +191,6 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       return;
     }
 
-    // ── DOWNLOAD_REGION_REQUEST ─────────────────────────────────────────────
-    if (type === 'DOWNLOAD_REGION_REQUEST') {
-      const { pmtilesBuffer, routingBuffer, regionLabel } =
-        payload as DownloadRegionRequestPayload;
-
-      const result = await writeRegionToOPFS(pmtilesBuffer, routingBuffer, regionLabel);
-
-      const response: WorkerResponseMessage = {
-        id,
-        type: 'DOWNLOAD_REGION_SUCCESS',
-        payload: result satisfies DownloadRegionSuccessPayload,
-      };
-      self.postMessage(response);
-      return;
-    }
-
     // ── Unknown type ─────────────────────────────────────────────────────────
     const response: WorkerResponseMessage = {
       id,
@@ -229,7 +205,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
     console.error('[mapData.worker] Error handling message:', type, err);
     self.postMessage({
       id,
-      type: type === 'DOWNLOAD_REGION_REQUEST' ? 'DOWNLOAD_REGION_ERROR' : 'ERROR',
+      type: 'ERROR',
       payload: null,
       error: message,
     } satisfies WorkerResponseMessage);
@@ -237,16 +213,20 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
 });
 
 // ---------------------------------------------------------------------------
-// MAP_INIT — open (and optionally seed) a set of OPFS files
+// MAP_INIT — open (and, in the dev preview, provision) a set of OPFS files
 // ---------------------------------------------------------------------------
 
 /**
- * Opens SyncAccessHandles for each filename in the list.
- * For the primary file ('hike.pmtiles' legacy path) an empty file is seeded
- * with a minimal PMTiles v3 stub header so the PMTiles library never reads
- * zero bytes and crashes during the first parse attempt.
+ * Opens SyncAccessHandles for each filename in the list. An empty file is
+ * provisioned from `/local/<filename>`, a path that exists ONLY on the Vite
+ * dev server (dev_assets/local via the middleware in vite.config.ts —
+ * P-FE.C3 decision D4c). Production and native builds have no such path:
+ * the fetch fails, the file stays a zero-byte stub, and the filename is
+ * reported in `provisionFailures` so the UI shows "Map data unavailable".
+ * On device, a map exists only once the on-device compiler's archive is
+ * bound through LOAD_OFFLINE_REGION (ARCHITECTURE.md P10).
  *
- * @returns Filenames that could not be provisioned (left as empty/stub OPFS
+ * @returns Filenames that could not be provisioned (left as empty OPFS
  *          files) so the caller can surface a user-facing error instead of
  *          only logging to the console.
  */
@@ -255,117 +235,31 @@ async function initFiles(filenames: string[]): Promise<string[]> {
 
   for (const filename of filenames) {
     const handle = await getHandle(filename);
+    if (handle.getSize() !== 0) continue;
 
-    if (handle.getSize() === 0) {
-      if (filename === 'hike.pmtiles') {
-        console.log('[mapData.worker] hike.pmtiles is empty — seeding with sample dataset…');
-        try {
-          const res = await fetch('https://pmtiles.io/stamen_toner(raster)CC-BY+ODbL_z3.pmtiles');
-          if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-          const buf = await res.arrayBuffer();
-          handle.write(new Uint8Array(buf), { at: 0 });
-          handle.flush();
-          console.log(`[mapData.worker] Sample PMTiles written. Size: ${handle.getSize()} bytes`);
-        } catch (err) {
-          console.error('[mapData.worker] Seed fetch failed — writing stub header:', err);
-          // Minimal PMTiles v3 magic + version byte so the library does not crash.
-          const stub = new Uint8Array(127);
-          stub.set([0x50, 0x4D, 0x54, 0x69, 0x6C, 0x65, 0x73, 3]); // "PMTiles" + v3
-          handle.write(stub, { at: 0 });
-          handle.flush();
-          provisionFailures.push(filename);
-        }
-      } else {
-        console.log(`[mapData.worker] "${filename}" is empty — provisioning from local assets /local/${filename}…`);
-        try {
-          const res = await fetch(`/local/${filename}`);
-          if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
-          const buf = await res.arrayBuffer();
+    console.log(`[mapData.worker] "${filename}" is empty — provisioning from dev assets /local/${filename}…`);
+    try {
+      const res = await fetch(`/local/${filename}`);
+      if (!res.ok) throw new Error(`Fetch failed: ${res.statusText}`);
+      const buf = await res.arrayBuffer();
 
-          // Dev servers (and some static hosts) return HTTP 200 with an HTML
-          // fallback page for a missing asset instead of a real 404 — verify
-          // the "PMTiles" magic header so a bad fetch doesn't get silently
-          // treated as a successful provision.
-          const magic = new Uint8Array(buf.slice(0, 7));
-          const isPMTiles = String.fromCharCode(...magic) === 'PMTiles';
-          if (!isPMTiles) {
-            throw new Error(`"${filename}" did not resolve to a valid PMTiles archive (got ${buf.byteLength} bytes — likely a missing/404 asset)`);
-          }
-
-          handle.write(new Uint8Array(buf), { at: 0 });
-          handle.flush();
-          console.log(`[mapData.worker] Provisioned "${filename}" from local assets. Size: ${handle.getSize()} bytes`);
-        } catch (err) {
-          console.error(`[mapData.worker] Failed to provision "${filename}" from local assets:`, err);
-          provisionFailures.push(filename);
-        }
+      // Some static hosts answer HTTP 200 with an HTML fallback page for a
+      // missing asset instead of a real 404 — verify the "PMTiles" magic
+      // header so a bad fetch is never treated as a successful provision.
+      const magic = new Uint8Array(buf.slice(0, 7));
+      const isPMTiles = String.fromCharCode(...magic) === 'PMTiles';
+      if (!isPMTiles) {
+        throw new Error(`"${filename}" did not resolve to a valid PMTiles archive (got ${buf.byteLength} bytes — likely a missing/404 asset)`);
       }
+
+      handle.write(new Uint8Array(buf), { at: 0 });
+      handle.flush();
+      console.log(`[mapData.worker] Provisioned "${filename}" from dev assets. Size: ${handle.getSize()} bytes`);
+    } catch (err) {
+      console.error(`[mapData.worker] Failed to provision "${filename}" (expected on native builds — no /local/ path):`, err);
+      provisionFailures.push(filename);
     }
   }
 
   return provisionFailures;
-}
-
-// ---------------------------------------------------------------------------
-// DOWNLOAD_REGION_REQUEST — write both files to OPFS, open new handles
-// ---------------------------------------------------------------------------
-
-/**
- * Writes `pmtilesBuffer` \u2192 `active_map.pmtiles` and
- *         `routingBuffer` \u2192 `active_routing.tar`
- * using createSyncAccessHandle() for maximum off-thread throughput.
- *
- * After writing, the function closes any stale handle for `active_map.pmtiles`
- * and opens a fresh one so subsequent MAP_READ_BYTES requests serve the new
- * region without an explicit LOAD_OFFLINE_REGION call.
- */
-async function writeRegionToOPFS(
-  pmtilesBuffer: ArrayBuffer,
-  routingBuffer: ArrayBuffer,
-  regionLabel:   string,
-): Promise<DownloadRegionSuccessPayload> {
-  const root = await navigator.storage.getDirectory();
-
-  // ── Write PMTiles ─────────────────────────────────────────────────────────
-  const pmHandle = await root.getFileHandle('active_map.pmtiles', { create: true });
-  const pmAccess = await pmHandle.createSyncAccessHandle();
-  pmAccess.truncate(0);
-  pmAccess.write(new Uint8Array(pmtilesBuffer), { at: 0 });
-  pmAccess.flush();
-  const pmtilesBytes = pmAccess.getSize();
-  pmAccess.close();
-
-  // ── Write routing tar (may be empty) ─────────────────────────────────────
-  let routingBytes = 0;
-  if (routingBuffer.byteLength > 0) {
-    const tarHandle = await root.getFileHandle('active_routing.tar', { create: true });
-    const tarAccess = await tarHandle.createSyncAccessHandle();
-    tarAccess.truncate(0);
-    tarAccess.write(new Uint8Array(routingBuffer), { at: 0 });
-    tarAccess.flush();
-    routingBytes = tarAccess.getSize();
-    tarAccess.close();
-  }
-
-  // ── Swap the registry entry for active_map.pmtiles ───────────────────────
-  // Close any cached handle (it points at stale bytes after truncate+write)
-  // and open a fresh one so MAP_READ_BYTES is immediately consistent.
-  const stale = handles.get('active_map.pmtiles');
-  if (stale) {
-    try { stale.close(); } catch { /* ignore if already closed */ }
-    handles.delete('active_map.pmtiles');
-  }
-  await getHandle('active_map.pmtiles');
-
-  console.log(
-    `[mapData.worker] Region "${regionLabel}" committed to OPFS \u2014 ` +
-    `PMTiles: ${pmtilesBytes} B, routing: ${routingBytes} B`,
-  );
-
-  return {
-    regionLabel,
-    pmtilesBytes,
-    routingBytes,
-    writtenAt: new Date().toISOString(),
-  };
 }

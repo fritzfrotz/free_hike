@@ -3000,3 +3000,6 @@ Steps used: 21/25. Pivots: 0.
 - Not closed by this chunk: B008 (sprite/glyph), D004, D009 untouched.
 
 **Status:** AGENT-CLOSED (operator commit + OPERATOR-CLOSED pending).
+
+**Status:** OPERATOR-CLOSED (2026-09-11, recorded on behalf of the operator in
+chat: "looks good. close the chunk"). Commit by the operator.

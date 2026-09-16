@@ -287,6 +287,22 @@ RustBuffer uniffi_freehike_ffi_fn_func_engine_version(RustCallStatus *_Nonnull o
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_FETCH_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_FETCH_CHUNK
+RustBuffer uniffi_freehike_ffi_fn_func_fetch_chunk(RustBuffer source_id, RustBuffer dest_dir, uint32_t budget_ms, uint64_t callback, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_LIST_SOURCES
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_LIST_SOURCES
+RustBuffer uniffi_freehike_ffi_fn_func_list_sources(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_PURGE_FETCH
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_PURGE_FETCH
+int8_t uniffi_freehike_ffi_fn_func_purge_fetch(RustBuffer source_id, RustBuffer dest_dir, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_PURGE_JOB
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_PURGE_JOB
 int8_t uniffi_freehike_ffi_fn_func_purge_job(RustBuffer job_id, RustBuffer output_dir, RustCallStatus *_Nonnull out_status
@@ -295,6 +311,11 @@ int8_t uniffi_freehike_ffi_fn_func_purge_job(RustBuffer job_id, RustBuffer outpu
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_QUERY_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_QUERY_CHECKPOINT
 RustBuffer uniffi_freehike_ffi_fn_func_query_checkpoint(RustBuffer job_id, RustBuffer output_dir, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_QUERY_FETCH
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_QUERY_FETCH
+RustBuffer uniffi_freehike_ffi_fn_func_query_fetch(RustBuffer source_id, RustBuffer dest_dir, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_FN_FUNC_SET_THERMAL_STATE
@@ -606,6 +627,24 @@ uint16_t uniffi_freehike_ffi_checksum_func_engine_version(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_FETCH_CHUNK
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_FETCH_CHUNK
+uint16_t uniffi_freehike_ffi_checksum_func_fetch_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_LIST_SOURCES
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_LIST_SOURCES
+uint16_t uniffi_freehike_ffi_checksum_func_list_sources(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_PURGE_FETCH
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_PURGE_FETCH
+uint16_t uniffi_freehike_ffi_checksum_func_purge_fetch(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_PURGE_JOB
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_PURGE_JOB
 uint16_t uniffi_freehike_ffi_checksum_func_purge_job(void
@@ -615,6 +654,12 @@ uint16_t uniffi_freehike_ffi_checksum_func_purge_job(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_CHECKPOINT
 uint16_t uniffi_freehike_ffi_checksum_func_query_checkpoint(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_FETCH
+#define UNIFFI_FFIDEF_UNIFFI_FREEHIKE_FFI_CHECKSUM_FUNC_QUERY_FETCH
+uint16_t uniffi_freehike_ffi_checksum_func_query_fetch(void
     
 );
 #endif

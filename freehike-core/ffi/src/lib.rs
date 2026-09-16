@@ -421,6 +421,415 @@ pub fn emit_test_progress(callback: Box<dyn ProgressCallback>, steps: u32) -> u3
 }
 
 // ---------------------------------------------------------------------------
+// Raw-input fetching (P-SOV.C2a) — Surface v1 addition, HITL-reviewed
+// ---------------------------------------------------------------------------
+//
+// `fetch_chunk(source_id, dest_dir, budget_ms, callback)` is the download
+// twin of `compile_chunk`: one budget-bounded slice, durable state on disk
+// only (a sidecar + the data file's own length), resume by re-invoking with
+// the same arguments. The foreign layer never names a host — it passes a
+// source id from `list_sources()`; the URL table lives in the fetcher crate
+// (ARCHITECTURE.md P10a keeps absolute URLs out of the WebView).
+
+/// Payload family of a source, mirrored from the fetcher crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FetchKind {
+    OsmPbf,
+    Tiff,
+}
+
+impl From<fetcher::PayloadKind> for FetchKind {
+    fn from(k: fetcher::PayloadKind) -> Self {
+        match k {
+            fetcher::PayloadKind::OsmPbf => FetchKind::OsmPbf,
+            fetcher::PayloadKind::Tiff => FetchKind::Tiff,
+        }
+    }
+}
+
+/// One fetchable raw-extract origin (display data for the UI; the id is
+/// what goes back into `fetch_chunk`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FetchSource {
+    pub id: String,
+    pub label: String,
+    /// Entry URL, for display/provenance only — never fetched by the WebView.
+    pub url: String,
+    pub kind: FetchKind,
+}
+
+/// Durable fetch state for a source in a destination directory.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FetchState {
+    pub source_id: String,
+    /// Final URL after redirect resolution; empty until resolved.
+    pub pinned_url: String,
+    /// Absolute path of the data file (`<dest_dir>/<pinned basename>`);
+    /// empty until resolved. This is the `pbf_path` a `CompileJob` takes.
+    pub path: String,
+    pub bytes_have: u64,
+    pub bytes_total: u64,
+    /// True only after magic-byte + MD5 verification: the enqueue gate.
+    pub verified: bool,
+    /// Restart-clean events so far (entity rotated, Range ignored…).
+    pub restarts: u32,
+}
+
+/// Result of one fetch slice.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FetchStatus {
+    /// Complete and verified; `state.path` is safe to compile from.
+    Finished { state: FetchState },
+    /// Budget expired; `state.bytes_have` bytes are durable. Re-invoke.
+    Yielded { state: FetchState },
+    /// Non-retryable (bad payload, checksum mismatch, refused URL, restart
+    /// cap, unreadable sidecar). `purge_fetch` clears the state.
+    FailedFatal { reason: String },
+    /// Network/disk refused the slice; durable state untouched. Retry later.
+    FailedTransient { reason: String },
+}
+
+/// The source table, in declaration order.
+#[uniffi::export]
+pub fn list_sources() -> Vec<FetchSource> {
+    ensure_logging();
+    fetcher::sources::sources()
+        .into_iter()
+        .map(|s| FetchSource {
+            id: s.id,
+            label: s.label,
+            url: s.url,
+            kind: s.kind.into(),
+        })
+        .collect()
+}
+
+fn to_fetch_state(s: fetcher::FetchState) -> FetchState {
+    FetchState {
+        source_id: s.source_id,
+        pinned_url: s.pinned_url,
+        path: s.path.to_string_lossy().into_owned(),
+        bytes_have: s.have,
+        bytes_total: s.total,
+        verified: s.verified,
+        restarts: s.restarts,
+    }
+}
+
+/// The full sidecar view after a slice. The engine wrote the sidecar an
+/// instant ago, so failing to read it back means the durable state is
+/// inconsistent — reported as an error, never fabricated (same rule as
+/// `query_checkpoint`: unreadable state is not guessed at).
+fn state_after(source_id: &str, dest_dir: &str) -> Result<FetchState, String> {
+    match fetcher::query_fetch(source_id, std::path::Path::new(dest_dir)) {
+        Ok(Some(s)) => Ok(to_fetch_state(s)),
+        Ok(None) => Err(format!(
+            "fetch sidecar for {source_id} vanished after the slice"
+        )),
+        Err(e) => Err(format!(
+            "fetch sidecar for {source_id} unreadable after the slice: {e}"
+        )),
+    }
+}
+
+/// Runs one fetch slice for an already-resolved `Source`. Plain (non-
+/// exported) entry point so tests can point the engine at a loopback
+/// mirror; `fetch_chunk` is the exported wrapper that adds the id lookup.
+pub fn fetch_chunk_for_source(
+    source: &fetcher::sources::Source,
+    dest_dir: &str,
+    budget_ms: u32,
+    callback: &dyn ProgressCallback,
+) -> FetchStatus {
+    if dest_dir.is_empty() {
+        return FetchStatus::FailedFatal {
+            reason: "dest_dir must not be empty".to_string(),
+        };
+    }
+    let budget = Duration::from_millis(u64::from(budget_ms));
+    let mut on_progress = |pct: f32, status: String| callback.on_progress(pct, status);
+    let outcome = fetcher::fetch_slice_blocking(
+        source,
+        std::path::Path::new(dest_dir),
+        budget,
+        &mut on_progress,
+    );
+    match outcome {
+        fetcher::FetchOutcome::Finished { path, bytes } => {
+            info!(
+                "FFI fetch_chunk({}) -> Finished ({} bytes at {})",
+                source.id,
+                bytes,
+                path.display()
+            );
+            match state_after(&source.id, dest_dir) {
+                Ok(state) => FetchStatus::Finished { state },
+                Err(reason) => {
+                    error!("FFI fetch_chunk({}) -> FailedFatal: {reason}", source.id);
+                    FetchStatus::FailedFatal { reason }
+                }
+            }
+        }
+        fetcher::FetchOutcome::Yielded { have, total, .. } => {
+            info!(
+                "FFI fetch_chunk({}) -> Yielded ({have}/{total} bytes)",
+                source.id
+            );
+            match state_after(&source.id, dest_dir) {
+                Ok(state) => FetchStatus::Yielded { state },
+                Err(reason) => {
+                    error!("FFI fetch_chunk({}) -> FailedFatal: {reason}", source.id);
+                    FetchStatus::FailedFatal { reason }
+                }
+            }
+        }
+        fetcher::FetchOutcome::FailedFatal(reason) => {
+            error!("FFI fetch_chunk({}) -> FailedFatal: {reason}", source.id);
+            FetchStatus::FailedFatal { reason }
+        }
+        fetcher::FetchOutcome::FailedTransient(reason) => {
+            warn!(
+                "FFI fetch_chunk({}) -> FailedTransient: {reason}",
+                source.id
+            );
+            FetchStatus::FailedTransient { reason }
+        }
+    }
+}
+
+/// Runs one budget-bounded fetch slice of `source_id` into `dest_dir`.
+/// Never throws: all failures are values. Resume by calling again with the
+/// same arguments; the engine reloads its own sidecar and the data file's
+/// length. See `FetchStatus`.
+#[uniffi::export]
+pub fn fetch_chunk(
+    source_id: String,
+    dest_dir: String,
+    budget_ms: u32,
+    callback: Box<dyn ProgressCallback>,
+) -> FetchStatus {
+    ensure_logging();
+    info!("FFI fetch_chunk({source_id}) entered (budget_ms={budget_ms})");
+    let Some(source) = fetcher::sources::find_source(&source_id) else {
+        error!("FFI fetch_chunk({source_id}) rejected: unknown source");
+        return FetchStatus::FailedFatal {
+            reason: format!("unknown source id {source_id:?}"),
+        };
+    };
+    fetch_chunk_for_source(&source, &dest_dir, budget_ms, callback.as_ref())
+}
+
+/// Durable fetch state for `source_id` in `dest_dir`, or None if nothing
+/// was ever resolved there. `verified == true` is the compile-enqueue gate.
+/// Unreadable state reports None (the next `fetch_chunk` surfaces the
+/// precise error), mirroring `query_checkpoint`.
+#[uniffi::export]
+pub fn query_fetch(source_id: String, dest_dir: String) -> Option<FetchState> {
+    ensure_logging();
+    match fetcher::query_fetch(&source_id, std::path::Path::new(&dest_dir)) {
+        Ok(Some(s)) => {
+            info!(
+                "FFI query_fetch({source_id}) -> found ({}/{} bytes, verified={})",
+                s.have, s.total, s.verified
+            );
+            Some(to_fetch_state(s))
+        }
+        Ok(None) => {
+            info!("FFI query_fetch({source_id}) -> none");
+            None
+        }
+        Err(e) => {
+            warn!("FFI query_fetch({source_id}) -> unreadable state ({e}); reporting none");
+            None
+        }
+    }
+}
+
+/// Removes the sidecar and the data file (partial or complete) for
+/// `source_id` in `dest_dir`. Returns true if anything existed.
+#[uniffi::export]
+pub fn purge_fetch(source_id: String, dest_dir: String) -> bool {
+    ensure_logging();
+    info!("FFI purge_fetch({source_id}) requested");
+    fetcher::purge_fetch(&source_id, std::path::Path::new(&dest_dir))
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use fetcher::sources::{Md5Spec, Source};
+    use fetcher::testing::{md5_hex, range_response, LoopbackServer, Request, Response};
+    use std::sync::{Arc, Mutex};
+
+    struct Sink(Arc<Mutex<Vec<(f32, String)>>>);
+    impl ProgressCallback for Sink {
+        fn on_progress(&self, percentage: f32, status: String) {
+            self.0.lock().unwrap().push((percentage, status));
+        }
+    }
+
+    const PBF_HEAD: &[u8] = &[
+        0x00, 0x00, 0x00, 0x0d, 0x0a, 0x09, b'O', b'S', b'M', b'H', b'e', b'a', b'd', b'e', b'r',
+        0x18, 0x4b, 0x10, 0x3f, 0x1a,
+    ];
+
+    fn body(len: usize) -> Vec<u8> {
+        let mut out = PBF_HEAD.to_vec();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.push((x & 0xff) as u8);
+        }
+        out
+    }
+
+    fn mirror(data: Vec<u8>) -> LoopbackServer {
+        LoopbackServer::start(move |req: &Request| {
+            if req.path == "/pt-latest.osm.pbf" {
+                Response::redirect("/pt-260910.osm.pbf")
+            } else if req.path == "/pt-260910.osm.pbf" {
+                range_response(&data, req, "\"ffi-etag\"")
+            } else if req.path == "/pt-260910.osm.pbf.md5" {
+                Response::ok(
+                    format!("{}  pt-260910.osm.pbf\n", md5_hex(&data)).into_bytes(),
+                    "text/plain",
+                )
+            } else {
+                Response::not_found()
+            }
+        })
+    }
+
+    fn scratch(tag: &str) -> String {
+        let dir =
+            std::env::temp_dir().join(format!("freehike-ffi-fetch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn loopback_source(server: &LoopbackServer) -> Source {
+        Source {
+            id: "loopback-pt".into(),
+            label: "loopback".into(),
+            url: server.url("/pt-latest.osm.pbf"),
+            kind: fetcher::PayloadKind::OsmPbf,
+            md5: Md5Spec::Derived,
+        }
+    }
+
+    #[test]
+    fn fetch_chunk_rejects_unknown_source() {
+        let sink = Sink(Default::default());
+        match fetch_chunk(
+            "no-such-source".into(),
+            scratch("unknown"),
+            1_000,
+            Box::new(sink),
+        ) {
+            FetchStatus::FailedFatal { reason } => {
+                assert!(reason.contains("unknown source"), "got: {reason}")
+            }
+            other => panic!("expected FailedFatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_chunk_rejects_empty_dest_dir() {
+        let sink = Sink(Default::default());
+        match fetch_chunk(
+            "geofabrik-portugal".into(),
+            String::new(),
+            1_000,
+            Box::new(sink),
+        ) {
+            FetchStatus::FailedFatal { reason } => {
+                assert!(reason.contains("dest_dir"), "got: {reason}")
+            }
+            other => panic!("expected FailedFatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_sources_matches_table() {
+        let ffi = list_sources();
+        let table = fetcher::sources::sources();
+        assert_eq!(ffi.len(), table.len());
+        for (a, b) in ffi.iter().zip(table.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.url, b.url);
+            assert_eq!(a.kind, b.kind.into());
+        }
+        assert!(ffi.iter().any(|s| s.id == "geofabrik-portugal"));
+        assert!(ffi.iter().any(|s| s.id == "osmfr-lisbon"));
+    }
+
+    #[test]
+    fn fetch_chunk_finishes_via_loopback() {
+        let data = body(250_000);
+        let server = mirror(data.clone());
+        let src = loopback_source(&server);
+        let dir = scratch("finish");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink(Arc::clone(&seen));
+
+        let mut status = None;
+        for _ in 0..5 {
+            match fetch_chunk_for_source(&src, &dir, 10_000, &sink) {
+                FetchStatus::Yielded { .. } => continue,
+                terminal => {
+                    status = Some(terminal);
+                    break;
+                }
+            }
+        }
+        let Some(FetchStatus::Finished { state }) = status else {
+            panic!("expected Finished, got {status:?}")
+        };
+        assert!(state.verified);
+        assert_eq!(state.bytes_have, data.len() as u64);
+        assert_eq!(state.bytes_total, data.len() as u64);
+        assert!(state.pinned_url.ends_with("/pt-260910.osm.pbf"));
+        assert!(state.path.ends_with("/pt-260910.osm.pbf"));
+        assert_eq!(std::fs::read(&state.path).unwrap(), data);
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|(_, s)| s.starts_with("fetch: resolved")));
+        assert!(seen.iter().any(|(_, s)| s.starts_with("fetch: verified")));
+    }
+
+    #[test]
+    fn query_and_purge_fetch_roundtrip() {
+        let data = body(120_000);
+        let server = mirror(data);
+        let src = loopback_source(&server);
+        let dir = scratch("roundtrip");
+
+        assert!(query_fetch(src.id.clone(), dir.clone()).is_none());
+        let sink = Sink(Default::default());
+        let mut done = false;
+        for _ in 0..5 {
+            if let FetchStatus::Finished { .. } = fetch_chunk_for_source(&src, &dir, 10_000, &sink)
+            {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+
+        let q = query_fetch(src.id.clone(), dir.clone()).expect("state after finish");
+        assert!(q.verified);
+        assert_eq!(q.restarts, 0);
+        assert!(std::path::Path::new(&q.path).is_file());
+
+        assert!(purge_fetch(src.id.clone(), dir.clone()));
+        assert!(query_fetch(src.id.clone(), dir.clone()).is_none());
+        assert!(!std::path::Path::new(&q.path).exists());
+        assert!(!purge_fetch(src.id, dir));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

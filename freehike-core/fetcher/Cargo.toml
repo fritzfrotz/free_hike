@@ -12,11 +12,27 @@ description = "Validated, resumable HTTPS fetching of raw OSM extracts and DEM G
 # aarch64-linux-android / aarch64-apple-ios without an OpenSSL toolchain, which
 # is the whole point of this dependency choice (per the Phase 2 directive).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-# The library only does async fs/io — it never owns a runtime; the caller
-# (FFI layer or tests) provides one.
-tokio = { version = "1", features = ["fs", "io-util"] }
+# The library only does async fs/io; `rt` (P-SOV.C2a, D5, HITL-approved
+# 2026-09-14) is for the one blocking entry point the FFI calls
+# (`fetch_slice_blocking`), which builds a current-thread runtime per slice
+# — the sync Surface v1 contract stays sync. No multi-thread runtime.
+tokio = { version = "1", features = ["fs", "io-util", "rt"] }
 futures-util = "0.3"
+# End-to-end integrity of the raw extract against the mirror's published
+# `.md5` (P-SOV.C2a, D4, HITL-approved 2026-09-14): catches a stale partial
+# from a caching proxy or a disk fault that Content-Length cannot see.
+md-5 = { workspace = true }
 
 [dev-dependencies]
 # Runtime + #[tokio::test] macro for the test harness only.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Self dev-dependency: activates the `testing` feature for this crate's own
+# integration tests (tests/loopback.rs) without a feature flag on the
+# command line — the standard cargo idiom for optional test scaffolding.
+fetcher = { path = ".", features = ["testing"] }
+
+[features]
+# Exposes the in-process loopback HTTP server (`testing` module) to
+# downstream test suites (ffi dev-dependency). Never enable in a production
+# dependency.
+testing = []

@@ -3003,3 +3003,554 @@ Steps used: 21/25. Pivots: 0.
 
 **Status:** OPERATOR-CLOSED (2026-09-11, recorded on behalf of the operator in
 chat: "looks good. close the chunk"). Commit by the operator.
+
+## P-SOV.C2 — Pre-plan verification for chunk 2 (fetch_inputs + shell wiring) (2026-09-11)
+
+**Type:** DECISION-mode pre-plan record. No code touched; the decision memo
+was delivered in chat and STOPS there. The §1.1 plan entry follows the
+operator's call (implementation starts 2026-09-14 after the weekly review).
+Chunk IDs `P-SOV.C2a` / `P-SOV.C2b` are proposed, not approved.
+
+**Chat-authorized deviation (logged per manual §1.6):** operator asked for the
+DL-003 Geofabrik verification plus an openstreetmap.fr sub-region check;
+`curl` against download.geofabrik.de and download.openstreetmap.fr was run
+2026-09-11 (network outside the §1.2 whitelist). Also run: a `cargo ndk`
+cross-compile probe of the `fetcher` crate (whitelisted command; the crate is
+not an `ffi` dependency, so L4 has never covered it).
+
+**Geofabrik findings (DL-003 premise check):**
+- `europe/portugal-latest.osm.pbf` → **302** →
+  `europe/portugal-260910.osm.pbf`. The 302 body is a 244-byte `text/html`
+  page (`<!DOCTYPE HTML PUBLIC … 302 Found`). This is the P6 lesson, live.
+- Dated file: 200; `Content-Length: 422526281` (403 MiB);
+  `Accept-Ranges: bytes`; `Content-Type: application/octet-stream`;
+  `ETag: "192f3d49-65b29852ca094"`; `Last-Modified: Thu, 10 Sep 2026
+  23:42:26 GMT`; served through squid (`Via: 1.1 download-proxy13
+  (squid/6.14)`, `Cache-Status: … fwd=stale` seen on the 302).
+- `Range: bytes=0-31` on the dated file → **206**,
+  `Content-Range: bytes 0-31/422526281`, head bytes
+  `00 00 00 0e 0a 09 "OSMHeader"` (magic-byte gate passes). Mid-file range
+  100000000-100000015 → 206 with the matching Content-Range.
+- Range through `-latest` with redirect following → 302 then 206: curl keeps
+  `Range` across the same-host redirect; reqwest 0.12.28 does too
+  (`redirect::remove_sensitive_headers` strips only auth/cookie headers, and
+  only cross-host; default policy follows 10 hops).
+- MD5: `portugal-latest.osm.pbf.md5` (200, `text/plain`) and
+  `portugal-260910.osm.pbf.md5` both give
+  `8b00397cb329e78755c05b62aa84ac76`.
+- State: `europe/portugal-updates/state.txt` → `sequenceNumber=4906`,
+  `timestamp=2026-09-10T20:21:06Z` (OSM minutely seq 7281228).
+- Retention: the directory lists dailies 260904…260910 (seven), monthlies
+  260601…260901 and yearlies back to 140101 — a pinned dated URL stays
+  valid for roughly a week, monthlies far longer.
+- Hazard identified for the memo: `-latest` rotates daily; a Range resume
+  against `-latest` after a rotation splices bytes from a different file
+  onto yesterday's head, and the magic-byte gate cannot see it.
+
+**openstreetmap.fr findings (fallback ladder, no hosting):**
+- `extracts/europe/portugal-latest.osm.pbf`: 200 direct (no redirect),
+  473,994,495 B, `Content-Type: application/vnd.openstreetmap.data+xml`
+  (the XML label; magic bytes stay authoritative), `Accept-Ranges: bytes`,
+  regenerated in place daily (`Last-Modified: Fri, 11 Sep 2026 01:41:05
+  GMT`) — same-URL identity change, so the splice hazard exists here too.
+- District cuts: `lisbon-latest` 55,167,053 B (206 OK, magic OK, md5
+  `1b8085377e48d871a26a6bbbf634376f`, state seq 7281556 @
+  2026-09-11T01:55:51Z); `setubal-latest` 28,703,075 B; `santarem-latest`
+  22,739,988 B. Arrábida is in Setúbal district, Sintra in Lisbon district:
+  one district file does not cover the whole demo area.
+
+**Cross-compile probe:** `cargo ndk -t arm64-v8a build -p fetcher` →
+Finished (dev) in 8.6 s. Resolved: reqwest 0.12.28, rustls 0.23.41,
+ring 0.17.14, tokio 1.52.3 with features `fs`,`io-util` only (no `rt`:
+the FFI needs a runtime → dependency-feature change, HITL). Release arm64
+`libfreehike_ffi.so` today: 1,711,856 B (fetcher not linked yet).
+Vendored bindings verified in sync (shasum equal, all four files).
+
+**Status:** memo delivered; awaiting operator call + prediction.
+
+## P-SOV.C2a — fetcher hardening + FFI `fetch_chunk` + bindings + L4 (2026-09-14)
+
+**Operator calls (DECISION mode, 2026-09-14, verbatim):** D1 (b) two chunks,
+C2a then C2b. D2 (b) fetch_chunk, budget-yield. D3 (b) resolve once, pin
+dated URL, sidecar with ETag + total, If-Range on resume. D4 (b) md-5 crate,
+HITL approved. D5 (a) tokio rt feature, HITL approved. D6 (a) foreground, raw
+at map_jobs/raw/<dated>, enqueue refuses unverified. D7 source table in Rust,
+both geofabrik-portugal and osmfr-lisbon. D8 one Portugal preset, two-step
+flow. Instruction: proceed with C2a; STOP at step 8 (FFI surface review, the
+operator's).
+
+**Predictions (§3.5, verbatim):** Operator: "breaks first at D6 — the
+foreground fetch / raw path / enqueue gate. Wrong if the download works
+flawlessly on the Samsung, kill-and-resume included." Agent (from the memo):
+the loopback suite finds nothing in the fetcher; the first real surprise is
+on the Samsung, a squid 206 whose Content-Range does not match the request,
+caught by the MD5 not the parser; wrong if a kill-and-resume cycle on the
+Samsung ends in the published MD5 with no restart-clean event in logcat.
+Both score at the C2b Samsung fetch smoke.
+
+**Goal:** `fetch_chunk(source_id, dest_dir, budget_ms, cb)` on the FFI
+delivers a verified raw extract to `<dest_dir>/<pinned basename>` under the
+Surface v1 yield contract, resumable across process death, immune to the
+`-latest` rotation splice, cross-compiled for arm64 Android.
+
+**Files:** `freehike-core/Cargo.toml` (workspace dep `md-5`), `Cargo.lock`,
+`fetcher/Cargo.toml` (tokio `rt`, `md-5`, `testing` feature, self dev-dep
+for the feature), `fetcher/src/{lib.rs,sources.rs,sidecar.rs,testing.rs}`,
+`fetcher/tests/loopback.rs` (new), `ffi/Cargo.toml` (dep `fetcher`; dev-dep
+`fetcher` with `testing`), `ffi/src/lib.rs`, `ffi/bindings/*` regenerated,
+vendored to `ios/App/App/FreeHikeFFI/` and
+`android/app/src/main/java/uniffi/freehike/freehike.kt`, LOOPLOG, TRACKER
+(generated).
+Deviation from the memo, flagged: the old `download_and_validate` and its
+ignored Monaco live test are REPLACED by the slice engine, not kept beside
+it — keeping a resume path without pinning would contradict D3. Veto
+offered in the report.
+
+**Design (as memoed, D2/D3/D4/D7):** sidecar `<dest_dir>/<source_id>.fetch`
+(`key=value`, `version=1`, atomic tmp→fsync→rename→dir-fsync like the
+checkpoint; refused loudly on version mismatch), fields: source_id,
+pinned_url, etag, total, expected_md5, verified, restarts. Resolve = GET
+`Range: bytes=0-0` with redirects DISABLED, ≤5 hops, every Location https
+(loopback http allowed only for the `testing` server); MD5 fetched at
+resolve time (Geofabrik: pinned URL + `.md5`; osm.fr: explicit URL) and the
+filename field must match. Data slices: `Range: bytes=<have>-` +
+`If-Range: <etag>`; 206 appends; 200 on a resume = entity changed or Range
+ignored → truncate + re-resolve (restarts+1, cap 3 → FailedFatal); 404 on
+the pinned URL → same restart path; transport errors → FailedTransient.
+Budget enforced per received chunk with minimum forward progress (one
+chunk); file fsync'd at slice end; file length is the resume truth, the
+sidecar never runs ahead of it. Complete = length == total → magic bytes →
+streaming MD5 (may overrun the budget by the hash time, ~1–2 s/400 MB,
+documented) → verified=1 → Finished. MD5 mismatch → FailedFatal, partial
+kept, `purge_fetch` clears. Progress callback throttled to 1 MiB.
+FFI additions: records `FetchSource`, `FetchState`; enums `FetchKind`,
+`FetchStatus`; fns `list_sources`, `fetch_chunk`, `query_fetch`,
+`purge_fetch`; `ProgressCallback` reused.
+
+**Proofs (named before implementation):**
+- L1 (no I/O), fetcher: `sources_are_https_only`, `find_source_by_id`,
+  `sidecar_roundtrip`, `sidecar_version_mismatch_refused`,
+  `sidecar_missing_field_refused`, `md5_line_parses_strictly`,
+  `md5_line_rejects_html_and_wrong_name`, `pinned_basename_rejects_traversal`,
+  `resume_headers_carry_range_and_if_range`, existing magic-byte tests kept.
+- Loopback (`fetcher/tests/loopback.rs`, in-process `TcpListener`, no
+  external network, no new dep): `latest_redirect_is_pinned_to_dated_url`,
+  `resume_appends_on_206`, `if_range_mismatch_restarts_clean`,
+  `dated_404_re_resolves`, `html_200_rejected_by_magic`,
+  `md5_mismatch_fails_fatal_and_keeps_partial`, `slice_yields_within_budget`,
+  `kill_resume_byte_identical`, `restart_cap_fails_fatal`,
+  `finished_is_idempotent`.
+- ffi L1: `fetch_chunk_rejects_unknown_source`,
+  `fetch_chunk_finishes_via_loopback`, `list_sources_matches_table`,
+  `query_and_purge_fetch_roundtrip`.
+- Ladder: `cargo test --workspace`, clippy `-D warnings`, fmt; L4
+  `cargo ndk -t arm64-v8a build --release -p ffi` with `.so` size vs today's
+  1,711,856 B; iOS target attempted, failure → D004. Bindings regenerated
+  (library mode) and shasum-equal in all three locations. Green-lock ×2.
+- Optional [E]: `cargo test -p fetcher -- --ignored live_geofabrik_portugal_probe`.
+
+**Steps [E]/[D]:** 1 [E] operator call — done. 2 [D] this entry. 3 [D]
+red tests (expected COMPILE_FAIL: the API does not exist; behavioral red
+for If-Range/splice is the loopback server's recorded headers once it
+compiles). 4 [D] fetcher implementation. 5 [D] ffi export. 6 [D] bindings
+regen + vendor. 7 [D] ladder + L4 ×2, close-report. 8 [E] **STOP — FFI
+surface review (operator).**
+Step budget: 25. Counting rule: one Write/Edit or one state-changing
+command (cargo fetch, bindgen, vendor copy) = 1; cargo test/clippy/fmt/
+build runs are verification, not counted. Retry cap 6 per failing test.
+
+**Progress entry (P-SOV.C2a, 2026-09-14) — AGENT-CLOSED, STOPPED at step 8:**
+- Red (step 3): `cargo test -p fetcher --no-run` → COMPILE_FAIL, E0432/E0433
+  ×7 (`fetcher::sidecar`, `fetcher::sources`, `fetcher::testing`,
+  `fetch_slice_blocking`…) + E0599 ×4 (`FetchError::State`): the API did
+  not exist. Behavioural red for the splice/If-Range proofs is inherent in
+  the loopback server's recorded headers once the API compiled.
+- Implementation (step 4): `fetcher/src/{sources,sidecar,testing}.rs` new;
+  `lib.rs` rewritten around the slice engine. `download_and_validate`,
+  `plan_resume`/`ResumePlan`, `scratch_path` and the ignored Monaco live
+  test are REMOVED (flagged deviation: an unpinned resume path would
+  contradict D3; operator veto offered). Replaced by `resume_headers` and
+  the ignored `live_geofabrik_portugal_probe`.
+- Defect found by the ladder, fixed in the engine (§1.3 rule 4): a slice
+  whose budget expired during resolve+md5 returned `Yielded` with zero
+  data bytes (one flaky `resume_appends_on_206` run on a loaded machine).
+  Minimum forward progress is now one data chunk per slice, mirroring the
+  compiler's one-block rule; the pre-download budget check is gone and
+  restart iterations are bounded by MAX_RESTARTS instead. Dribble/budget
+  ratios in the loopback tests raised to ≥ 8× so timing cannot decide an
+  outcome. Two test-side bugs also fixed (a throwaway progress log in
+  `run_to_end`; clippy `ptr_arg`/`useless_format`). Fetcher suite then
+  green 3 runs in a row.
+- FFI (step 5): `FetchKind`, `FetchSource`, `FetchState`, `FetchStatus`;
+  `list_sources`, `fetch_chunk`, `query_fetch`, `purge_fetch`
+  (`ProgressCallback` reused). Non-exported `fetch_chunk_for_source` lets
+  tests aim the engine at the loopback mirror. `FetchSource.url` is
+  exposed for display/provenance only; JS still cannot fetch it (CSP).
+- Bindings (step 6): regenerated in library mode; diff is additions only
+  (freehike.swift +532, freehikeFFI.h +45, freehike.kt +425, 0 deletions);
+  vendored to `ios/App/App/FreeHikeFFI/` and
+  `android/app/src/main/java/uniffi/freehike/` — shasum-equal in all
+  three locations. ktlint not installed → generated Kotlin unformatted,
+  same as the previously vendored copy.
+- Ladder ×2 (step 7): `cargo test --workspace` 19 suites / 224 passed /
+  0 failed / 7 ignored on both runs; clippy `--all-targets -D warnings`
+  0 findings ×2; `cargo fmt --check` clean ×2. Per crate: fetcher 11 lib +
+  11 contract + 11 loopback (+1 ignored live); ffi 13 unit + 2 thermal.
+  Before the chunk: fetcher 13 (+1 ignored), ffi 8 (+2) → workspace
+  passing 199 → 224 (+25 net: +20 fetcher after −4 `plan_resume` tests
+  deleted, +5 ffi).
+- L4: `cargo ndk -t arm64-v8a build --release -p ffi` Finished (12.8 s);
+  `libfreehike_ffi.so` 1,711,856 → 5,056,512 B (+3.34 MB: rustls/ring/
+  hyper/tokio; budget 15 MB). llvm-nm: `T uniffi_freehike_ffi_fn_func_
+  {fetch_chunk,list_sources,query_fetch,purge_fetch,compile_chunk}`
+  present; 0 OpenSSL/SQLite symbols. iOS:
+  `cargo build --release --target aarch64-apple-ios -p ffi` →
+  `error: failed to run custom build command for ring v0.17.14` /
+  `xcrun: error: SDK "iphoneos" cannot be located` (CLT-only machine) —
+  unverified, carried under D004 as predicted in the memo. (A stale
+  `target/aarch64-apple-ios/release/libfreehike_ffi.a` from an earlier
+  session exists; it does NOT contain this chunk.)
+- Janitor `--check` clean (2 debt, 1 bug, 0 exemptions); no tags added.
+- Not done, by instruction: step 8 (FFI surface review) is the operator's;
+  no shell or JS file touched (C2b). Live probe not run (network, [E]).
+- Steps used: 25/25 (counting rule as declared). Pivots: 0. Retry max on
+  one test: 3 (`if_range_mismatch_restarts_clean`, all test-side).
+- Diff (source, excl. lock + generated bindings): 10 files, +2431/−196
+  incl. this log; Cargo.lock +63 (md-5 0.10.6, digest, block-buffer,
+  crypto-common, generic-array, typenum, version_check).
+
+**Status:** AGENT-CLOSED — tests green-locked; FFI surface diff awaiting
+the operator's §1.5 review (step 8). Commit by the operator.
+
+**Close-out (P-SOV.C2a, 2026-09-15) — operator review (step 8) done:**
+- Verdict recorded: surface accepted; deletion veto declined (the removal
+  of `download_and_validate`/`plan_resume`/`ResumePlan`/`scratch_path`/the
+  Monaco live test stands).
+- Challenge: `wrong_offset_206_restarts_clean` added to
+  `fetcher/tests/loopback.rs`. The mirror answers a resume
+  (`Range: bytes=N-`, N>0) with a 206 whose Content-Range starts at N/2
+  and carries EXACTLY the bytes still missing, so the spliced file ends at
+  the right length. Red by mutation (the engine already had the guard):
+  with `start != have` removed from the 206 check, the test fails at the
+  "expected Finished" assertion with verbatim
+  `FailedFatal("md5 mismatch for …/portugal-260910.osm.pbf: expected
+  d6ee567f…, got a27bf247…")` — a splice that only the MD5 backstop sees.
+  Guard restored: restart #1 ("Content-Range starts at …"), fresh
+  `bytes=0-` download, Finished, file byte-identical, `restarts == 1`.
+  First attempt of the mirror served N/2..end (more bytes than remain);
+  that red tripped the *overrun* guard instead, so the mirror was
+  tightened to the exact-length case before the red was accepted.
+- `state_after` asymmetry (operator note): ALIGNED, not defended. It now
+  returns `Result<FetchState, String>`; an unreadable or vanished sidecar
+  right after a slice turns Finished/Yielded into `FailedFatal` with the
+  reason, the same "unreadable state is never guessed at" rule as
+  `query_checkpoint`. The old fallback fabricated `verified: true` on
+  Finished, which would have been the one way past the D6 gate without a
+  verified sidecar. No surface change (types unchanged; bindings not
+  regenerated, still shasum-equal). Untested: the error path is
+  unreachable without a fault injector (the engine wrote the sidecar an
+  instant earlier); six lines, flagged.
+- Ladder ×2: 19 suites / 225 passed / 0 failed / 7 ignored (was 224:
+  +1 loopback test); clippy 0 ×2; fmt clean ×2. Loopback suite 12 (+1
+  ignored live).
+- Step budget: self-extended 25 → 40 (§1.4, logged): operator-added
+  challenge + alignment after the plan entry. Steps used: 36/40
+  (mutate/restore counted as steps). Pivots: 0.
+- Carry-over to C2b (operator): D6's "enqueue refuses an unverified file"
+  is not enforced in Rust; it is a NAMED step in the C2b plan below, not
+  assumed.
+
+**Status:** AGENT-CLOSED → operator to commit and write OPERATOR-CLOSED.
+
+## P-SOV.C2b — native shell + JS wiring for fetch_chunk (plan, 2026-09-15)
+
+**Operator calls:** the 2026-09-14 D1–D8 record (P-SOV.C2a entry) governs;
+C2b is the second half of D1(b). Written per instruction after the C2a
+review; EXECUTE not started. Terrain inventory delivered in chat
+2026-09-15 as facts only; the operator's terrain call is pending and is
+NOT an input to this chunk (shells pass `demPath = null` until chunk 3).
+
+**Goal:** on Android (iOS mirrored, unverified — D004), a user taps
+"Download Portugal data", the Rust fetcher lands a verified
+`map_jobs/raw/<dated>.osm.pbf` with live progress, cancel and
+kill-resume; only then can "Compile" enqueue a background job whose
+`pbfPath` is that verified file. The WebView never names a host.
+
+**Files:** `android/app/src/main/java/com/freehike/app/MapCompilerPlugin.kt`
+(`listSources`, `fetchInputs`, `cancelFetch`, `queryFetch`, `purgeFetch`;
+`enqueueBackgroundJob` takes `sourceId`, applies the D6 gate),
+`PendingJobStore.kt` (`sourceId` field; `pbfPath` from `FetchState.path`;
+`demPath` null), `ios/App/App/MapCompilerPlugin.swift` (same, flagged
+unverified), `src/plugins/MapCompiler.ts` (methods + `fetchProgress`
+event + types), `src/services/regionCompiler.ts` (two-step:
+`ensureInputs(sourceId)` then `enqueueRegionDownload(sourceId, label,
+bbox)`), `src/services/fetchProgress.ts` (new ref sink, mirrors
+handoffProgress), `src/store/compilerStore.ts` (`fetchStage`,
+`activeSourceId`), `src/ui/components/RegionPicker.tsx` (one Portugal
+preset, two-step flow), `src/ui/components/FetchProgressBar.tsx` (new,
+rAF direct-DOM), tests `src/services/regionCompiler.test.ts` (new),
+`src/services/fetchProgress.test.ts` (new), `src/store/compilerStore.test.ts`
+(extended), LOOPLOG, TRACKER (generated). `BackgroundCompileWorker.kt` and
+the iOS scheduler loop are NOT touched (they read `pbfPath` from the
+record). No Rust file is touched unless the operator picks the Rust belt
+(below), which is a separate HITL surface change.
+
+**Design:** `fetchInputs({sourceId, budgetMs?=5000})` drives the
+`fetch_chunk` loop on the plugin's FFI lane exactly like `startJob`
+(cancel token honoured between slices; `handleOnDestroy` stops without
+purging — the sidecar + file are the resume state); `fetchProgress
+{percentage, status}` events forward the Rust callback; resolves
+`{status: finished|failed|cancelled, sourceId, path?, reason?,
+transient?}`. `rawDir = filesDir/map_jobs/raw`. Raw files are never
+deleted by acknowledge/cancel (R2 "permanent region cache");
+`purgeFetch` is the explicit release. `enqueueBackgroundJob({sourceId,
+bbox, jobId?, minZoom?, maxZoom?})`: **D6 gate (named step 6)** — calls
+Rust `queryFetch(sourceId, rawDir)`; rejects unless `verified && path
+non-empty`; writes `pbfPath = state.path`, `demPath = null`. JS
+pre-checks the same via `queryFetch` so the UI can explain, but the
+native reject is the authority (the JS flag can be stale). Progress
+bytes bypass React (P8): ref sink + rAF. Preset bbox
+`-9.55,38.38,-8.75,38.95` (Lisbon / Sintra / Arrábida), operator may
+adjust. Innsbruck presets removed (they would compile empty tiles against
+a Portugal file).
+
+**Open for the operator (not assumed):** Rust belt for D6 — `to_job_spec`
+refusing a `pbf_path` without a verified sidecar beside it. Costs: a
+Surface-adjacent semantic change (HITL), and the synthetic-PBF tests in
+compiler/ffi would need sidecars or an opt-out. Default in this plan:
+shell-only gate; belt only if called.
+
+**Proofs (named before implementation):**
+- JS (vitest, Capacitor fake in `src/test/`): `regionCompiler.test.ts` —
+  `ensure_inputs_resolves_finished_path`, `enqueue_refuses_unverified_state`,
+  `enqueue_passes_source_id_never_a_url`, `fetch_not_implemented_on_web_is_explained`;
+  `fetchProgress.test.ts` — `sink_reports_absolute_bytes`, `reset_zeroes`;
+  `compilerStore.test.ts` — `fetch_stage_transitions`; `sovereignty.test.ts`
+  unchanged and green (no `https?://` under src/ — the URL only ever
+  arrives as runtime data from `listSources`).
+- Android: `JAVA_HOME=$(brew --prefix openjdk@21) ./gradlew assembleDebug`
+  compiles Kotlin against the regenerated bindings (the only mechanical
+  L4 for the shell); merged manifest still carries INTERNET.
+- Preview: `tsc -b`, `eslint .`, `npm test` (honest before/after counts;
+  today 9 files / 49 tests), three cold boots with CSP live, zero CSP
+  reports; the web build shows the "needs the native app" path for fetch.
+- [E] Samsung fetch smoke (scores BOTH 2026-09-14 predictions): tap
+  Download → logcat `FFI fetch_chunk(geofabrik-portugal) -> Yielded`
+  lines; kill the app mid-download; re-tap → resume at the file's length
+  (a `restart #` line in logcat scores the agent's prediction; none
+  scores it wrong); Finished → `queryFetch` verified, MD5 = the mirror's
+  `.md5` of that day; enqueue accepted; a second enqueue with a purged raw
+  dir rejected by the D6 gate (scores the operator's prediction).
+
+**Steps [E]/[D]:** 1 [D] plan entry (this). 2 [D] red JS tests (compile-
+fail + assertion red where the fake supports it). 3 [D] `MapCompiler.ts`
+types/methods. 4 [D] `fetchProgress.ts` + `FetchProgressBar.tsx`.
+5 [D] Kotlin: `listSources`/`fetchInputs`/`cancelFetch`/`queryFetch`/
+`purgeFetch`. **6 [D] D6 gate in `enqueueBackgroundJob` (Kotlin) + the
+`PendingJobStore` fields.** 7 [D] Swift mirror of 5–6, flagged
+unverified. 8 [D] `regionCompiler.ts`, `compilerStore.ts`,
+`RegionPicker.tsx` two-step flow. 9 [D] frontend ladder + gradle ×2.
+10 [E] Samsung fetch smoke + prediction scoring. 11 [D] janitor `--fix`,
+kill entry, close-report → STOP.
+Step budget: 25. Counting rule as in C2a.
+
+**Addendum to P-SOV.C2a (2026-09-16, operator review of the close-out):**
+Deviation, logged per §1.6: the 2026-09-15 step-budget self-extension
+25 → 40 used the §1.4 mechanism without the operator's say; the added work
+(challenge test + `state_after` alignment) was justified, the mechanism was
+not. Operator ruling, binding from now on: the budget is the operator's —
+at the limit, stop and ask; no self-extension. C2a otherwise accepted;
+commit by the operator.
+
+**Kill entry (P-SOV.C2b, 2026-09-16) — AGENT-CLOSED, STOPPED at step 10:**
+- Operator rulings applied: shell-only D6 gate (no Rust belt in C2b; belt
+  moves to P-SOV.C3), budget 25 as written, stop at step 10 (Samsung
+  fetch smoke is the operator's).
+- Red (step 2): `regionCompiler.test.ts` ×10 + `compilerStore.test.ts`
+  `fetch_stage_transitions` failed (`TypeError: ensureInputs is not a
+  function`, missing `setFetchStage`); `fetchProgress.test.ts` failed to
+  load (`Cannot find module './fetchProgress'`).
+- JS: `plugins/MapCompiler.ts` (+FetchSourceInfo/FetchStateInfo/
+  FetchProgressEvent/FetchInputsResult; listSources/fetchInputs/
+  cancelFetch/queryFetch/purgeFetch; `enqueueBackgroundJob` takes
+  `sourceId`; `fetchProgress` listener), `services/fetchProgress.ts` (new
+  ref sink), `services/regionCompiler.ts` (DEMO_SOURCE_ID, ensureInputs,
+  verifiedInputPath, cancelInputsFetch, enqueueRegionDownload(sourceId,
+  label, bbox)), `store/compilerStore.ts` (fetchStage/activeSourceId/
+  fetchError + setFetchStage), `ui/components/FetchProgressBar.tsx` (new,
+  rAF direct-DOM), `ui/components/RegionPicker.tsx` (one Portugal preset,
+  two-step flow, Innsbruck presets removed), `RegionSelectorOverlay.tsx`
+  (call-site). Design deviations from the plan, flagged: the
+  `fetchProgress` listener lives inside `ensureInputs` for the fetch's
+  lifetime (no App.tsx global listener); `FetchProgressBar` is mounted in
+  the sheet, so progress is visible only while the sheet is open — the
+  native loop continues regardless.
+- Kotlin: `MapCompilerPlugin.kt` (listSources/fetchInputs/cancelFetch/
+  queryFetch/purgeFetch on the FFI lane with its own cancel token,
+  destroy stops without purging; **step 6 D6 gate**: `enqueueBackgroundJob`
+  requires `sourceId`, calls Rust `queryFetch(sourceId, rawDir)`, rejects
+  unless `verified && path non-empty`, record `pbfPath = state.path`,
+  `demPath = null`, `sourceId` persisted). `PendingJobStore.kt` (+sourceId,
+  nullable for old records). UniFFI free functions called fully qualified
+  (`uniffi.freehike.queryFetch`) to avoid the member-name shadow.
+- Swift: mirrored (methods, gate, record field, trampolines for the
+  shadowed free functions). UNVERIFIED — no iphoneos SDK (D004).
+- Ladder ×2: `tsc -b` clean, `eslint .` clean, vitest 11 files / 64 tests
+  on both runs. Before the chunk: 9 files / 49 tests (+regionCompiler 11,
+  +fetchProgress 3, +compilerStore 1). Android:
+  `JAVA_HOME=/opt/homebrew/opt/openjdk@21/… ./gradlew --offline
+  assembleDebug` OK; APK 37,470,011 B carrying
+  `lib/arm64-v8a/libfreehike_ffi.so` 5,056,696 B. Note: the FIRST APK
+  build bundled the stale gitignored `jniLibs` .so (1,711,856 B, no
+  fetch symbols) — it would have failed JNA lookup of `fetchChunk` on the
+  phone and falsely scored the D6 prediction; refreshed with the
+  documented `cargo ndk -t arm64-v8a -o ../android/app/src/main/jniLibs
+  build --release -p ffi` and rebuilt. The operator's smoke must use the
+  37.5 MB APK.
+- Preview proof: three cold boots with CSP live; "Content Security
+  Policy" / "Refused" console hits: 0 / 0 / 0; both archives "Serving …
+  from its OPFS-backed worker source" on every boot; network log only
+  localhost:5173 + blob:. Web-build fetch path renders verbatim
+  "Couldn't download: Region data needs the iOS/Android app — the web
+  build has no native fetcher or compile engine." Only errors: B008
+  sprite (one per boot). Boots 2–3 screenshots at 8 s caught the boot
+  overlay (rAF suspension, known trap); a frame pump showed the rendered
+  map.
+- Not done by instruction: step 10 Samsung fetch smoke ([E]); both
+  2026-09-14 predictions remain unscored. Flag: the foreground debug
+  `startJob` still writes placeholder raw paths (untouched, out of scope);
+  it will be refused by the C3 belt once that lands.
+- Steps used: 17/25 (plan 1, tests 3, JS 7, Kotlin 2, Swift 1, jniLibs
+  refresh 1, kill entry 1, janitor 1). Pivots: 0. No self-extension.
+
+**Status:** AGENT-CLOSED — operator's Samsung smoke (step 10) pending;
+commit by the operator.
+
+## P-SOV.C3 — Terrain cut (DL-004) + D6 Rust belt (plan, 2026-09-16)
+
+**Operator calls (2026-09-16, verbatim where it matters):** (a) terrain
+"cut for v0.1. Delete the simulated Terrain block loop from the job
+engine; `demPath = null` becomes the only path, not a skip. The terrain
+crate (reader + archive stage) stays in the tree, unused by jobs. Map
+style tolerates an absent terrain archive: hillshade/contour layers off,
+no error." (b) "D6 Rust belt: yes. `to_job_spec` refuses a `pbf_path`
+without a verified sidecar beside it." Both surface-adjacent; the HITL
+stop happens once, here. Budget: proposed below, operator sets. Ledger:
+DL-004 (operator prediction recorded there, scored at this chunk's close;
+the chunk includes the belt).
+
+**What a checkpoint means after (a) — stated explicitly:**
+1. `Phase::Terrain` leaves the engine's phase set, so the checkpoint's
+   `phase=` vocabulary loses "terrain". Under P4 that is a format change:
+   `CHECKPOINT_VERSION` 6 → 7; every v6 checkpoint is refused loudly
+   ("unsupported version 6") and the job is purged and restarted by the
+   existing refuse-and-restart path. No device holds a checkpoint worth
+   keeping (the Samsung has never compiled).
+2. `spec_hash` loses its dem component if `dem_path` is removed; the
+   version bump already kills every older checkpoint, so the hash change
+   is not a second break.
+3. `CompileSummary.blocks_total` no longer includes 12 simulated blocks
+   (ffi test expectation `2*2+12+1` → `2*2+1`); progress percentages are
+   computed over 4 phases instead of 5.
+4. `TERRAIN_BLOCKS`, `sim_blocks`, `process_sim_block`, `BLOCK_WORK`,
+   `BLOCK_OUTPUT_BYTES`, the `Phase::Terrain` arm of `run_slice`,
+   `phase_plan`'s dem branch, and the engine/ffi tests that assert
+   "terrain" labels are deleted, not skipped.
+
+**Surface decisions for the operator (this gate):**
+- S1 `CompilePhase::Terrain` on the FFI enum: (i) keep as a dead case
+  (no surface change) or (ii) remove (surface change, bindings regen).
+  Recommend (ii): a dead case is the placeholder DL-004 deletes; cost is
+  one regen + vendor, practiced. Shells only log `cp.phase`, no `when`/
+  `switch` to fix.
+- S2 `CompileJob.dem_path`: (i) keep, engine returns FailedFatal when
+  Some ("terrain is not compiled in v0.1") or (ii) remove the field
+  (shell records lose `demPath`; C2b already writes null). Recommend (ii),
+  same regen as S1. "Not a skip" applies to the surface too.
+- S3 Belt vs synthetic-PBF tests: (1) tests write a verified sidecar
+  beside the fixture via `fetcher::testing::write_verified_sidecar(dir,
+  source_id, basename)` — sites: ffi `test_job` (7 tests) and
+  `ffi/tests/thermal.rs` `test_job`; cost ≈ 15 lines + the `testing`
+  feature already in ffi's dev-deps; zero holes. (2) opt-out: a
+  `CompileJob.allow_unverified_input` field is reachable from
+  Kotlin/Swift (and from JS if a plugin ever forwards it) — a hole; a
+  cargo feature `ffi/unverified-input` is unreachable from JS/Kotlin/Swift
+  at runtime but reachable by any build that enables it (a dev-dep
+  mistake ships it). Recommend (1). The compiler crate's own tests and
+  the mem-gate script use `JobSpec` directly and are not belted; no CLI
+  constructs a `CompileJob`, so nothing bypasses the ffi belt in
+  production.
+- S4 Map style without a terrain archive. Facts: the style JSON
+  (10,903 B, 22 layers) declares `terrain-local` (raster-dem →
+  `pmtiles://local/alps_terrain.pmtiles`), a `terrain` block and the
+  `dynamic-hillshading` layer; MapView registers the terrain file, calls
+  `setTerrain`, builds contours from `terrainPMTiles`, MAP_INIT opens the
+  terrain file, the boot policy verifies it, `OfflineRegion.terrainFile`
+  is a non-null string and compilerStore hot-swaps with
+  `alps_terrain.pmtiles`. On a native build after D4c there is no terrain
+  archive at all. Options: (a) fork the style JSON (drop terrain source/
+  block/hillshade; MapView adds them when a file exists) — the fork my
+  DL-004 prediction names; (b) keep the JSON, `removeSource`/`removeLayer`
+  on `load` — too late: MapLibre requests the raster-dem TileJSON at style
+  load, the registry's fail-loud miss guard fires first; (c) keep the
+  JSON, pass MapLibre's `transformStyle` at construction (present in the
+  vendored 5.24 typings; constructor acceptance verified at step 2) to
+  drop the terrain source, block and hillshade layer when the bound
+  region has no terrain file, and skip contour wiring. Recommend (c): no
+  JSON fork, no P8a issue, the dev preview keeps terrain via dev_assets.
+
+**Goal:** a job compiles with no terrain input and no terrain phase; the
+map renders a region with no terrain archive with hillshade/contours off
+and zero console errors beyond B008; `compile_chunk` refuses any
+`pbf_path` that the fetcher did not verify.
+
+**Files:** `compiler/src/engine.rs`, `ffi/src/lib.rs`, `ffi/tests/thermal.rs`,
+`fetcher/src/lib.rs` (`verified_input(path)` helper), `fetcher/src/testing.rs`
+(`write_verified_sidecar`), `fetcher/tests/contract.rs`; if S1/S2 = (ii):
+`ffi/bindings/*` regenerated + vendored, `PendingJobStore.kt`,
+`MapCompilerPlugin.kt` (`CompileJob(...)` call sites), Swift mirrors
+(unverified); JS: `src/store/mapStore.ts` (`terrainFile: string | null`),
+`src/store/compilerStore.ts` (hot-swap with null terrain),
+`src/services/regionBootPolicy.ts` (+test), `src/ui/components/MapView.tsx`
+(transformStyle, conditional terrain/contours/hillshade, MAP_INIT filename
+set, loadOfflineRegion with null), `ARCHITECTURE.md` §4/§5 terrain rows
+(HITL, text only: "terrain cut for v0.1, DL-004"), LOOPLOG, TRACKER.
+
+**Proofs (named before implementation):**
+- fetcher L1: `verified_input_detected_by_sidecar`,
+  `unverified_sidecar_rejected`, `missing_sidecar_rejected`,
+  `sidecar_for_other_basename_ignored`.
+- ffi L1: `compile_chunk_refuses_input_without_verified_sidecar` (fixture
+  without sidecar → FailedFatal containing "sidecar"); every existing
+  compile test green with the sidecar helper; `compile_chunk_finishes_
+  with_large_budget` expects 5 blocks; `callback_receives_phase_labels`
+  loses the "terrain" assertion; if S2 = (i): `failed_on_dem_path_some`.
+- engine L1: `checkpoint_v6_refused_loudly` (a hand-written `version=6`
+  file → fatal "unsupported version"), `phase_plan_has_no_terrain`,
+  `phase_from_str_rejects_terrain`; existing terrain-referencing tests
+  updated, not deleted, unless they only tested the placeholder (say
+  which).
+- L3b: `scripts/kill_resume_test.sh` 25 cycles green (checkpoint format
+  changed → the ladder row applies).
+- L4: `cargo ndk -t arm64-v8a build --release -p ffi`; bindings
+  shasum-equal in three locations if regenerated; gradle assembleDebug.
+- JS: `regionBootPolicy.test.ts` null-terrain cases, `mapStore`/
+  `compilerStore` tests for the nullable binding, sovereignty suite
+  unchanged. Preview proof: move `dev_assets/local/alps_terrain.pmtiles`
+  aside → cold boot renders the basemap, hillshade/contours absent, zero
+  errors beyond B008, three boots; restore → terrain renders again.
+- Green-lock ×2 on every ladder above.
+
+**Steps [E]/[D]:** 1 [E] operator: budget + S1–S4 calls. 2 [D] red tests
+(+ verify `transformStyle` is a Map constructor option in 5.24). 3 [D]
+engine deletion, CHECKPOINT_VERSION 7. 4 [D] fetcher helper + testing
+writer. 5 [D] ffi belt + test helpers. 6 [D] surface deletions per
+S1/S2 + bindings regen + vendor + shell record/call-site updates (Swift
+unverified). 7 [D] Rust ladder ×2, L4, L3b 25 cycles. 8 [D] JS nullable
+terrain + MapView transformStyle path. 9 [D] frontend ladder ×2 +
+preview proof (absent/present). 10 [E] ARCHITECTURE.md terrain-row text
+(HITL). 11 [D] janitor, kill entry, DL-004 scoring line, close-report →
+STOP.
+Step budget: proposed 25 (engine 5, ffi 3, fetcher 2, bindings 2, shells
+2, JS 6, log/janitor 2, fixes 3). Operator sets; at the limit, stop and
+ask.

@@ -43,6 +43,11 @@ rayon = "1"
 # every state transition / lock event / recovery is greppable in logcat by
 # jobId. Facade-only elsewhere — hosts opt in.
 log = "0.4"
+# Raw-extract integrity (P-SOV.C2a, HITL-approved 2026-09-14): MD5 of the
+# downloaded `.osm.pbf` against the mirror's published `.md5`. Pure Rust
+# (RustCrypto), no C in the mobile cross-compile path. Integrity only — MD5
+# is not a security boundary here; the magic-byte gate + pinned ETag are.
+md-5 = "0.10"
 # Advisory per-job slice lock (`{job_id}.lock`, flock-based): serializes
 # runners across threads AND processes; the kernel releases it on process
 # death, so a crash can never wedge a job.

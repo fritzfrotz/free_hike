@@ -18,6 +18,10 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [dependencies]
 uniffi = { workspace = true }
 compiler = { workspace = true }
+# Raw-extract ingestion (P-SOV.C2a): `fetch_chunk` wraps the fetcher's
+# budget-yield slice engine; rustls-only, so the arm64 cross-compile stays
+# free of OpenSSL (ARCHITECTURE.md P6).
+fetcher = { workspace = true }
 # Lifecycle tracing across the boundary (jobId-tagged logcat lines).
 log = { workspace = true }
 
@@ -41,3 +45,6 @@ required-features = ["cli"]
 [dev-dependencies]
 # Synthetic-PBF fixtures: compile_chunk tests exercise the real Pass 1.
 pbf = { workspace = true, features = ["fixtures"] }
+# In-process loopback mirror: fetch_chunk tests exercise the real slice
+# engine without touching the network.
+fetcher = { workspace = true, features = ["testing"] }

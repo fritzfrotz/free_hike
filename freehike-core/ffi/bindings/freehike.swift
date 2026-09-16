@@ -893,6 +893,241 @@ public func FfiConverterTypeCompileSummary_lower(_ value: CompileSummary) -> Rus
     return FfiConverterTypeCompileSummary.lower(value)
 }
 
+
+/**
+ * One fetchable raw-extract origin (display data for the UI; the id is
+ * what goes back into `fetch_chunk`).
+ */
+public struct FetchSource {
+    public var id: String
+    public var label: String
+    /**
+     * Entry URL, for display/provenance only — never fetched by the WebView.
+     */
+    public var url: String
+    public var kind: FetchKind
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, label: String, 
+        /**
+         * Entry URL, for display/provenance only — never fetched by the WebView.
+         */url: String, kind: FetchKind) {
+        self.id = id
+        self.label = label
+        self.url = url
+        self.kind = kind
+    }
+}
+
+#if compiler(>=6)
+extension FetchSource: Sendable {}
+#endif
+
+
+extension FetchSource: Equatable, Hashable {
+    public static func ==(lhs: FetchSource, rhs: FetchSource) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.label != rhs.label {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(label)
+        hasher.combine(url)
+        hasher.combine(kind)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFetchSource: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FetchSource {
+        return
+            try FetchSource(
+                id: FfiConverterString.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeFetchKind.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FetchSource, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterTypeFetchKind.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchSource_lift(_ buf: RustBuffer) throws -> FetchSource {
+    return try FfiConverterTypeFetchSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchSource_lower(_ value: FetchSource) -> RustBuffer {
+    return FfiConverterTypeFetchSource.lower(value)
+}
+
+
+/**
+ * Durable fetch state for a source in a destination directory.
+ */
+public struct FetchState {
+    public var sourceId: String
+    /**
+     * Final URL after redirect resolution; empty until resolved.
+     */
+    public var pinnedUrl: String
+    /**
+     * Absolute path of the data file (`<dest_dir>/<pinned basename>`);
+     * empty until resolved. This is the `pbf_path` a `CompileJob` takes.
+     */
+    public var path: String
+    public var bytesHave: UInt64
+    public var bytesTotal: UInt64
+    /**
+     * True only after magic-byte + MD5 verification: the enqueue gate.
+     */
+    public var verified: Bool
+    /**
+     * Restart-clean events so far (entity rotated, Range ignored…).
+     */
+    public var restarts: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sourceId: String, 
+        /**
+         * Final URL after redirect resolution; empty until resolved.
+         */pinnedUrl: String, 
+        /**
+         * Absolute path of the data file (`<dest_dir>/<pinned basename>`);
+         * empty until resolved. This is the `pbf_path` a `CompileJob` takes.
+         */path: String, bytesHave: UInt64, bytesTotal: UInt64, 
+        /**
+         * True only after magic-byte + MD5 verification: the enqueue gate.
+         */verified: Bool, 
+        /**
+         * Restart-clean events so far (entity rotated, Range ignored…).
+         */restarts: UInt32) {
+        self.sourceId = sourceId
+        self.pinnedUrl = pinnedUrl
+        self.path = path
+        self.bytesHave = bytesHave
+        self.bytesTotal = bytesTotal
+        self.verified = verified
+        self.restarts = restarts
+    }
+}
+
+#if compiler(>=6)
+extension FetchState: Sendable {}
+#endif
+
+
+extension FetchState: Equatable, Hashable {
+    public static func ==(lhs: FetchState, rhs: FetchState) -> Bool {
+        if lhs.sourceId != rhs.sourceId {
+            return false
+        }
+        if lhs.pinnedUrl != rhs.pinnedUrl {
+            return false
+        }
+        if lhs.path != rhs.path {
+            return false
+        }
+        if lhs.bytesHave != rhs.bytesHave {
+            return false
+        }
+        if lhs.bytesTotal != rhs.bytesTotal {
+            return false
+        }
+        if lhs.verified != rhs.verified {
+            return false
+        }
+        if lhs.restarts != rhs.restarts {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sourceId)
+        hasher.combine(pinnedUrl)
+        hasher.combine(path)
+        hasher.combine(bytesHave)
+        hasher.combine(bytesTotal)
+        hasher.combine(verified)
+        hasher.combine(restarts)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFetchState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FetchState {
+        return
+            try FetchState(
+                sourceId: FfiConverterString.read(from: &buf), 
+                pinnedUrl: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                bytesHave: FfiConverterUInt64.read(from: &buf), 
+                bytesTotal: FfiConverterUInt64.read(from: &buf), 
+                verified: FfiConverterBool.read(from: &buf), 
+                restarts: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FetchState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sourceId, into: &buf)
+        FfiConverterString.write(value.pinnedUrl, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterUInt64.write(value.bytesHave, into: &buf)
+        FfiConverterUInt64.write(value.bytesTotal, into: &buf)
+        FfiConverterBool.write(value.verified, into: &buf)
+        FfiConverterUInt32.write(value.restarts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchState_lift(_ buf: RustBuffer) throws -> FetchState {
+    return try FfiConverterTypeFetchState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchState_lower(_ value: FetchState) -> RustBuffer {
+    return FfiConverterTypeFetchState.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -1107,6 +1342,191 @@ public func FfiConverterTypeCompilePhase_lower(_ value: CompilePhase) -> RustBuf
 
 
 extension CompilePhase: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Payload family of a source, mirrored from the fetcher crate.
+ */
+
+public enum FetchKind {
+    
+    case osmPbf
+    case tiff
+}
+
+
+#if compiler(>=6)
+extension FetchKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFetchKind: FfiConverterRustBuffer {
+    typealias SwiftType = FetchKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FetchKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .osmPbf
+        
+        case 2: return .tiff
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FetchKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .osmPbf:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .tiff:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchKind_lift(_ buf: RustBuffer) throws -> FetchKind {
+    return try FfiConverterTypeFetchKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchKind_lower(_ value: FetchKind) -> RustBuffer {
+    return FfiConverterTypeFetchKind.lower(value)
+}
+
+
+extension FetchKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Result of one fetch slice.
+ */
+
+public enum FetchStatus {
+    
+    /**
+     * Complete and verified; `state.path` is safe to compile from.
+     */
+    case finished(state: FetchState
+    )
+    /**
+     * Budget expired; `state.bytes_have` bytes are durable. Re-invoke.
+     */
+    case yielded(state: FetchState
+    )
+    /**
+     * Non-retryable (bad payload, checksum mismatch, refused URL, restart
+     * cap, unreadable sidecar). `purge_fetch` clears the state.
+     */
+    case failedFatal(reason: String
+    )
+    /**
+     * Network/disk refused the slice; durable state untouched. Retry later.
+     */
+    case failedTransient(reason: String
+    )
+}
+
+
+#if compiler(>=6)
+extension FetchStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFetchStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FetchStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FetchStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .finished(state: try FfiConverterTypeFetchState.read(from: &buf)
+        )
+        
+        case 2: return .yielded(state: try FfiConverterTypeFetchState.read(from: &buf)
+        )
+        
+        case 3: return .failedFatal(reason: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 4: return .failedTransient(reason: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FetchStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .finished(state):
+            writeInt(&buf, Int32(1))
+            FfiConverterTypeFetchState.write(state, into: &buf)
+            
+        
+        case let .yielded(state):
+            writeInt(&buf, Int32(2))
+            FfiConverterTypeFetchState.write(state, into: &buf)
+            
+        
+        case let .failedFatal(reason):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(reason, into: &buf)
+            
+        
+        case let .failedTransient(reason):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchStatus_lift(_ buf: RustBuffer) throws -> FetchStatus {
+    return try FfiConverterTypeFetchStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFetchStatus_lower(_ value: FetchStatus) -> RustBuffer {
+    return FfiConverterTypeFetchStatus.lower(value)
+}
+
+
+extension FetchStatus: Equatable, Hashable {}
 
 
 
@@ -1387,6 +1807,55 @@ fileprivate struct FfiConverterOptionTypeCheckpointState: FfiConverterRustBuffer
         }
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFetchState: FfiConverterRustBuffer {
+    typealias SwiftType = FetchState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFetchState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFetchState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFetchSource: FfiConverterRustBuffer {
+    typealias SwiftType = [FetchSource]
+
+    public static func write(_ value: [FetchSource], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFetchSource.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FetchSource] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FetchSource]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFetchSource.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Runs one budget-bounded slice of `job`. See module docs for the
  * Finished / Yielded / FailedFatal / FailedTransient contract. Never
@@ -1424,6 +1893,43 @@ public func engineVersion() -> String  {
 })
 }
 /**
+ * Runs one budget-bounded fetch slice of `source_id` into `dest_dir`.
+ * Never throws: all failures are values. Resume by calling again with the
+ * same arguments; the engine reloads its own sidecar and the data file's
+ * length. See `FetchStatus`.
+ */
+public func fetchChunk(sourceId: String, destDir: String, budgetMs: UInt32, callback: ProgressCallback) -> FetchStatus  {
+    return try!  FfiConverterTypeFetchStatus_lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_fetch_chunk(
+        FfiConverterString.lower(sourceId),
+        FfiConverterString.lower(destDir),
+        FfiConverterUInt32.lower(budgetMs),
+        FfiConverterCallbackInterfaceProgressCallback_lower(callback),$0
+    )
+})
+}
+/**
+ * The source table, in declaration order.
+ */
+public func listSources() -> [FetchSource]  {
+    return try!  FfiConverterSequenceTypeFetchSource.lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_list_sources($0
+    )
+})
+}
+/**
+ * Removes the sidecar and the data file (partial or complete) for
+ * `source_id` in `dest_dir`. Returns true if anything existed.
+ */
+public func purgeFetch(sourceId: String, destDir: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_purge_fetch(
+        FfiConverterString.lower(sourceId),
+        FfiConverterString.lower(destDir),$0
+    )
+})
+}
+/**
  * Cancels a job between slices by deleting its durable state. Returns true
  * if state existed and was removed. (In-slice cancellation is not needed:
  * slices are budget-bounded, so the runner simply stops re-invoking.)
@@ -1447,6 +1953,20 @@ public func queryCheckpoint(jobId: String, outputDir: String) -> CheckpointState
     uniffi_freehike_ffi_fn_func_query_checkpoint(
         FfiConverterString.lower(jobId),
         FfiConverterString.lower(outputDir),$0
+    )
+})
+}
+/**
+ * Durable fetch state for `source_id` in `dest_dir`, or None if nothing
+ * was ever resolved there. `verified == true` is the compile-enqueue gate.
+ * Unreadable state reports None (the next `fetch_chunk` surfaces the
+ * precise error), mirroring `query_checkpoint`.
+ */
+public func queryFetch(sourceId: String, destDir: String) -> FetchState?  {
+    return try!  FfiConverterOptionTypeFetchState.lift(try! rustCall() {
+    uniffi_freehike_ffi_fn_func_query_fetch(
+        FfiConverterString.lower(sourceId),
+        FfiConverterString.lower(destDir),$0
     )
 })
 }
@@ -1501,10 +2021,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_freehike_ffi_checksum_func_engine_version() != 51964) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_freehike_ffi_checksum_func_fetch_chunk() != 7733) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_func_list_sources() != 46299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_func_purge_fetch() != 52367) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_freehike_ffi_checksum_func_purge_job() != 63403) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freehike_ffi_checksum_func_query_checkpoint() != 56823) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_freehike_ffi_checksum_func_query_fetch() != 57953) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_freehike_ffi_checksum_func_set_thermal_state() != 35667) {

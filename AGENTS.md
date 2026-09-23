@@ -64,6 +64,20 @@ violate these most)
   to arguments, never to pressure; "I don't know" is a valid answer.
   Full contract in manual Part 3.
 
+## Handoff and budget (added 2026-09-23)
+
+- At AGENT-CLOSED, stage the chunk and stop. The operator commits it to
+  a `wip/<chunk>` branch and pushes, so a review chat can clone it. Main
+  is untouched. The operator deletes the wip branch once the real commit
+  lands on main.
+- Do not start implementing chunk N+1 while chunk N is uncommitted
+  (dirty tree). Stop and say so. "go ahead anyway" from the operator
+  overrides it for that chunk.
+- A step budget is the operator's leash. Reaching it means stop and ask;
+  changing it is an HITL gate, same tier as manual edits.
+- Close-reports list risks and ask for the veto. They never propose the
+  review challenge or "questions I would ask in your place."
+
 ## Process facts
 
 - This project runs a two-model process: an implementing agent writes the

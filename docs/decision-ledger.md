@@ -13,7 +13,7 @@ Prefix convention: DL-### = decision ledger, D### = tracker debt.
 - Prediction (author, primary): ~80% slowdown; ~10 defects caught by review by 2026-09-22.
 - Prediction (Claude, second opinion): <=10% slowdown; >=1 real defect caught by review that v1 would have shipped.
 - Wrong if: ship date at risk from review overhead, or reviews rubber-stamped.
-- Checkpoint: 2026-09-22. Verdict: ___
+- Checkpoint: 2026-09-22. Verdict (2026-09-23): inconclusive — W37–W38 not method data (operator ill); re-score 2026-10-07.
 
 ## DL-002 · Map-first re-scope for v0.1 (2026-08-21)
 - Optimizing for: credibility of the core claim (the phone compiles its own map).

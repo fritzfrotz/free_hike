@@ -1,7 +1,7 @@
 # FreeHike Agentic Operating Manual
 
 > v1 (retired 2026-09-09) — built everything up to v0.1 finish-line start.
-> v2.1 (active, 2026-09-09) — see Part 3. v2 (mandatory hand-coding as
+> v2.1 (active, 2026-09-09; 2026-09-23 amendment: §1.4 budget) — see Part 3. v2 (mandatory hand-coding as
 > training) was drafted and dropped before first use as artificial slowdown.
 > Parts 1–2 remain binding mechanics; v2.1 changes the operator's role, not the loop.
 
@@ -104,8 +104,9 @@ After every `cargo` invocation, classify the outcome: `PASS`, `COMPILE_FAIL`, `T
 ### 1.4 Stopping conditions
 
 - **Step budget:** a *mutating step* = one `Write`/`Edit` or one state-changing `Bash` command
-  (reads are free). Default budget **25** mutating steps per chunk; the agent may self-extend
-  once to **40** with a logged justification. Exceeding 40 → hard stop, escalate.
+  (reads are free). Default budget **25** mutating steps per chunk, set by the operator in the
+  plan entry. Reaching it means stop and ask; the agent never extends it. Any change to a
+  budget is a HITL gate (§1.5), same tier as edits to this manual.
 - **Retry cap:** max **6** consecutive fix attempts against a single failing test, regardless of
   budget remaining.
 - **Green-lock:** a chunk closes only when its full ladder (§2) passes **twice consecutively**
@@ -129,6 +130,7 @@ After every `cargo` invocation, classify the outcome: `PASS`, `COMPILE_FAIL`, `T
 | Threshold changes (50MB memory gate, tolerances) | Same reason |
 | `git commit` / push | Human owns history |
 | File deletion / fixture modification | Irreversible |
+| Step-budget change | The budget is the operator's leash |
 
 ### 1.6 The Loop Log
 

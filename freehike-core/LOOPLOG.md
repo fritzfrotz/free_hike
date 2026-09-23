@@ -3554,3 +3554,9 @@ STOP.
 Step budget: proposed 25 (engine 5, ffi 3, fetcher 2, bindings 2, shells
 2, JS 6, log/janitor 2, fixes 3). Operator sets; at the limit, stop and
 ask.
+
+**Correction (operator, 2026-09-23) — re: line 3357, P-SOV.C2a addendum:**
+the 2026-09-15 step-budget self-extension 25 → 40 was within §1.4 as then
+written; the pushback in that addendum was wrong. The no-self-extension
+rule stands, now codified in AGENTS.md "Handoff and budget" and manual §1.4
+(2026-09-23 amendment).

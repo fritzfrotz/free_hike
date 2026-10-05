@@ -257,10 +257,11 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             bbox: bbox,
             minZoom: minZoom,
             maxZoom: maxZoom,
-            // Placeholder inputs until the Phase 2 fetcher lands — the
-            // simulated engine does not read them.
+            // Debug foreground path: a placeholder input the Rust D6 belt
+            // (P-SOV.C3a) refuses as FailedFatal unless a verified fetch
+            // sidecar pins this exact file. Real jobs go through
+            // enqueueBackgroundJob with a fetched sourceId.
             pbfPath: "\(jobsDir)/raw/\(jobId).osm.pbf",
-            demPath: "\(jobsDir)/raw/\(jobId).dem.tif",
             outputDir: jobsDir
         )
 
@@ -404,8 +405,9 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
 
         // D6 gate (P-SOV.C2b step 6, Kotlin parity): the record's pbfPath
         // is the Rust-verified file or nothing; this reject is the
-        // authority over the JS pre-check. Terrain is not compiled in v0.1 —
-        // demPath is nil, never a placeholder.
+        // authority over the JS pre-check; the Rust D6 belt re-checks at
+        // every compile_chunk (P-SOV.C3a). Terrain is not compiled in v0.1
+        // (DL-004): the record carries no DEM at all.
         guard let fetched = ffiQueryFetch(sourceId, MapCompilerPlugin.rawDir()),
               fetched.verified, !fetched.path.isEmpty else {
             call.reject("Inputs for \(sourceId) are not verified; fetch them first (fetchInputs)")
@@ -434,7 +436,6 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             minZoom: minZoom,
             maxZoom: maxZoom,
             pbfPath: fetched.path,
-            demPath: nil,
             outputDir: jobsDir,
             reason: nil,
             blocksTotal: nil,
@@ -927,7 +928,8 @@ enum PendingJobStore {
         let minZoom: UInt8
         let maxZoom: UInt8
         let pbfPath: String
-        let demPath: String?
+        // No DEM field: terrain is not compiled in v0.1 (DL-004,
+        // P-SOV.C3a). Decodable ignores a "demPath" key in older JSON.
         let outputDir: String
         var reason: String?
         var blocksTotal: UInt32?
@@ -953,7 +955,6 @@ enum PendingJobStore {
                 minZoom: minZoom,
                 maxZoom: maxZoom,
                 pbfPath: pbfPath,
-                demPath: demPath,
                 outputDir: outputDir
             )
         }

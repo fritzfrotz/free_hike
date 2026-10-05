@@ -660,6 +660,9 @@ public func FfiConverterTypeCheckpointState_lower(_ value: CheckpointState) -> R
 /**
  * Description of a compile job. Send the *same* record for every slice of
  * the same job — `job_id` + `output_dir` are the resume identity.
+ *
+ * P-SOV.C3a surface note: `dem_path` was removed — terrain is not compiled
+ * in v0.1 (DL-004), and a field the engine ignores is a placeholder.
  */
 public struct CompileJob {
     /**
@@ -682,10 +685,6 @@ public struct CompileJob {
      * Absolute path to the raw .osm.pbf extract on device storage.
      */
     public var pbfPath: String
-    /**
-     * Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
-     */
-    public var demPath: String?
     /**
      * Directory owning this job's checkpoints and output archives.
      */
@@ -710,9 +709,6 @@ public struct CompileJob {
          * Absolute path to the raw .osm.pbf extract on device storage.
          */pbfPath: String, 
         /**
-         * Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
-         */demPath: String?, 
-        /**
          * Directory owning this job's checkpoints and output archives.
          */outputDir: String) {
         self.jobId = jobId
@@ -720,7 +716,6 @@ public struct CompileJob {
         self.minZoom = minZoom
         self.maxZoom = maxZoom
         self.pbfPath = pbfPath
-        self.demPath = demPath
         self.outputDir = outputDir
     }
 }
@@ -747,9 +742,6 @@ extension CompileJob: Equatable, Hashable {
         if lhs.pbfPath != rhs.pbfPath {
             return false
         }
-        if lhs.demPath != rhs.demPath {
-            return false
-        }
         if lhs.outputDir != rhs.outputDir {
             return false
         }
@@ -762,7 +754,6 @@ extension CompileJob: Equatable, Hashable {
         hasher.combine(minZoom)
         hasher.combine(maxZoom)
         hasher.combine(pbfPath)
-        hasher.combine(demPath)
         hasher.combine(outputDir)
     }
 }
@@ -781,7 +772,6 @@ public struct FfiConverterTypeCompileJob: FfiConverterRustBuffer {
                 minZoom: FfiConverterUInt8.read(from: &buf), 
                 maxZoom: FfiConverterUInt8.read(from: &buf), 
                 pbfPath: FfiConverterString.read(from: &buf), 
-                demPath: FfiConverterOptionString.read(from: &buf), 
                 outputDir: FfiConverterString.read(from: &buf)
         )
     }
@@ -792,7 +782,6 @@ public struct FfiConverterTypeCompileJob: FfiConverterRustBuffer {
         FfiConverterUInt8.write(value.minZoom, into: &buf)
         FfiConverterUInt8.write(value.maxZoom, into: &buf)
         FfiConverterString.write(value.pbfPath, into: &buf)
-        FfiConverterOptionString.write(value.demPath, into: &buf)
         FfiConverterString.write(value.outputDir, into: &buf)
     }
 }
@@ -1258,6 +1247,10 @@ extension CompilationStatus: Equatable, Hashable {}
  * pass landed — a Surface v1 addition made under the operator's Phase-4
  * integration directive (adds a Swift/Kotlin enum case; existing cases and
  * their ordinals are unchanged).
+ *
+ * P-SOV.C3a surface note: `Terrain` was removed (DL-004, operator call S1).
+ * `Finalize`'s ordinal moves from 5 to 4; the shells only log the phase,
+ * and old checkpoints are refused by the engine's v7 bump anyway.
  */
 
 public enum CompilePhase {
@@ -1265,7 +1258,6 @@ public enum CompilePhase {
     case pass1Nodes
     case pass2Ways
     case pass3Tiles
-    case terrain
     case finalize
 }
 
@@ -1290,9 +1282,7 @@ public struct FfiConverterTypeCompilePhase: FfiConverterRustBuffer {
         
         case 3: return .pass3Tiles
         
-        case 4: return .terrain
-        
-        case 5: return .finalize
+        case 4: return .finalize
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1314,12 +1304,8 @@ public struct FfiConverterTypeCompilePhase: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
         
         
-        case .terrain:
-            writeInt(&buf, Int32(4))
-        
-        
         case .finalize:
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -1758,30 +1744,6 @@ public func FfiConverterCallbackInterfaceProgressCallback_lift(_ handle: UInt64)
 #endif
 public func FfiConverterCallbackInterfaceProgressCallback_lower(_ v: ProgressCallback) -> UInt64 {
     return FfiConverterCallbackInterfaceProgressCallback.lower(v)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
-    typealias SwiftType = String?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterString.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterString.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
 }
 
 #if swift(>=5.8)

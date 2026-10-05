@@ -141,6 +141,24 @@ pub fn md5_hex(bytes: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Writes the sidecar a finished, verified fetch of `<dir>/<basename>` would
+/// leave behind (P-SOV.C3a): downstream suites compile synthetic fixtures
+/// through the D6 belt (`crate::verified_input`) without a mirror. `total`
+/// is the file's current length (0 if it does not exist yet).
+pub fn write_verified_sidecar(dir: &std::path::Path, source_id: &str, basename: &str) {
+    let total = std::fs::metadata(dir.join(basename)).map_or(0, |m| m.len());
+    let sc = crate::sidecar::Sidecar {
+        source_id: source_id.to_string(),
+        pinned_url: format!("https://mirror.invalid/{basename}"),
+        etag: String::new(),
+        total,
+        expected_md5: String::new(),
+        verified: true,
+        restarts: 0,
+    };
+    crate::sidecar::save_sidecar(dir, &sc).expect("test sidecar write");
+}
+
 pub struct LoopbackServer {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<Request>>>,

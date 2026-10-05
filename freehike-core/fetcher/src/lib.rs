@@ -400,6 +400,57 @@ pub fn purge_fetch(source_id: &str, dest_dir: &Path) -> bool {
     removed
 }
 
+/// The D6 Rust belt (P-SOV.C3a): `Ok(())` only if a sidecar beside `path`
+/// pins exactly this basename, is marked verified, and the file still has
+/// the verified length. Shells gate on `query_fetch` before enqueueing; this
+/// is the core's own check, so no caller can hand the compiler an input the
+/// fetcher never vouched for. Sidecars are keyed by source id, not by file,
+/// hence the directory scan; one that fails to decode belongs to some other
+/// source and is skipped rather than blocking every input beside it.
+pub fn verified_input(path: &Path) -> Result<(), FetchError> {
+    let refuse =
+        |why: String| FetchError::State(format!("unverified input {}: {why}", path.display()));
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Err(refuse("no parent directory or file name".into()));
+    };
+    let Some(kind) = kind_for_path(path) else {
+        return Err(refuse("not a .pbf/.tif input".into()));
+    };
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| refuse(format!("cannot list {} for a sidecar: {e}", dir.display())))?;
+
+    let mut unverified = None;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(id) = file_name.to_str().and_then(|f| f.strip_suffix(".fetch")) else {
+            continue;
+        };
+        let Ok(Some(sc)) = load_sidecar(dir, id) else {
+            continue;
+        };
+        if !sc.is_resolved() || pinned_basename(&sc.pinned_url, kind).ok().as_deref() != Some(name)
+        {
+            continue;
+        }
+        if !sc.verified {
+            unverified = Some(id.to_string());
+            continue;
+        }
+        let have = file_len(path)?;
+        if have != sc.total {
+            return Err(refuse(format!(
+                "length {have} != verified total {} in sidecar {id}.fetch",
+                sc.total
+            )));
+        }
+        return Ok(());
+    }
+    Err(refuse(match unverified {
+        Some(id) => format!("sidecar {id}.fetch is not verified"),
+        None => "no fetch sidecar pins this file".into(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // The slice engine
 // ---------------------------------------------------------------------------

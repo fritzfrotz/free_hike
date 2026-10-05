@@ -63,6 +63,9 @@ fn ensure_logging() {
 
 /// Description of a compile job. Send the *same* record for every slice of
 /// the same job — `job_id` + `output_dir` are the resume identity.
+///
+/// P-SOV.C3a surface note: `dem_path` was removed — terrain is not compiled
+/// in v0.1 (DL-004), and a field the engine ignores is a placeholder.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct CompileJob {
     /// Caller-chosen unique ID (e.g. a UUID). Checkpoints are keyed by it.
@@ -75,8 +78,6 @@ pub struct CompileJob {
     pub max_zoom: u8,
     /// Absolute path to the raw .osm.pbf extract on device storage.
     pub pbf_path: String,
-    /// Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
-    pub dem_path: Option<String>,
     /// Directory owning this job's checkpoints and output archives.
     pub output_dir: String,
 }
@@ -115,12 +116,15 @@ pub struct CompileSummary {
 /// pass landed — a Surface v1 addition made under the operator's Phase-4
 /// integration directive (adds a Swift/Kotlin enum case; existing cases and
 /// their ordinals are unchanged).
+///
+/// P-SOV.C3a surface note: `Terrain` was removed (DL-004, operator call S1).
+/// `Finalize`'s ordinal moves from 5 to 4; the shells only log the phase,
+/// and old checkpoints are refused by the engine's v7 bump anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum CompilePhase {
     Pass1Nodes,
     Pass2Ways,
     Pass3Tiles,
-    Terrain,
     Finalize,
 }
 
@@ -130,7 +134,6 @@ impl From<engine::Phase> for CompilePhase {
             engine::Phase::Pass1Nodes => CompilePhase::Pass1Nodes,
             engine::Phase::Pass2Ways => CompilePhase::Pass2Ways,
             engine::Phase::Pass3Tiles => CompilePhase::Pass3Tiles,
-            engine::Phase::Terrain => CompilePhase::Terrain,
             engine::Phase::Finalize => CompilePhase::Finalize,
         }
     }
@@ -251,13 +254,18 @@ fn to_job_spec(job: &CompileJob) -> Result<JobSpec, String> {
             job.min_zoom, job.max_zoom
         ));
     }
+    // D6 Rust belt (P-SOV.C3a): the shells gate enqueue on `query_fetch`,
+    // but this is the choke point every compile crosses — an input the
+    // fetcher never verified (placeholder path, stale record, hand-edited
+    // job) is refused here, before the engine mmaps a single byte.
+    fetcher::verified_input(std::path::Path::new(&job.pbf_path))
+        .map_err(|e| format!("pbf_path refused by the D6 belt: {e}"))?;
     Ok(JobSpec {
         job_id: job.job_id.clone(),
         bbox,
         min_zoom: job.min_zoom,
         max_zoom: job.max_zoom,
         pbf_path: job.pbf_path.clone(),
-        dem_path: job.dem_path.clone(),
         output_dir: job.output_dir.clone(),
     })
 }
@@ -860,15 +868,31 @@ mod tests {
             ]]),
         )
         .unwrap();
+        // The D6 belt (P-SOV.C3a): only fetcher-verified inputs compile.
+        fetcher::testing::write_verified_sidecar(&dir, "test-source", "fixture.osm.pbf");
         CompileJob {
             job_id: format!("job-{tag}"),
             bbox: "11.15,47.05,11.65,47.45".into(),
             min_zoom: 5,
             max_zoom: 14,
             pbf_path: pbf_path.to_string_lossy().into_owned(),
-            dem_path: Some("unused_dem.tif".into()),
             output_dir: dir.to_string_lossy().into_owned(),
         }
+    }
+
+    #[test]
+    fn compile_chunk_refuses_input_without_verified_sidecar() {
+        let job = test_job("belt");
+        std::fs::remove_file(std::path::Path::new(&job.output_dir).join("test-source.fetch"))
+            .unwrap();
+        match compile_chunk(job.clone(), 300_000, Box::new(Recorder(Default::default()))) {
+            CompilationStatus::FailedFatal { reason } => {
+                assert!(reason.contains("sidecar"), "got: {reason}")
+            }
+            other => panic!("an unverified pbf_path must be refused, got {other:?}"),
+        }
+        // Refused at spec validation: the engine never ran, no state exists.
+        assert!(query_checkpoint(job.job_id, job.output_dir).is_none());
     }
 
     #[test]
@@ -882,9 +906,9 @@ mod tests {
         match status {
             CompilationStatus::Finished { summary } => {
                 // Fixture: 2 blocks (header + 1 node data) walked by each
-                // real pass + simulated terrain (12) + real finalize on a
-                // nodes-only extract (0 ways → 0 tiles + 1 assembly block).
-                assert_eq!(summary.blocks_total, 2 * 2 + 12 + 1);
+                // real pass + real finalize on a nodes-only extract (0 ways
+                // → 0 tiles + 1 assembly block). No terrain phase (DL-004).
+                assert_eq!(summary.blocks_total, 2 * 2 + 1);
                 assert!(summary.bytes_written > 0);
             }
             other => panic!("expected Finished, got {other:?}"),
@@ -991,7 +1015,8 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert!(seen.iter().any(|(_, s)| s.starts_with("pass1")));
         assert!(seen.iter().any(|(_, s)| s.starts_with("pass2")));
-        assert!(seen.iter().any(|(_, s)| s.starts_with("terrain")));
+        assert!(seen.iter().any(|(_, s)| s.starts_with("finalizing")));
+        assert!(!seen.iter().any(|(_, s)| s.starts_with("terrain")));
     }
 
     #[test]

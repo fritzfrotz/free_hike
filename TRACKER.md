@@ -12,6 +12,8 @@
 - **D009** — mem gate needs a harness-free CLI driver plus the in-process allocator peak counter, an Austria-scale on-device run, and the iOS increased-memory entitlement — platforms: ios,core
   - freehike-core/scripts/mem_gate.sh:28
   - ios/App/App/MapCompilerPlugin.swift:5
+- **D010** — manual §3b L3b SIGKILL torture harness (scripts/kill_resume_test.sh + CLI driver) was never built; in-process resume proofs stand in since P-SOV.C3a — platforms: core
+  - freehike-core/scripts/mem_gate.sh:29
 
 ## Open Bugs
 

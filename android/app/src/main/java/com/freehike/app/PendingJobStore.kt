@@ -33,6 +33,11 @@ object PendingJobStore {
 
     private const val PREFS = "freehike_background_job"
 
+    /**
+     * No DEM field: terrain is not compiled in v0.1 (DL-004, P-SOV.C3a).
+     * A "demPath" key left by an older record is never read and goes away
+     * with the record's next [clear].
+     */
     data class Record(
         val state: String,
         val jobId: String,
@@ -40,7 +45,6 @@ object PendingJobStore {
         val minZoom: Int,
         val maxZoom: Int,
         val pbfPath: String,
-        val demPath: String?,
         val outputDir: String,
         val reason: String?,
         val blocksTotal: Long,
@@ -73,7 +77,6 @@ object PendingJobStore {
             minZoom = minZoom.toUByte(),
             maxZoom = maxZoom.toUByte(),
             pbfPath = pbfPath,
-            demPath = demPath,
             outputDir = outputDir,
         )
 
@@ -93,7 +96,6 @@ object PendingJobStore {
             .putInt("minZoom", record.minZoom)
             .putInt("maxZoom", record.maxZoom)
             .putString("pbfPath", record.pbfPath)
-            .putString("demPath", record.demPath)
             .putString("outputDir", record.outputDir)
             .putString("reason", record.reason)
             .putLong("blocksTotal", record.blocksTotal)
@@ -116,7 +118,6 @@ object PendingJobStore {
             minZoom = p.getInt("minZoom", 5),
             maxZoom = p.getInt("maxZoom", 14),
             pbfPath = p.getString("pbfPath", "") ?: "",
-            demPath = p.getString("demPath", null),
             outputDir = p.getString("outputDir", "") ?: "",
             reason = p.getString("reason", null),
             blocksTotal = p.getLong("blocksTotal", 0),

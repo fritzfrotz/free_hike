@@ -269,3 +269,63 @@ fn sidecar_path_is_keyed_by_source_id() {
     let p = sidecar_path(Path::new("/tmp/raw"), "geofabrik-portugal");
     assert_eq!(p, Path::new("/tmp/raw/geofabrik-portugal.fetch"));
 }
+
+// ---------------------------------------------------------------------------
+// D6 Rust belt (P-SOV.C3a): `verified_input`
+// ---------------------------------------------------------------------------
+
+fn input_file(dir: &Path, name: &str) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, b"payload bytes").unwrap();
+    p
+}
+
+#[test]
+fn verified_input_detected_by_sidecar() {
+    let dir = scratch("belt-ok");
+    let pbf = input_file(&dir, "portugal-260101.osm.pbf");
+    fetcher::testing::write_verified_sidecar(&dir, "geofabrik-portugal", "portugal-260101.osm.pbf");
+    fetcher::verified_input(&pbf).expect("a verified sidecar pinning this file passes the belt");
+}
+
+#[test]
+fn unverified_sidecar_rejected() {
+    let dir = scratch("belt-unverified");
+    let pbf = input_file(&dir, "x.osm.pbf");
+    fetcher::testing::write_verified_sidecar(&dir, "src", "x.osm.pbf");
+    let mut sc = load_sidecar(&dir, "src").unwrap().unwrap();
+    sc.verified = false;
+    save_sidecar(&dir, &sc).unwrap();
+    let err = fetcher::verified_input(&pbf).unwrap_err().to_string();
+    assert!(err.contains("not verified"), "got: {err}");
+}
+
+#[test]
+fn missing_sidecar_rejected() {
+    let dir = scratch("belt-missing");
+    let pbf = input_file(&dir, "x.osm.pbf");
+    let err = fetcher::verified_input(&pbf).unwrap_err().to_string();
+    assert!(err.contains("sidecar"), "got: {err}");
+}
+
+#[test]
+fn sidecar_for_other_basename_ignored() {
+    let dir = scratch("belt-other");
+    let pbf = input_file(&dir, "x.osm.pbf");
+    input_file(&dir, "y.osm.pbf");
+    fetcher::testing::write_verified_sidecar(&dir, "src-y", "y.osm.pbf");
+    let err = fetcher::verified_input(&pbf).unwrap_err().to_string();
+    assert!(err.contains("no fetch sidecar"), "got: {err}");
+}
+
+#[test]
+fn verified_length_mismatch_rejected() {
+    // The file was swapped or truncated after verification: the sidecar's
+    // verdict no longer describes the bytes on disk.
+    let dir = scratch("belt-len");
+    let pbf = input_file(&dir, "x.osm.pbf");
+    fetcher::testing::write_verified_sidecar(&dir, "src", "x.osm.pbf");
+    std::fs::write(&pbf, b"swapped after verification").unwrap();
+    let err = fetcher::verified_input(&pbf).unwrap_err().to_string();
+    assert!(err.contains("length"), "got: {err}");
+}

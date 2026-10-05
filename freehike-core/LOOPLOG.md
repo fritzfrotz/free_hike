@@ -3560,3 +3560,128 @@ the 2026-09-15 step-budget self-extension 25 → 40 was within §1.4 as then
 written; the pushback in that addendum was wrong. The no-self-extension
 rule stands, now codified in AGENTS.md "Handoff and budget" and manual §1.4
 (2026-09-23 amendment).
+
+## P-SOV.C3a — plan revision + operator calls (2026-10-05)
+
+**Operator calls (step 1):** S1 (ii) remove `CompilePhase::Terrain`; S2
+(ii) remove `CompileJob.dem_path`; S3 (1) tests write a verified sidecar
+via `fetcher::testing::write_verified_sidecar`, no opt-out field, no
+cargo feature; S4 (c) transformStyle at Map construction. Budget 25.
+
+**Step-2 finding → back to DECISION mode (0 steps spent):** `transformStyle`
+is NOT a MapLibre 5.24 constructor option (`MapOptions` lacks it; it lives
+on `StyleSwapOptions`; the constructor calls `setStyle(style,
+{localIdeographFontFamily})` only), so (c) needs `.setStyle(` — P8a.
+`scripts/kill_resume_test.sh` does not exist (manual §3b names it; no CLI
+driver either, cf. D009). Budget recount ≈32 vs 25.
+
+**Operator calls (2026-10-05):** S4 → (c′) fetch the style, strip terrain in
+a pure tested function, pass the object to the constructor; no fork, no
+RULE-EXEMPT. L3b → in-process resume proofs stand in
+(`sliced_run_matches_single_run`, `resume_continues_not_restarts`,
+`finalize_yields_mid_phase_with_durable_tile_cursor`,
+`spec_change_purges_stale_state_and_restarts_fresh`, new
+`checkpoint_v6_refused_loudly`); DEBT tag beside D009; the harness is a
+separate chunk after Phase 1 kill tests. Split: **C3a** = Rust belt,
+terrain deletion, CHECKPOINT_VERSION 7, bindings regen + vendor,
+Kotlin/Swift shells, `compiler/tests/thermal_governance.rs`; budget 25.
+**C3b** = JS no-terrain path + preview proof; plan entry only, after C3a is
+on main. Housekeeping: main is `d8f89e7` (`5042b0f` is a dangling
+same-tree commit).
+
+**C3a Files:** `compiler/src/engine.rs`, `compiler/tests/thermal_governance.rs`
+(plan revision: overflow +1, sets `dem_path`), `ffi/src/lib.rs`,
+`ffi/tests/thermal.rs`, `fetcher/src/lib.rs`, `fetcher/src/testing.rs`,
+`fetcher/tests/contract.rs`, `scripts/mem_gate.sh` (DEBT tag only, overflow
++1, per the "beside D009" call), `ffi/bindings/*` + both vendored copies,
+`MapCompilerPlugin.kt`, `PendingJobStore.kt`, `MapCompilerPlugin.swift`
+(unverified, D004), LOOPLOG, TRACKER.
+**C3a proofs:** as in the C3 plan entry, minus the JS rows; fetcher adds
+`verified_length_mismatch_rejected` (the belt also checks the on-disk length
+equals the sidecar's verified total — flagged strengthening). L3b = the
+in-process set above. L4 = `cargo ndk -t arm64-v8a build --release -p ffi`
+(refreshing jniLibs), bindings shasum-equal ×3 locations, gradle
+assembleDebug.
+**Step allocation (25):** log 1, fetcher 3, engine 2 (red edit + rewrite),
+thermal_governance 1, ffi 2 (red edit + rewrite), ffi thermal test 1,
+mem_gate tag 1, bindings 2, Kotlin 3, Swift 3, jniLibs 1, kill entry 1,
+janitor 1 = 22; 3 reserve.
+
+### P-SOV.C3a — execution + close (2026-10-05)
+
+- Red → green, in order: fetcher `contract.rs` +5 tests (COMPILE_FAIL: API
+  absent) → `testing::write_verified_sidecar` + `fetcher::verified_input`
+  → 16/16. Engine +3 tests (`phase_plan_has_no_terrain`,
+  `phase_from_str_rejects_terrain`, `checkpoint_v6_refused_loudly`) red as
+  TEST_FAIL → engine rewrite → green. ffi
+  `compile_chunk_refuses_input_without_verified_sidecar` red as TEST_FAIL
+  (Finished, not refused) after the surface deletions → belt in
+  `to_job_spec` → green.
+- Engine: `Phase::Terrain`, `JobSpec.dem_path`, `TERRAIN_BLOCKS`,
+  `BLOCK_WORK`, `BLOCK_OUTPUT_BYTES`, `sim_blocks`, `process_sim_block`, the
+  Terrain arm deleted; `phase_plan()` is fixed (4 phases); `spec_fingerprint`
+  drops the dem component; `CHECKPOINT_VERSION` 6 → 7. **Flagged extra
+  deletion:** the `plan.contains(&cp.phase)` resume guard (unreachable once
+  the plan is fixed and `from_str` can only name plan phases). Tests:
+  `dem_none_skips_terrain_phase` renamed `full_run_never_reports_terrain`
+  (it tested the placeholder's skip path); `pass3_bins_tiles_mid_job` now
+  expects the next phase `Finalize`; `phase_transitions_in_order` and the
+  ignored `real_innsbruck_end_to_end_sliced` lose the terrain term; no test
+  deleted.
+- ffi: `CompileJob.dem_path` and `CompilePhase::Terrain` removed (S1/S2
+  (ii)); `Finalize` ordinal 5 → 4. Belt error text: "pbf_path refused by the
+  D6 belt: … sidecar …". The belt also requires on-disk length == the
+  sidecar's verified total (`verified_length_mismatch_rejected`). Unreadable
+  sidecars of OTHER sources are skipped, not fatal.
+- Bindings: regenerated (library mode; ktlint absent → unformatted, as
+  before); shasum-equal across all locations — swift d8a8f5bd…, .h
+  8d48a92e… (unchanged), modulemap ea8b5630…, kt 94870fad….
+- Shells: Kotlin `MapCompilerPlugin.kt` (debug `startJob` placeholder
+  comment now says the belt refuses it; enqueue record drops `demPath`),
+  `PendingJobStore.kt` (field, save, load, `toCompileJob`). Swift mirrored,
+  UNVERIFIED (D004). Old persisted `demPath` keys are ignored (prefs key
+  unread; Codable ignores unknown keys).
+- Ladder ×2 (both runs identical): `cargo fmt --check` OK, clippy
+  `--all-targets -D warnings` OK, `cargo test --workspace` 234 passed / 0
+  failed / 7 ignored (before: 225 — +5 fetcher, +3 engine, +1 ffi). L4 ×2:
+  `cargo ndk -t arm64-v8a build --release -p ffi` exit 0 (run 1 with `-o`
+  refreshing jniLibs: `libfreehike_ffi.so` 5,065,152 B, `llvm-nm` shows
+  `uniffi_freehike_ffi_fn_func_{compile,fetch}_chunk`); gradle `--offline
+  assembleDebug` exit 0 ×2, APK 37,478,467 B carrying that .so.
+- L3b (operator call): in-process proofs stand in — all green in both runs:
+  `sliced_run_matches_single_run`, `resume_continues_not_restarts`,
+  `finalize_yields_mid_phase_with_durable_tile_cursor`,
+  `spec_change_purges_stale_state_and_restarts_fresh`,
+  `checkpoint_v6_refused_loudly`. New DEBT(D010) beside D009 in
+  `scripts/mem_gate.sh` for the missing SIGKILL harness.
+- Correction to the C3 plan's checkpoint note 1: a v6 checkpoint is NOT
+  "purged and restarted by the engine". The engine returns FailedFatal; the
+  Android worker then purges job state and marks the record failed
+  (`BackgroundCompileWorker.kt` FailedFatal arm); the user re-enqueues.
+  No device holds a v6 checkpoint (the Samsung has never compiled).
+- Not done (out of C3a scope): `ARCHITECTURE.md` still says checkpoint
+  "currently v6" (P4) and lists terrain as Phase 6 IN PROGRESS — HITL text
+  proposed in the close-report; `compiler/src/lib.rs:8` doc still calls
+  Terrain simulated (pre-existing staleness, not in Files). JS untouched
+  (C3b): `startJob` aside, nothing in JS sent `demPath`.
+- DL-004 scoring line (provisional; verdict at C3b close, ledger untouched):
+  the operator's prediction ("one small chunk; wrong if Code stops at the
+  checkpoint-semantics gate or it needs a second chunk") is falsified on
+  its second clause — C3 split into C3a/C3b; the stop came at the S4
+  transformStyle check, not checkpoint semantics. The style-fork
+  prediction in the ledger is Claude's second opinion, not the operator's
+  (the 2026-10-05 instruction attributed it to the operator): Claude
+  predicted "one chunk at the proposed budget… wrong if the style JSON has
+  to fork" — the first half is falsified (budget recount ≈32, split); the
+  fork half is pending C3b, where S4 went to (c′) fetch-and-strip, not
+  transformStyle and not a fork.
+- Steps used: 24/25 at this entry; janitor makes 25. Spent: plan revision
+  1, fetcher 3 (tests, helper, belt fn), engine 3 (red edit, a TRUNCATED
+  rewrite — my error, the file was cut at `purge_job_state` — and the full
+  rewrite), thermal_governance 1, ffi 3 (red edit, surface rewrite, belt —
+  one over plan because the engine change made the first ffi red a
+  compile failure), ffi thermal 1, fmt fix 1, D010 tag 1, bindings 2,
+  Kotlin 3, Swift 3, jniLibs 1, this entry 1. One Kotlin Edit was rejected
+  by the tool (old_string mismatch, no write) and is not counted. Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip/c3a).

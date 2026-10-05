@@ -144,10 +144,11 @@ class MapCompilerPlugin : Plugin() {
             bbox = bbox,
             minZoom = minZoom.toUByte(),
             maxZoom = maxZoom.toUByte(),
-            // Placeholder inputs until the Phase 2 fetcher lands — the
-            // simulated engine does not read them.
+            // Debug foreground path: a placeholder input the Rust D6 belt
+            // (P-SOV.C3a) refuses as FailedFatal unless a verified fetch
+            // sidecar pins this exact file. Real jobs go through
+            // enqueueBackgroundJob with a fetched sourceId.
             pbfPath = "$jobsDir/raw/$jobId.osm.pbf",
-            demPath = "$jobsDir/raw/$jobId.dem.tif",
             outputDir = jobsDir,
         )
 
@@ -569,8 +570,9 @@ class MapCompilerPlugin : Plugin() {
             // D6 gate (P-SOV.C2b step 6): the record's pbfPath is the
             // Rust-verified file or nothing. The JS layer pre-checks the same
             // state so the UI can explain; THIS reject is the authority (the
-            // JS view can be stale). Terrain is not compiled in v0.1 —
-            // demPath is null, never a placeholder.
+            // JS view can be stale); the Rust D6 belt re-checks at every
+            // compile_chunk (P-SOV.C3a). Terrain is not compiled in v0.1
+            // (DL-004): the record carries no DEM at all.
             val fetched = uniffi.freehike.queryFetch(sourceId, rawDir())
             if (fetched == null || !fetched.verified || fetched.path.isEmpty()) {
                 call.reject("Inputs for $sourceId are not verified; fetch them first (fetchInputs)")
@@ -600,7 +602,6 @@ class MapCompilerPlugin : Plugin() {
                     minZoom = minZoom,
                     maxZoom = maxZoom,
                     pbfPath = fetched.path,
-                    demPath = null,
                     outputDir = jobsDir,
                     reason = null,
                     blocksTotal = 0,

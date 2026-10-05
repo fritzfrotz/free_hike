@@ -48,13 +48,14 @@ fn test_job(tag: &str) -> CompileJob {
         ]]),
     )
     .unwrap();
+    // The D6 belt (P-SOV.C3a): only fetcher-verified inputs compile.
+    fetcher::testing::write_verified_sidecar(&dir, "test-source", "fixture.osm.pbf");
     CompileJob {
         job_id: format!("job-{tag}"),
         bbox: "11.15,47.05,11.65,47.45".into(),
         min_zoom: 5,
         max_zoom: 14,
         pbf_path: pbf_path.to_string_lossy().into_owned(),
-        dem_path: Some("unused_dem.tif".into()),
         output_dir: dir.to_string_lossy().into_owned(),
     }
 }

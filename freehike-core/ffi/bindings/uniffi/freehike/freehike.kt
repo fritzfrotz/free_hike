@@ -1373,6 +1373,9 @@ public object FfiConverterTypeCheckpointState: FfiConverterRustBuffer<Checkpoint
 /**
  * Description of a compile job. Send the *same* record for every slice of
  * the same job — `job_id` + `output_dir` are the resume identity.
+ *
+ * P-SOV.C3a surface note: `dem_path` was removed — terrain is not compiled
+ * in v0.1 (DL-004), and a field the engine ignores is a placeholder.
  */
 data class CompileJob (
     /**
@@ -1396,10 +1399,6 @@ data class CompileJob (
      */
     var `pbfPath`: kotlin.String, 
     /**
-     * Absolute path to the DEM GeoTIFF; None skips the Terrain phase.
-     */
-    var `demPath`: kotlin.String?, 
-    /**
      * Directory owning this job's checkpoints and output archives.
      */
     var `outputDir`: kotlin.String
@@ -1419,7 +1418,6 @@ public object FfiConverterTypeCompileJob: FfiConverterRustBuffer<CompileJob> {
             FfiConverterUByte.read(buf),
             FfiConverterUByte.read(buf),
             FfiConverterString.read(buf),
-            FfiConverterOptionalString.read(buf),
             FfiConverterString.read(buf),
         )
     }
@@ -1430,7 +1428,6 @@ public object FfiConverterTypeCompileJob: FfiConverterRustBuffer<CompileJob> {
             FfiConverterUByte.allocationSize(value.`minZoom`) +
             FfiConverterUByte.allocationSize(value.`maxZoom`) +
             FfiConverterString.allocationSize(value.`pbfPath`) +
-            FfiConverterOptionalString.allocationSize(value.`demPath`) +
             FfiConverterString.allocationSize(value.`outputDir`)
     )
 
@@ -1440,7 +1437,6 @@ public object FfiConverterTypeCompileJob: FfiConverterRustBuffer<CompileJob> {
             FfiConverterUByte.write(value.`minZoom`, buf)
             FfiConverterUByte.write(value.`maxZoom`, buf)
             FfiConverterString.write(value.`pbfPath`, buf)
-            FfiConverterOptionalString.write(value.`demPath`, buf)
             FfiConverterString.write(value.`outputDir`, buf)
     }
 }
@@ -1743,6 +1739,10 @@ public object FfiConverterTypeCompilationStatus : FfiConverterRustBuffer<Compila
  * pass landed — a Surface v1 addition made under the operator's Phase-4
  * integration directive (adds a Swift/Kotlin enum case; existing cases and
  * their ordinals are unchanged).
+ *
+ * P-SOV.C3a surface note: `Terrain` was removed (DL-004, operator call S1).
+ * `Finalize`'s ordinal moves from 5 to 4; the shells only log the phase,
+ * and old checkpoints are refused by the engine's v7 bump anyway.
  */
 
 enum class CompilePhase {
@@ -1750,7 +1750,6 @@ enum class CompilePhase {
     PASS1_NODES,
     PASS2_WAYS,
     PASS3_TILES,
-    TERRAIN,
     FINALIZE;
     companion object
 }
@@ -2044,38 +2043,6 @@ internal object uniffiCallbackInterfaceProgressCallback {
  * @suppress
  */
 public object FfiConverterTypeProgressCallback: FfiConverterCallbackInterface<ProgressCallback>()
-
-
-
-
-/**
- * @suppress
- */
-public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
-    override fun read(buf: ByteBuffer): kotlin.String? {
-        if (buf.get().toInt() == 0) {
-            return null
-        }
-        return FfiConverterString.read(buf)
-    }
-
-    override fun allocationSize(value: kotlin.String?): ULong {
-        if (value == null) {
-            return 1UL
-        } else {
-            return 1UL + FfiConverterString.allocationSize(value)
-        }
-    }
-
-    override fun write(value: kotlin.String?, buf: ByteBuffer) {
-        if (value == null) {
-            buf.put(0)
-        } else {
-            buf.put(1)
-            FfiConverterString.write(value, buf)
-        }
-    }
-}
 
 
 

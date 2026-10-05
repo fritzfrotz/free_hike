@@ -123,7 +123,6 @@ fn test_job(tag: &str) -> JobSpec {
         min_zoom: 5,
         max_zoom: 14,
         pbf_path: pbf_path.to_string_lossy().into_owned(),
-        dem_path: Some("unused_dem.tif".into()),
         output_dir: dir.to_string_lossy().into_owned(),
     }
 }

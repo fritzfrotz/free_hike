@@ -26,6 +26,7 @@
 # it to make this script pass.
 #
 # DEBT(D009): mem gate needs a harness-free CLI driver plus the in-process allocator peak counter, an Austria-scale on-device run, and the iOS increased-memory entitlement — platforms: ios,core
+# DEBT(D010): manual §3b L3b SIGKILL torture harness (scripts/kill_resume_test.sh + CLI driver) was never built; in-process resume proofs stand in since P-SOV.C3a — platforms: core
 #
 # Exit codes: 0 = command succeeded and peak under limit; 1 = peak breached
 # the limit; the command's own failure code otherwise.

@@ -22,15 +22,18 @@ export interface RegionBootDefaults {
 /**
  * Files that need an OPFS existence probe: only those differing from the
  * booted defaults — the defaults trivially exist (the worker just opened
- * them), and probing an already-locked file is pointless.
+ * them), and probing an already-locked file is pointless. A null terrain
+ * (P-SOV.C3b: compiled regions bring none) is never probed — the region
+ * binds on its basemap alone and keeps whatever terrain the boot found.
  */
 export function regionFilesToVerify(
   persisted: OfflineRegion,
   defaults: RegionBootDefaults,
 ): string[] {
+  const { terrainFile } = persisted;
   return [
     ...(persisted.basemapFile !== defaults.basemapFile ? [persisted.basemapFile] : []),
-    ...(persisted.terrainFile !== defaults.terrainFile ? [persisted.terrainFile] : []),
+    ...(terrainFile !== null && terrainFile !== defaults.terrainFile ? [terrainFile] : []),
   ];
 }
 

@@ -25,6 +25,24 @@ describe('regionFilesToVerify', () => {
     ).toEqual([]);
   });
 
+  // P-SOV.C3b (DL-004): compiled regions carry no terrain archive.
+  it('null_terrain_is_never_probed', () => {
+    expect(
+      regionFilesToVerify(
+        { regionLabel: 'pt', basemapFile: 'job-pt.pmtiles', terrainFile: null },
+        DEFAULTS,
+      ),
+    ).toEqual(['job-pt.pmtiles']);
+  });
+
+  it('null_terrain_region_binds_on_basemap_alone', () => {
+    const toVerify = regionFilesToVerify(
+      { regionLabel: 'pt', basemapFile: 'job-pt.pmtiles', terrainFile: null },
+      DEFAULTS,
+    );
+    expect(decideRegionBoot(toVerify, [true])).toEqual({ action: 'bind' });
+  });
+
   it('probes both files when both differ', () => {
     expect(
       regionFilesToVerify(

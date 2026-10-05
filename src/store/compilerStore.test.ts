@@ -135,7 +135,7 @@ describe('finished-record ingest — acknowledge-after-durable-close ordering', 
     expect(useMapStore.getState().activeRegion).toEqual({
       regionLabel: 'bg_ok',
       basemapFile: 'bg_ok.pmtiles',
-      terrainFile: 'alps_terrain.pmtiles',
+      terrainFile: null,
     });
   });
 
@@ -223,7 +223,7 @@ describe('handleJobFinished — foreground finish (P9.C7 fixed contract, ex-D008
     expect(useMapStore.getState().activeRegion).toEqual({
       regionLabel: 'fg1',
       basemapFile: 'fg1.pmtiles',
-      terrainFile: 'alps_terrain.pmtiles',
+      terrainFile: null,
     });
     expect(useCompilerStore.getState().isTransferringToOPFS).toBe(false);
   });

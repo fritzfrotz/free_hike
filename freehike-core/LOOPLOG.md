@@ -3685,3 +3685,114 @@ janitor 1 = 22; 3 reserve.
   by the tool (old_string mismatch, no write) and is not counted. Pivots: 0.
 
 **Status:** AGENT-CLOSED — commit by the operator (wip/c3a).
+
+## P-SOV.C3b — JS no-terrain path via (c′) (plan, 2026-10-05)
+
+**Operator calls:** C1 (a) worker `MAP_INIT` gains `optionalFilenames` — a
+missing optional file is info-logged and reported apart from failures. C2:
+the preview proof counts `console.*` errors plus network failures other
+than the one known dev-server 404 for `/local/alps_terrain.pmtiles`, which
+is reported verbatim. C3: `terrainFile: null` = "this region brings no
+terrain; keep whatever terrain the boot found" (no runtime removal).
+Budget 22. Base: main `44e8dc5` (C3a). ARCHITECTURE amendment landed.
+
+**Goal:** a cold boot with no terrain archive renders the basemap with no
+hillshade, contours or 3D terrain and zero console errors beyond B008; a
+boot with one is unchanged.
+
+**Design (c′):** `services/styleTerrain.ts` (pure): `stripTerrain(style)`
+drops every `raster-dem` source, the `terrain` block and every layer on a
+dropped source, never mutating input; `mapInitOutcome(...)` turns a missing
+terrain archive into `hasTerrain=false`, not a user-facing failure.
+MapView: `!hasTerrain` → relative `fetch` of the style → `stripTerrain` →
+`new Map({ style: object })`; terrain registration, `setTerrain`, terrain
+`setMaxTiles` and contour wiring only when `hasTerrain`;
+`loadOfflineRegion(basemap, terrain: string | null)`. `mapStore`
+`terrainFile: string | null`; `compilerStore` writes null and loses
+`DEFAULT_TERRAIN_FILE`; `regionBootPolicy` never probes a null terrain.
+
+**Files:** `src/services/styleTerrain.ts` (+test, new),
+`src/ui/components/MapView.tsx`, `src/store/mapStore.ts`,
+`src/store/compilerStore.ts` (+test), `src/services/regionBootPolicy.ts`
+(+test), `src/workers/mapData.worker.ts`, `src/shared/types.ts`, LOOPLOG,
+TRACKER.
+
+**Proofs (named before implementation):** styleTerrain:
+`strips_terrain_source_block_and_hillshade` (real style JSON, 22 → 21
+layers), `no_layer_references_a_missing_source`, `does_not_mutate_input`,
+`idempotent`, `missing_terrain_is_not_a_user_facing_failure`,
+`missing_basemap_still_is`. regionBootPolicy:
+`null_terrain_is_never_probed`,
+`null_terrain_region_binds_on_basemap_alone`. compilerStore: the two
+hot-swap expectations become `terrainFile: null`. Sovereignty unchanged.
+Frontend L1 ×2 (`tsc -b`, `eslint .`, vitest; 11 files / 64 tests →
+12 / ~72). Preview: move `dev_assets/local/alps_terrain.pmtiles` aside +
+delete the OPFS entry (initFiles skips non-empty files) → 3 cold boots:
+basemap renders; `dynamic-hillshading`, `terrain-local`, terrain and the
+contour source absent; console errors = B008 only (C2) → restore → 1 cold
+boot: terrain/hillshade/contours back.
+
+**Steps [E]/[D]:** 1 [E] calls (done). 2 [D] red tests. 3 [D] styleTerrain +
+regionBootPolicy + stores. 4 [D] worker/types. 5 [D] MapView. 6 [D] ladder
+×2 + preview proof. 7 [D] janitor, kill entry, DL-004 scoring → STOP.
+Allocation (22): plan 1, styleTerrain 2, regionBootPolicy 2, mapStore 1,
+compilerStore 3, worker+types 2, MapView 1, preview setup 3, kill 1,
+janitor 1 = 17; fixes 3; contingency 2.
+
+### P-SOV.C3b — execution + close (2026-10-05)
+
+- Red first: `styleTerrain.test.ts` (module absent), regionBootPolicy
+  `null_terrain_is_never_probed` + `null_terrain_region_binds_on_basemap_alone`
+  (TEST_FAIL: null was probed, decision `clear`), compilerStore's two
+  hot-swap tests (TEST_FAIL: got `'alps_terrain.pmtiles'`). Then
+  `styleTerrain.ts`, regionBootPolicy, mapStore, compilerStore → green.
+- Worker: `MAP_INIT` takes `optionalFilenames`; a missing optional file is
+  `console.info`-logged and returned in `optionalMissing`
+  (`MapInitSuccessPayload` +field). 3 edits, not 2 (my second edit
+  stopped short of the catch/return) — paid from contingency.
+- MapView (one rewrite; `wc -l` 1048, ends at the closing brace; `git diff
+  -w` +73/−25, all intended): `mapInitOutcome` drives the banner and
+  `hasTerrain`; terrain registered only with an archive; no archive →
+  relative `fetch(STYLE_URL)` → `stripTerrain` → `new Map({ style })`;
+  `setTerrain`/terrain `setMaxTiles`/contour wiring behind `hasTerrain`;
+  `loadOfflineRegion(basemap, terrain | null)` keeps the boot's terrain on
+  null (C3). Banner text loses "terrain, hillshading" (terrain is never a
+  user-facing failure now).
+- Frontend L1 ×2: `tsc -b` 0, `eslint .` 0, vitest 12 files / 72 tests
+  both runs (before: 11 / 64; +6 styleTerrain, +2 regionBootPolicy).
+- Preview proof (freehike-dev, tab seed): terrain archive moved to the
+  scratchpad; OPFS `alps_terrain.pmtiles` was a 0-byte stub (removed from a
+  same-origin JSON page so no worker held its lock; no persisted region).
+  3 cold boots, each after frame pumping (rAF-suspension trap):
+  `loaded:true`, sources `[basemap-local, user-location-source]`, 23
+  layers (21 stripped + 2 location), `getLayer('dynamic-hillshading')`
+  false, `getSource('terrain-local')` false, `getTerrain()` null,
+  `contour-source` false, 147 rendered features; no data banner. Console
+  errors: exactly one per page load, all B008 (`Invalid sprite URL
+  "/sprites/outdoor", must be absolute…`) — 4 after 4 loads (the first is
+  the tab's initial load). Worker logged `[info] Optional
+  "alps_terrain.pmtiles" is absent — continuing without it: Error: Fetch
+  failed: Not Found`. C2: the dev-server 404 surfaced in neither the
+  console capture nor the tab's network log (the fetch runs in the worker).
+  Restore → 1 cold boot: sources add `terrain-local` + `contour-source`, 26
+  layers, hillshade true, contour lines true, terrain `{source:
+  terrain-local, exaggeration: 1.3}`, 458 rendered features; errors 5
+  after 5 loads, all B008.
+- DL-004 scoring (proposed; the verdict is the operator's, ledger
+  untouched): operator prediction falsified (needed a second chunk; first
+  stop was S4, not checkpoint semantics). Claude's prediction: "one chunk at
+  the proposed budget" falsified (C3a); "wrong if the style JSON has to
+  fork" held — no fork; one style file, stripped in a pure function.
+  Whether (c′) counts as "held" or "dodged" is the operator's call.
+- Steps used: 18/22 at this entry; janitor makes 19. Spent: plan 1, red
+  tests 3, styleTerrain 1, regionBootPolicy 1, mapStore 1, compilerStore 2,
+  worker 3, types 1, MapView 1, terrain aside 1, OPFS delete 1, restore 1,
+  this entry 1. Pivots: 0.
+- Addendum (after the entry above): janitor `--fix` flagged 2× LINT_FAIL
+  for rule P8a — my own comments quoted the literal `setStyle` call text
+  (P8a's pattern is not line-anchored, unlike P4a). Reworded both
+  (`styleTerrain.ts`, `MapView.tsx`) → janitor clean; TRACKER diff = B008
+  anchor 334 → 348 only. Frontend L1 re-run ×2 green (72/72). **Final
+  steps: 22/22** (janitor 1, two rewords 2, this addendum 1).
+
+**Status:** AGENT-CLOSED — commit by the operator (wip/c3b).

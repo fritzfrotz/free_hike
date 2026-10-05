@@ -23,11 +23,6 @@ function nativeArchiveRelativePath(jobId: string): string {
   return `map_jobs/${jobId}.pmtiles`;
 }
 
-/** Default terrain source — no compile job produces terrain tiles yet
- *  (Phase 6 is deferred), so every hot-swapped region keeps the shared
- *  default terrain archive rather than trying to substitute one. */
-const DEFAULT_TERRAIN_FILE = 'alps_terrain.pmtiles';
-
 /**
  * A finished background compile awaiting its cross-bridge handoff: the
  * archive exists in the native app sandbox and must be stream-copied into
@@ -291,7 +286,9 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
       useMapStore.getState().setActiveRegion({
         regionLabel: job.jobId,
         basemapFile: opfsFilename,
-        terrainFile: DEFAULT_TERRAIN_FILE,
+        // No compile job produces terrain (DL-004): null keeps whatever
+        // terrain the boot found (none on device).
+        terrainFile: null,
       });
 
       set({ backgroundProgress: { stage: 'done', jobId: job.jobId, error: null } });
@@ -358,7 +355,9 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
       useMapStore.getState().setActiveRegion({
         regionLabel: jobId,
         basemapFile: opfsFilename,
-        terrainFile: DEFAULT_TERRAIN_FILE,
+        // No compile job produces terrain (DL-004): null keeps whatever
+        // terrain the boot found (none on device).
+        terrainFile: null,
       });
     } catch (err) {
       console.error(`[compilerStore] Failed to move job "${jobId}" into OPFS:`, err);

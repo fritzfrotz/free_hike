@@ -38,4 +38,10 @@ export interface MapInitSuccessPayload {
    * on the static asset) and were left as empty OPFS stubs.
    */
   provisionFailures: string[];
+  /**
+   * Files the MAP_INIT request listed in `optionalFilenames` that are simply
+   * absent (P-SOV.C3b: the terrain archive — not compiled in v0.1, DL-004).
+   * Not an error; the map runs without them.
+   */
+  optionalMissing: string[];
 }

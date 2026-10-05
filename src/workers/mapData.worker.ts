@@ -95,7 +95,12 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
         throw new Error('MAP_INIT: payload.filenames must be a non-empty array.');
       }
 
-      const provisionFailures = await initFiles(filenames);
+      // P-SOV.C3b: files whose absence is a normal state (the terrain
+      // archive — not compiled in v0.1, DL-004) rather than an error.
+      const optional = new Set<string>(
+        Array.isArray(payload?.optionalFilenames) ? payload.optionalFilenames : [],
+      );
+      const { provisionFailures, optionalMissing } = await initFiles(filenames, optional);
 
       // Report the size of the first file for the UI status bar.
       const primaryHandle = handles.get(filenames[0]);
@@ -104,7 +109,7 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
       const response: WorkerResponseMessage = {
         id,
         type: 'MAP_INIT_SUCCESS',
-        payload: { size, provisionFailures } satisfies MapInitSuccessPayload,
+        payload: { size, provisionFailures, optionalMissing } satisfies MapInitSuccessPayload,
       };
       self.postMessage(response);
       return;
@@ -226,12 +231,18 @@ self.addEventListener('message', async (event: MessageEvent<WorkerRequestMessage
  * On device, a map exists only once the on-device compiler's archive is
  * bound through LOAD_OFFLINE_REGION (ARCHITECTURE.md P10).
  *
- * @returns Filenames that could not be provisioned (left as empty OPFS
- *          files) so the caller can surface a user-facing error instead of
- *          only logging to the console.
+ * @returns `provisionFailures`: required files that could not be provisioned
+ *          (left as empty OPFS files) so the caller can surface a user-facing
+ *          error instead of only logging to the console. `optionalMissing`:
+ *          files in `optional` that are simply absent — info-logged, never an
+ *          error (P-SOV.C3b: the terrain archive on every native build).
  */
-async function initFiles(filenames: string[]): Promise<string[]> {
+async function initFiles(
+  filenames: string[],
+  optional: Set<string>,
+): Promise<{ provisionFailures: string[]; optionalMissing: string[] }> {
   const provisionFailures: string[] = [];
+  const optionalMissing: string[] = [];
 
   for (const filename of filenames) {
     const handle = await getHandle(filename);
@@ -256,10 +267,15 @@ async function initFiles(filenames: string[]): Promise<string[]> {
       handle.flush();
       console.log(`[mapData.worker] Provisioned "${filename}" from dev assets. Size: ${handle.getSize()} bytes`);
     } catch (err) {
-      console.error(`[mapData.worker] Failed to provision "${filename}" (expected on native builds — no /local/ path):`, err);
-      provisionFailures.push(filename);
+      if (optional.has(filename)) {
+        console.info(`[mapData.worker] Optional "${filename}" is absent — continuing without it:`, err);
+        optionalMissing.push(filename);
+      } else {
+        console.error(`[mapData.worker] Failed to provision "${filename}" (expected on native builds — no /local/ path):`, err);
+        provisionFailures.push(filename);
+      }
     }
   }
 
-  return provisionFailures;
+  return { provisionFailures, optionalMissing };
 }

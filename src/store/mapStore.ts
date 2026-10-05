@@ -6,7 +6,9 @@ import { persist } from 'zustand/middleware';
 export interface OfflineRegion {
   regionLabel: string;
   basemapFile: string;
-  terrainFile: string;
+  /** null = the region brings no terrain archive (v0.1: every compiled
+   *  region, DL-004); the map keeps whatever terrain the boot found. */
+  terrainFile: string | null;
 }
 
 interface MapState {

@@ -3,6 +3,7 @@ package com.freehike.app
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
@@ -11,6 +12,10 @@ import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.File
 import uniffi.freehike.CompilationStatus
 import uniffi.freehike.CompileJob
+import uniffi.freehike.FetchKind
+import uniffi.freehike.FetchState
+import uniffi.freehike.FetchStatus
+import uniffi.freehike.fetchChunk
 import uniffi.freehike.ProgressCallback
 import uniffi.freehike.compileChunk
 import uniffi.freehike.emitTestProgress
@@ -48,6 +53,10 @@ class MapCompilerPlugin : Plugin() {
      */
     private val activeCancel = java.util.concurrent.atomic.AtomicReference<AtomicBoolean?>(null)
 
+    /** Cancellation token of the raw-input fetch loop RUNNING right now
+     *  (P-SOV.C2b); same ownership rules as [activeCancel]. */
+    private val activeFetchCancel = java.util.concurrent.atomic.AtomicReference<AtomicBoolean?>(null)
+
     /** Raised by handleOnDestroy (closes D007): the WebView is gone, so any
      *  running/queued foreground loop must stop WITHOUT purging — the
      *  durable checkpoint stays for the next session's resume. */
@@ -81,6 +90,7 @@ class MapCompilerPlugin : Plugin() {
         // with the WebView.
         destroyed = true
         activeCancel.get()?.set(true)
+        activeFetchCancel.get()?.set(true)
         executor.shutdownNow()
         if (active === this) active = null
         super.handleOnDestroy()
@@ -306,6 +316,216 @@ class MapCompilerPlugin : Plugin() {
     }
 
     // -----------------------------------------------------------------------
+    // Raw-input fetching (P-SOV.C2b) — the fetch_chunk budget-yield loop
+    // -----------------------------------------------------------------------
+
+    /**
+     * Where raw extracts live: source-keyed (`<pinned basename>`), shared
+     * across jobs, never deleted by acknowledge/cancel (the R2 "permanent
+     * region cache"); `purgeFetch` is the explicit release.
+     */
+    private fun rawDir(): String = context.filesDir.absolutePath + "/map_jobs/raw"
+
+    private fun fetchStateToJs(s: FetchState): JSObject =
+        JSObject()
+            .put("sourceId", s.sourceId)
+            .put("pinnedUrl", s.pinnedUrl)
+            .put("path", s.path)
+            .put("bytesHave", s.bytesHave.toLong())
+            .put("bytesTotal", s.bytesTotal.toLong())
+            .put("verified", s.verified)
+            .put("restarts", s.restarts.toLong())
+
+    /** The Rust source table. The WebView never names a host (P10a). */
+    @PluginMethod
+    fun listSources(call: PluginCall) {
+        executor.execute {
+            try {
+                val sources = JSArray()
+                uniffi.freehike.listSources().forEach { s ->
+                    sources.put(
+                        JSObject()
+                            .put("id", s.id)
+                            .put("label", s.label)
+                            .put("url", s.url)
+                            .put("kind", if (s.kind == FetchKind.OSM_PBF) "osmPbf" else "tiff")
+                    )
+                }
+                call.resolve(JSObject().put("sources", sources))
+            } catch (t: Throwable) {
+                call.reject("FFI listSources failed: ${t.message}", t as? Exception)
+            }
+        }
+    }
+
+    /**
+     * Drives `fetch_chunk` for `sourceId` until a terminal state, exactly
+     * like startJob drives compile_chunk: the engine owns the resume state
+     * on disk (sidecar + the data file's own length), cancellation is
+     * honoured between slices, and a WebView teardown stops the loop WITHOUT
+     * purging — the next fetchInputs resumes from the file's length.
+     * Progress streams as `fetchProgress` events; the call resolves with
+     * the terminal status (finished carries the verified file's path).
+     */
+    @PluginMethod
+    fun fetchInputs(call: PluginCall) {
+        val sourceId = call.getString("sourceId")
+        if (sourceId.isNullOrBlank()) {
+            call.reject("Missing required parameter: sourceId")
+            return
+        }
+        if (!isSafeSourceId(sourceId)) {
+            call.reject(UNSAFE_SOURCE_ID_MESSAGE)
+            return
+        }
+        val budgetMs = (call.getInt("budgetMs") ?: 5_000).coerceIn(0, 600_000)
+        val rawDir = rawDir()
+
+        val cancelToken = AtomicBoolean(false)
+        executor.execute {
+            activeFetchCancel.set(cancelToken)
+            try {
+                var slices = 0
+                while (true) {
+                    if (destroyed) {
+                        Log.i(TAG, "fetch $sourceId stopped by plugin destroy after $slices slices; state kept for resume")
+                        return@execute
+                    }
+                    if (cancelToken.get()) {
+                        Log.i(TAG, "fetch $sourceId cancelled after $slices slices; partial kept for resume")
+                        call.resolve(
+                            JSObject().put("status", "cancelled").put("sourceId", sourceId).put("slices", slices)
+                        )
+                        return@execute
+                    }
+
+                    val status = fetchChunk(sourceId, rawDir, budgetMs.toUInt(), fetchForwardingCallback())
+                    slices += 1
+
+                    when (status) {
+                        is FetchStatus.Yielded -> {
+                            val s = status.state
+                            Log.i(
+                                TAG,
+                                "fetch $sourceId slice $slices yielded: ${s.bytesHave}/${s.bytesTotal} bytes, restarts=${s.restarts}"
+                            )
+                            // Loop continues: the engine resumes from the file's length.
+                        }
+                        is FetchStatus.Finished -> {
+                            val s = status.state
+                            Log.i(TAG, "fetch $sourceId finished in $slices slices: ${s.bytesTotal} bytes at ${s.path}")
+                            call.resolve(
+                                JSObject()
+                                    .put("status", "finished")
+                                    .put("sourceId", sourceId)
+                                    .put("slices", slices)
+                                    .put("path", s.path)
+                            )
+                            return@execute
+                        }
+                        is FetchStatus.FailedFatal -> {
+                            Log.e(TAG, "fetch $sourceId failed after $slices slices: ${status.reason}")
+                            call.resolve(
+                                JSObject()
+                                    .put("status", "failed")
+                                    .put("sourceId", sourceId)
+                                    .put("slices", slices)
+                                    .put("reason", status.reason)
+                                    .put("transient", false)
+                            )
+                            return@execute
+                        }
+                        is FetchStatus.FailedTransient -> {
+                            // Network/disk refused the slice; durable state
+                            // untouched. Surface as retryable, don't spin.
+                            Log.w(TAG, "fetch $sourceId transient refusal after $slices slices: ${status.reason}")
+                            call.resolve(
+                                JSObject()
+                                    .put("status", "failed")
+                                    .put("sourceId", sourceId)
+                                    .put("slices", slices)
+                                    .put("reason", status.reason)
+                                    .put("transient", true)
+                            )
+                            return@execute
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                call.reject("FFI fetchChunk failed: ${t.message}", t as? Exception)
+            } finally {
+                activeFetchCancel.compareAndSet(cancelToken, null)
+            }
+        }
+    }
+
+    /** Requests cancellation of the RUNNING fetch (honoured between slices). */
+    @PluginMethod
+    fun cancelFetch(call: PluginCall) {
+        val token = activeFetchCancel.get()
+        token?.set(true)
+        call.resolve(JSObject().put("requested", token != null))
+    }
+
+    /** Durable fetch state for a source (`found: false` if never resolved). */
+    @PluginMethod
+    fun queryFetch(call: PluginCall) {
+        val sourceId = call.getString("sourceId")
+        if (sourceId.isNullOrBlank()) {
+            call.reject("Missing required parameter: sourceId")
+            return
+        }
+        if (!isSafeSourceId(sourceId)) {
+            call.reject(UNSAFE_SOURCE_ID_MESSAGE)
+            return
+        }
+        executor.execute {
+            try {
+                val state = uniffi.freehike.queryFetch(sourceId, rawDir())
+                if (state == null) {
+                    call.resolve(JSObject().put("found", false))
+                } else {
+                    call.resolve(JSObject().put("found", true).put("state", fetchStateToJs(state)))
+                }
+            } catch (t: Throwable) {
+                call.reject("FFI queryFetch failed: ${t.message}", t as? Exception)
+            }
+        }
+    }
+
+    /** Removes a source's sidecar and data file (partial or complete). */
+    @PluginMethod
+    fun purgeFetch(call: PluginCall) {
+        val sourceId = call.getString("sourceId")
+        if (sourceId.isNullOrBlank()) {
+            call.reject("Missing required parameter: sourceId")
+            return
+        }
+        if (!isSafeSourceId(sourceId)) {
+            call.reject(UNSAFE_SOURCE_ID_MESSAGE)
+            return
+        }
+        executor.execute {
+            try {
+                call.resolve(JSObject().put("purged", uniffi.freehike.purgeFetch(sourceId, rawDir())))
+            } catch (t: Throwable) {
+                call.reject("FFI purgeFetch failed: ${t.message}", t as? Exception)
+            }
+        }
+    }
+
+    /** Adapts the UniFFI callback onto the `fetchProgress` event. */
+    private fun fetchForwardingCallback(): ProgressCallback =
+        object : ProgressCallback {
+            override fun onProgress(percentage: Float, status: String) {
+                notifyListeners(
+                    EVENT_FETCH_PROGRESS,
+                    JSObject().put("percentage", percentage.toDouble()).put("status", status)
+                )
+            }
+        }
+
+    // -----------------------------------------------------------------------
     // Background compilation (P8.C3) — mirrors the iOS P8.C2 surface
     // -----------------------------------------------------------------------
 
@@ -322,6 +542,15 @@ class MapCompilerPlugin : Plugin() {
      */
     @PluginMethod
     fun enqueueBackgroundJob(call: PluginCall) {
+        val sourceId = call.getString("sourceId")
+        if (sourceId.isNullOrBlank()) {
+            call.reject("Missing required parameter: sourceId (see listSources)")
+            return
+        }
+        if (!isSafeSourceId(sourceId)) {
+            call.reject(UNSAFE_SOURCE_ID_MESSAGE)
+            return
+        }
         val bbox = call.getString("bbox")
         if (bbox.isNullOrBlank()) {
             call.reject("Missing required parameter: bbox (\"west,south,east,north\")")
@@ -337,6 +566,17 @@ class MapCompilerPlugin : Plugin() {
         val jobsDir = context.filesDir.absolutePath + "/map_jobs"
 
         executor.execute {
+            // D6 gate (P-SOV.C2b step 6): the record's pbfPath is the
+            // Rust-verified file or nothing. The JS layer pre-checks the same
+            // state so the UI can explain; THIS reject is the authority (the
+            // JS view can be stale). Terrain is not compiled in v0.1 —
+            // demPath is null, never a placeholder.
+            val fetched = uniffi.freehike.queryFetch(sourceId, rawDir())
+            if (fetched == null || !fetched.verified || fetched.path.isEmpty()) {
+                call.reject("Inputs for $sourceId are not verified; fetch them first (fetchInputs)")
+                return@execute
+            }
+
             val existing = PendingJobStore.loadAny(context)
             if (existing != null) {
                 val remedy = if (existing.state == PendingJobStore.STATE_PENDING) {
@@ -359,12 +599,13 @@ class MapCompilerPlugin : Plugin() {
                     bbox = bbox,
                     minZoom = minZoom,
                     maxZoom = maxZoom,
-                    pbfPath = "$jobsDir/raw/$jobId.osm.pbf",
-                    demPath = "$jobsDir/raw/$jobId.dem.tif",
+                    pbfPath = fetched.path,
+                    demPath = null,
                     outputDir = jobsDir,
                     reason = null,
                     blocksTotal = 0,
                     bytesWritten = 0,
+                    sourceId = sourceId,
                 )
             )
             BackgroundCompileWorker.enqueue(context)
@@ -530,6 +771,15 @@ class MapCompilerPlugin : Plugin() {
         private const val EVENT_PROGRESS = "compilationProgress"
         private const val EVENT_STATUS = "compilationStatus"
         private const val EVENT_BACKGROUND = "backgroundCompile"
+        private const val EVENT_FETCH_PROGRESS = "fetchProgress"
+
+        /** Source ids come from the Rust table (`[a-z0-9-]`); they name the
+         *  sidecar file `<sourceId>.fetch` under the raw dir. */
+        private val SAFE_SOURCE_ID = Regex("^[a-z0-9-]{1,64}$")
+        private const val UNSAFE_SOURCE_ID_MESSAGE =
+            "Invalid sourceId: only [a-z0-9-] allowed, max 64 chars"
+
+        private fun isSafeSourceId(sourceId: String): Boolean = SAFE_SOURCE_ID.matches(sourceId)
 
         /**
          * jobId names on-disk files under the sandbox (`{jobId}.pmtiles`,

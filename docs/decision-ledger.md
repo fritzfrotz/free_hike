@@ -36,3 +36,12 @@ Prefix convention: DL-### = decision ledger, D### = tracker debt.
 
 ## Backlog (to backfill in finish-line Phase 3)
 Valhalla over GraphHopper · redb · FlatGeobuf · on-device compile over server tiles · 50MB dirty-heap ceiling (out-of-core) · checkpointed resume · OPFS · PMTiles output · terrain real-or-cut
+
+## DL-004 · Cut real terrain from v0.1; delete the placeholder (2026-09-16)
+- Optimizing for: an honest demo by 2026-09-28 with zero slack.
+- Traded away: hillshade/contours on the demo map; the real terrain path (4–6 chunks incl. a DEFLATE dependency gate, per the 2026-09-15 inventory).
+- Premises: the thesis is compile-on-device, and terrain isn't the server's job; the real path is deferred, not dead — stretch candidate ranked ahead of routing, decided when Phases 1–3 close.
+- Scope of the closing chunk: delete the simulated Terrain block loop from the job engine (`demPath = null` is the only path, not a skip; the terrain crate stays in the tree, unused by jobs), map style tolerates an absent terrain archive, AND the D6 Rust belt (`to_job_spec` refuses a `pbf_path` without a verified sidecar). Chunk plan: P-SOV.C3 (LOOPLOG).
+- Prediction (operator): "I expect the terrain cut to be one small chunk; wrong if Code stops at the checkpoint-semantics gate or it needs a second chunk." (Recorded with the chunk already including the belt.)
+- Prediction (Claude, second opinion): one chunk at the proposed budget; the engine deletion and the belt are mechanical, the risk is the map style — wrong if "no terrain archive" needs more than removing the terrain/hillshade/contour wiring from MapView (i.e. the style JSON itself has to fork).
+- Checkpoint: when P-SOV.C3 closes. Verdict: ___

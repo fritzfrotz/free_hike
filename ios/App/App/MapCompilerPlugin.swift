@@ -27,6 +27,13 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "queryBackgroundJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "acknowledgeBackgroundJob", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "cancelBackgroundJob", returnType: CAPPluginReturnPromise),
+        // P-SOV.C2b — raw-input fetching (UNVERIFIED on this machine: no
+        // iphoneos SDK, tracker D004; mirrors the Kotlin implementation).
+        CAPPluginMethod(name: "listSources", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "fetchInputs", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cancelFetch", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "queryFetch", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "purgeFetch", returnType: CAPPluginReturnPromise),
     ]
 
     /// The live plugin instance, if the WebView is up. The background
@@ -78,6 +85,142 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
         cancelLock.lock()
         defer { cancelLock.unlock() }
         return cancelRequested
+    }
+
+    /// Cancellation flag for the running raw-input fetch (P-SOV.C2b), same
+    /// idiom as the compile flag, checked between fetch slices.
+    private var fetchCancelRequested = false
+
+    private func setFetchCancel(_ value: Bool) {
+        cancelLock.lock()
+        fetchCancelRequested = value
+        cancelLock.unlock()
+    }
+
+    private func isFetchCancelRequested() -> Bool {
+        cancelLock.lock()
+        defer { cancelLock.unlock() }
+        return fetchCancelRequested
+    }
+
+    static let unsafeSourceIdMessage = "Invalid sourceId: only [a-z0-9-] allowed, max 64 chars"
+
+    /// Source ids come from the Rust table; they name `<sourceId>.fetch`.
+    static func isSafeSourceId(_ id: String) -> Bool {
+        !id.isEmpty
+            && id.count <= 64
+            && id.allSatisfy { $0.isASCII && (($0.isLetter && $0.isLowercase) || $0.isNumber || $0 == "-") }
+    }
+
+    /// Where raw extracts live: source-keyed, shared across jobs, never
+    /// deleted by acknowledge/cancel; `purgeFetch` is the explicit release.
+    static func rawDir() -> String { defaultJobsDir() + "/raw" }
+
+    private static func fetchStateToJs(_ s: FetchState) -> [String: Any] {
+        [
+            "sourceId": s.sourceId,
+            "pinnedUrl": s.pinnedUrl,
+            "path": s.path,
+            "bytesHave": Int(s.bytesHave),
+            "bytesTotal": Int(s.bytesTotal),
+            "verified": s.verified,
+            "restarts": Int(s.restarts),
+        ]
+    }
+
+    // -----------------------------------------------------------------------
+    // Raw-input fetching (P-SOV.C2b) — UNVERIFIED (D004)
+    // -----------------------------------------------------------------------
+
+    /// The Rust source table. The WebView never names a host (P10a).
+    @objc func listSources(_ call: CAPPluginCall) {
+        ffiQueue.async {
+            let sources: [[String: Any]] = ffiListSources().map { s in
+                [
+                    "id": s.id,
+                    "label": s.label,
+                    "url": s.url,
+                    "kind": s.kind == .osmPbf ? "osmPbf" : "tiff",
+                ]
+            }
+            call.resolve(["sources": sources])
+        }
+    }
+
+    /// Drives `fetchChunk` until a terminal state, the same way startJob
+    /// drives compileChunk: resume state lives on disk (sidecar + the data
+    /// file's length), cancellation is honoured between slices.
+    @objc func fetchInputs(_ call: CAPPluginCall) {
+        guard let sourceId = call.getString("sourceId"), !sourceId.isEmpty else {
+            call.reject("Missing required parameter: sourceId")
+            return
+        }
+        guard MapCompilerPlugin.isSafeSourceId(sourceId) else {
+            call.reject(MapCompilerPlugin.unsafeSourceIdMessage)
+            return
+        }
+        let budgetMs = UInt32(max(0, min(call.getInt("budgetMs") ?? 5_000, 600_000)))
+        let rawDir = MapCompilerPlugin.rawDir()
+        setFetchCancel(false)
+        let forwarder = FetchForwardingProgress(plugin: self)
+
+        ffiQueue.async { [weak self] in
+            guard let self else { return }
+            var slices = 0
+            while true {
+                if self.isFetchCancelRequested() {
+                    call.resolve(["status": "cancelled", "sourceId": sourceId, "slices": slices])
+                    return
+                }
+                let status = fetchChunk(sourceId: sourceId, destDir: rawDir, budgetMs: budgetMs, callback: forwarder)
+                slices += 1
+                switch status {
+                case .yielded(let state):
+                    CAPLog.print("⚡️ fetch \(sourceId) slice \(slices) yielded \(state.bytesHave)/\(state.bytesTotal)")
+                case .finished(let state):
+                    call.resolve(["status": "finished", "sourceId": sourceId, "slices": slices, "path": state.path])
+                    return
+                case .failedFatal(let reason):
+                    call.resolve(["status": "failed", "sourceId": sourceId, "slices": slices, "reason": reason, "transient": false])
+                    return
+                case .failedTransient(let reason):
+                    call.resolve(["status": "failed", "sourceId": sourceId, "slices": slices, "reason": reason, "transient": true])
+                    return
+                }
+            }
+        }
+    }
+
+    /// Requests cancellation of the running fetch (honoured between slices).
+    @objc func cancelFetch(_ call: CAPPluginCall) {
+        setFetchCancel(true)
+        call.resolve(["requested": true])
+    }
+
+    /// Durable fetch state for a source (`found: false` if never resolved).
+    @objc func queryFetch(_ call: CAPPluginCall) {
+        guard let sourceId = call.getString("sourceId"), MapCompilerPlugin.isSafeSourceId(sourceId) else {
+            call.reject(MapCompilerPlugin.unsafeSourceIdMessage)
+            return
+        }
+        ffiQueue.async {
+            guard let state = ffiQueryFetch(sourceId, MapCompilerPlugin.rawDir()) else {
+                call.resolve(["found": false])
+                return
+            }
+            call.resolve(["found": true, "state": MapCompilerPlugin.fetchStateToJs(state)])
+        }
+    }
+
+    /// Removes a source's sidecar and data file (partial or complete).
+    @objc func purgeFetch(_ call: CAPPluginCall) {
+        guard let sourceId = call.getString("sourceId"), MapCompilerPlugin.isSafeSourceId(sourceId) else {
+            call.reject(MapCompilerPlugin.unsafeSourceIdMessage)
+            return
+        }
+        ffiQueue.async {
+            call.resolve(["purged": ffiPurgeFetch(sourceId, MapCompilerPlugin.rawDir())])
+        }
     }
 
     /// Smoke test: proves the Rust core is linked and callable.
@@ -242,6 +385,10 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
     /// then submits the scheduler request. iOS decides when the window opens
     /// (our request: external power, no network needed).
     @objc func enqueueBackgroundJob(_ call: CAPPluginCall) {
+        guard let sourceId = call.getString("sourceId"), MapCompilerPlugin.isSafeSourceId(sourceId) else {
+            call.reject("Missing or invalid sourceId (see listSources)")
+            return
+        }
         guard let bbox = call.getString("bbox"), !bbox.isEmpty else {
             call.reject("Missing required parameter: bbox (\"west,south,east,north\")")
             return
@@ -254,6 +401,16 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
         let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 5, 22)))
         let maxZoom = UInt8(max(0, min(call.getInt("maxZoom") ?? 14, 22)))
         let jobsDir = defaultJobsDir()
+
+        // D6 gate (P-SOV.C2b step 6, Kotlin parity): the record's pbfPath
+        // is the Rust-verified file or nothing; this reject is the
+        // authority over the JS pre-check. Terrain is not compiled in v0.1 —
+        // demPath is nil, never a placeholder.
+        guard let fetched = ffiQueryFetch(sourceId, MapCompilerPlugin.rawDir()),
+              fetched.verified, !fetched.path.isEmpty else {
+            call.reject("Inputs for \(sourceId) are not verified; fetch them first (fetchInputs)")
+            return
+        }
 
         // Enforced single-slot invariant (D005 parity): saving over an
         // existing record would orphan a finished job's archive or yank a
@@ -276,14 +433,15 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             bbox: bbox,
             minZoom: minZoom,
             maxZoom: maxZoom,
-            pbfPath: "\(jobsDir)/raw/\(jobId).osm.pbf",
-            demPath: "\(jobsDir)/raw/\(jobId).dem.tif",
+            pbfPath: fetched.path,
+            demPath: nil,
             outputDir: jobsDir,
             reason: nil,
             blocksTotal: nil,
             bytesWritten: nil,
             dirtyAttempts: 0,
-            cleanStop: false
+            cleanStop: false,
+            sourceId: sourceId
         )
 
         do {
@@ -420,6 +578,34 @@ private final class BridgeForwardingProgress: ProgressCallback, @unchecked Senda
             "compilationProgress",
             data: ["percentage": percentage, "status": status]
         )
+    }
+}
+
+/// Top-level trampolines to the UniFFI free functions whose names the plugin
+/// class shadows with its own `@objc` methods (`listSources`, `queryFetch`,
+/// `purgeFetch`); same reason as `ffiEmitTestProgress` below.
+private func ffiListSources() -> [FetchSource] {
+    listSources()
+}
+
+private func ffiQueryFetch(_ sourceId: String, _ destDir: String) -> FetchState? {
+    queryFetch(sourceId: sourceId, destDir: destDir)
+}
+
+private func ffiPurgeFetch(_ sourceId: String, _ destDir: String) -> Bool {
+    purgeFetch(sourceId: sourceId, destDir: destDir)
+}
+
+/// Adapts the UniFFI callback onto the `fetchProgress` event.
+private final class FetchForwardingProgress: ProgressCallback, @unchecked Sendable {
+    private weak var plugin: CAPPlugin?
+
+    init(plugin: CAPPlugin) {
+        self.plugin = plugin
+    }
+
+    func onProgress(percentage: Float, status: String) {
+        plugin?.notifyListeners("fetchProgress", data: ["percentage": percentage, "status": status])
     }
 }
 
@@ -754,6 +940,9 @@ enum PendingJobStore {
         /// Set just before every deliberate window handback; consumed (and
         /// cleared) at the next window's start.
         var cleanStop: Bool?
+        /// Source id the verified `pbfPath` came from (P-SOV.C2b). Optional
+        /// so pre-fetch JSON records keep decoding.
+        var sourceId: String?
 
         var archivePath: String { "\(outputDir)/\(jobId).pmtiles" }
 

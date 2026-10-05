@@ -257,3 +257,27 @@ describe('handleJobFinished — foreground finish (P9.C7 fixed contract, ex-D008
     errSpy.mockRestore();
   });
 });
+
+describe('fetch stage (P-SOV.C2b) — coarse, low-frequency only', () => {
+  it('fetch_stage_transitions', () => {
+    const s = useCompilerStore.getState();
+    expect(s.fetchStage).toBe('idle');
+    expect(s.activeSourceId).toBeNull();
+    expect(s.fetchError).toBeNull();
+
+    s.setFetchStage('fetching', 'geofabrik-portugal');
+    expect(useCompilerStore.getState().fetchStage).toBe('fetching');
+    expect(useCompilerStore.getState().activeSourceId).toBe('geofabrik-portugal');
+
+    s.setFetchStage('error', 'geofabrik-portugal', 'md5 mismatch');
+    expect(useCompilerStore.getState().fetchStage).toBe('error');
+    expect(useCompilerStore.getState().fetchError).toBe('md5 mismatch');
+
+    s.setFetchStage('ready', 'geofabrik-portugal');
+    expect(useCompilerStore.getState().fetchError).toBeNull();
+
+    s.setFetchStage('idle');
+    expect(useCompilerStore.getState().activeSourceId).toBeNull();
+    expect(useCompilerStore.getState().fetchError).toBeNull();
+  });
+});

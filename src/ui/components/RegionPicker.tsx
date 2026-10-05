@@ -1,49 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useCompilerStore } from '../../store/compilerStore';
 import { useMapStore } from '../../store/mapStore';
-import { enqueueRegionDownload, COMPILE_MIN_ZOOM, COMPILE_MAX_ZOOM } from '../../services/regionCompiler';
+import {
+  COMPILE_MAX_ZOOM,
+  COMPILE_MIN_ZOOM,
+  DEMO_SOURCE_ID,
+  ensureInputs,
+  enqueueRegionDownload,
+  verifiedInputPath,
+} from '../../services/regionCompiler';
+import FetchProgressBar from './FetchProgressBar';
 
 /**
- * P9.C2 — hardcoded test regions for the background-compile pipeline. Bboxes
- * are "west,south,east,north" WGS84, all inside the Innsbruck fixture
- * coverage the native engine's sandbox inputs describe. A drawn bounding-box
- * selector replaces this list in a later chunk.
+ * P-SOV.C2b — the one v0.1 demo region (DL-003): Portugal via Geofabrik,
+ * demo area Lisbon / Sintra / Arrábida. The raw extract is fetched natively
+ * (step 1) and only a verified file can be compiled (step 2). Bbox is
+ * "west,south,east,north" WGS84.
  */
-interface CompileRegion {
-  /** Filesystem-safe slug — becomes part of the jobId, which in turn names
-   *  the native archive and its OPFS copy (`{jobId}.pmtiles`). */
-  slug: string;
-  name: string;
-  detail: string;
-  bbox: string;
-  /** Rough compiled-archive estimate shown in the card, purely informative. */
-  sizeHint: string;
-}
-
-const TEST_REGIONS: CompileRegion[] = [
-  {
-    slug: 'innsbruck-area',
-    name: 'Innsbruck Area',
-    detail: 'City + Nordkette · Tyrol, Austria',
-    bbox: '11.1,47.1,11.6,47.45',
-    sizeHint: '~15 MB',
-  },
-  {
-    slug: 'innsbruck-wide',
-    name: 'Innsbruck Wide',
-    detail: 'Inn valley + Stubai approaches',
-    bbox: '10.9,47.0,11.8,47.5',
-    sizeHint: '~40 MB',
-  },
-  {
-    slug: 'patscherkofel',
-    name: 'Patscherkofel',
-    detail: 'Summit trails south of the Inn',
-    bbox: '11.35,47.15,11.55,47.25',
-    sizeHint: '~6 MB',
-  },
-];
+const DEMO_REGION = {
+  sourceId: DEMO_SOURCE_ID,
+  name: 'Portugal',
+  detail: 'Lisbon · Sintra · Arrábida — Geofabrik daily extract',
+  bbox: '-9.55,38.38,-8.75,38.95',
+  sizeHint: '~403 MiB download',
+};
 
 type SubmitState = 'idle' | 'submitting' | 'queued' | 'error';
 
@@ -53,34 +34,60 @@ interface RegionPickerProps {
 }
 
 /**
- * Bottom-sheet for queuing a background offline compile.
+ * Bottom-sheet for the two-step region flow.
  *
- * Confirming calls MapCompiler.enqueueBackgroundJob() — the OS then owns the
- * job (BGProcessingTask / WorkManager, charging-gated), and the result flows
- * back through the P9.C1 discovery → OPFS ingest → hot-swap pipeline with no
- * further involvement from this component. Because the native PendingJobStore
- * is single-job by design (a second enqueue would overwrite the record), the
- * confirm button hard-disables while `isBackgroundCompiling` reports a
- * queued/running job.
+ * Step 1 (Download) drives MapCompiler.fetchInputs through
+ * regionCompiler.ensureInputs — resumable across kills, cancellable between
+ * slices. Step 2 (Compile) calls MapCompiler.enqueueBackgroundJob with the
+ * SOURCE ID; the native layer resolves the verified file and refuses
+ * anything else (D6). The native PendingJobStore is single-job, so the
+ * compile button hard-disables while a job is queued.
  */
 export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
   const isBackgroundCompiling = useCompilerStore((s) => s.isBackgroundCompiling);
+  const fetchStage = useCompilerStore((s) => s.fetchStage);
 
-  const [selectedSlug, setSelectedSlug] = useState<string>(TEST_REGIONS[0].slug);
   const [submitState, setSubmitState] = useState<SubmitState>('idle');
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
+  // On open, discover an already-verified extract (previous session) so the
+  // sheet opens on step 2. Native-only: the web build's rejection is ignored.
+  useEffect(() => {
+    if (!isOpen || fetchStage !== 'idle') return;
+    let cancelled = false;
+    void verifiedInputPath(DEMO_REGION.sourceId)
+      .then((path) => {
+        if (!cancelled && path) {
+          useCompilerStore.getState().setFetchStage('ready', DEMO_REGION.sourceId);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, fetchStage]);
 
   if (!isOpen) return null;
 
-  const selected = TEST_REGIONS.find((r) => r.slug === selectedSlug) ?? TEST_REGIONS[0];
-  const busy = isBackgroundCompiling || submitState === 'submitting';
+  const inputsReady = fetchStage === 'ready';
+  const fetching = fetchStage === 'fetching';
+  const busy = isBackgroundCompiling || submitState === 'submitting' || fetching;
+
+  const handleDownload = async () => {
+    if (fetching || inputsReady) return;
+    setFetchError(null);
+    const result = await ensureInputs(DEMO_REGION.sourceId);
+    if (!result.ready && !result.cancelled) {
+      setFetchError(result.error ?? 'Unknown download failure.');
+    }
+  };
 
   const handleConfirm = async () => {
-    if (busy) return;
+    if (busy || !inputsReady) return;
     setSubmitState('submitting');
     setSubmitError(null);
-
-    const result = await enqueueRegionDownload(selected.name, selected.bbox);
+    const result = await enqueueRegionDownload(DEMO_REGION.sourceId, DEMO_REGION.name, DEMO_REGION.bbox);
     if (result.queued) {
       setSubmitState('queued');
     } else {
@@ -90,9 +97,10 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
   };
 
   /** P9.C3: hand off to the map's fixed-reticle selection mode — the sheet
-   *  closes and RegionSelectorOverlay (MapView) takes over. */
+   *  closes and RegionSelectorOverlay (MapView) takes over. The overlay's
+   *  enqueue goes through the same D6 gate, so it needs step 1 done too. */
   const handleCustomArea = () => {
-    if (busy) return;
+    if (busy || !inputsReady) return;
     useMapStore.getState().setSelectingRegion(true);
     onClose();
   };
@@ -116,8 +124,8 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
               </svg>
             </div>
             <div>
-              <h2 className="text-sm font-bold text-slate-100 tracking-tight">Compile Offline Region</h2>
-              <p className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">Background · Runs While Charging</p>
+              <h2 className="text-sm font-bold text-slate-100 tracking-tight">Offline Region</h2>
+              <p className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">1 · Download raw data &nbsp; 2 · Compile while charging</p>
             </div>
           </div>
 
@@ -132,57 +140,47 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
           </button>
         </div>
 
-        {/* Region list */}
+        {/* Region + step 1 */}
         <div className="flex-1 overflow-y-auto p-6 space-y-3">
-          {TEST_REGIONS.map((region) => {
-            const isSelected = region.slug === selectedSlug;
-            return (
-              <button
-                key={region.slug}
-                onClick={() => setSelectedSlug(region.slug)}
-                disabled={busy}
-                className={[
-                  'w-full text-left p-4 rounded-2xl border transition-all cursor-pointer disabled:opacity-50 disabled:cursor-default',
-                  isSelected
-                    ? 'bg-emerald-500/10 border-emerald-500/40'
-                    : 'bg-slate-950/50 border-slate-800/60 hover:border-slate-700/60',
-                ].join(' ')}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <h4 className={`text-xs font-bold truncate ${isSelected ? 'text-emerald-300' : 'text-slate-200'}`}>
-                      {region.name}
-                    </h4>
-                    <p className="text-[10px] font-mono text-slate-500 mt-0.5 truncate">{region.detail}</p>
-                    <p className="text-[9px] font-mono text-slate-600 mt-1">bbox {region.bbox} · z{COMPILE_MIN_ZOOM}–{COMPILE_MAX_ZOOM}</p>
-                  </div>
-                  <div className="flex flex-col items-end gap-1.5 shrink-0">
-                    <span className="text-[10px] font-mono text-slate-500">{region.sizeHint}</span>
-                    <span
-                      className={[
-                        'h-4 w-4 rounded-full border-2 flex items-center justify-center',
-                        isSelected ? 'border-emerald-400' : 'border-slate-700',
-                      ].join(' ')}
-                    >
-                      {isSelected && <span className="h-2 w-2 rounded-full bg-emerald-400" />}
-                    </span>
-                  </div>
-                </div>
-              </button>
-            );
-          })}
+          <div className="w-full text-left p-4 rounded-2xl border bg-emerald-500/10 border-emerald-500/40">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h4 className="text-xs font-bold truncate text-emerald-300">{DEMO_REGION.name}</h4>
+                <p className="text-[10px] font-mono text-slate-500 mt-0.5 truncate">{DEMO_REGION.detail}</p>
+                <p className="text-[9px] font-mono text-slate-600 mt-1">bbox {DEMO_REGION.bbox} · z{COMPILE_MIN_ZOOM}–{COMPILE_MAX_ZOOM}</p>
+              </div>
+              <span className="text-[10px] font-mono text-slate-500 shrink-0">{DEMO_REGION.sizeHint}</span>
+            </div>
+          </div>
+
+          <button
+            onClick={handleDownload}
+            disabled={fetching || inputsReady}
+            className="w-full flex items-center justify-center gap-2.5 px-6 py-3 rounded-xl border border-teal-500/40 bg-teal-500/10 text-teal-200 font-semibold text-sm hover:bg-teal-500/20 transition-all cursor-pointer disabled:opacity-40 disabled:pointer-events-none"
+          >
+            {inputsReady ? '1 · Region data on device' : fetching ? '1 · Downloading…' : '1 · Download region data'}
+          </button>
+
+          <FetchProgressBar />
+
+          {fetchError && (
+            <div className="flex items-center gap-2.5 p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
+              <span className="h-2 w-2 rounded-full bg-rose-500 shrink-0" />
+              <span><strong>Couldn't download:</strong> {fetchError}</span>
+            </div>
+          )}
 
           {/* Custom area — hands off to the map's fixed-reticle selection mode */}
           <button
             onClick={handleCustomArea}
-            disabled={busy}
+            disabled={busy || !inputsReady}
             className="w-full text-left p-4 rounded-2xl border-2 border-dashed border-slate-700/70 bg-slate-950/30 hover:border-emerald-500/40 hover:bg-emerald-500/5 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-default"
           >
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <h4 className="text-xs font-bold text-slate-200">Custom Area</h4>
                 <p className="text-[10px] font-mono text-slate-500 mt-0.5">
-                  Frame any area on the map with a selection reticle
+                  Frame any area inside the downloaded extract with a selection reticle
                 </p>
               </div>
               <svg className="h-5 w-5 text-slate-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8}>
@@ -192,7 +190,7 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
           </button>
         </div>
 
-        {/* Footer: status + confirm */}
+        {/* Footer: status + step 2 */}
         <div className="p-6 border-t border-slate-800/80 space-y-3">
           {isBackgroundCompiling && (
             <div className="flex items-center gap-2.5 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300">
@@ -220,7 +218,7 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
 
           <button
             onClick={handleConfirm}
-            disabled={busy}
+            disabled={busy || !inputsReady}
             className="w-full flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-slate-950 font-bold text-sm hover:from-emerald-400 hover:to-teal-400 transition-all active:scale-[0.98] shadow-lg shadow-emerald-500/20 cursor-pointer disabled:opacity-40 disabled:pointer-events-none"
           >
             {isBackgroundCompiling ? (
@@ -231,12 +229,7 @@ export default function RegionPicker({ isOpen, onClose }: RegionPickerProps) {
                 Queuing…
               </>
             ) : (
-              <>
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" />
-                </svg>
-                Compile "{selected.name}" in Background
-              </>
+              <>2 · Compile "{DEMO_REGION.name}" in Background</>
             )}
           </button>
         </div>

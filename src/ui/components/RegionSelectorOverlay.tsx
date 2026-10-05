@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type maplibregl from 'maplibre-gl';
 import { useMapStore } from '../../store/mapStore';
 import { useCompilerStore } from '../../store/compilerStore';
-import { enqueueRegionDownload } from '../../services/regionCompiler';
+import { DEMO_SOURCE_ID, enqueueRegionDownload } from '../../services/regionCompiler';
 
 /** Reticle footprint as fractions of the map container — MUST stay in sync
  *  with the rendered box below (width/height style) since the geographic
@@ -134,7 +134,7 @@ export default function RegionSelectorOverlay({ map }: { map: maplibregl.Map }) 
     // Bounds are computed at CONFIRM time from the live camera — the
     // readout refs are display-only and never read back.
     const { bbox } = computeReticleBounds(map);
-    const result = await enqueueRegionDownload('Custom Region', bbox);
+    const result = await enqueueRegionDownload(DEMO_SOURCE_ID, 'Custom Region', bbox);
 
     if (result.queued) {
       useMapStore.getState().setSelectingRegion(false);

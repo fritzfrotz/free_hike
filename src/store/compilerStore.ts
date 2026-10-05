@@ -61,6 +61,13 @@ export interface BackgroundProgress {
 const IDLE_PROGRESS: BackgroundProgress = { stage: 'idle', jobId: null, error: null };
 
 /**
+ * Coarse stage of the raw-input fetch (P-SOV.C2b). Byte progress never
+ * lands here — it flows through services/fetchProgress into
+ * FetchProgressBar's rAF loop.
+ */
+export type FetchStage = 'idle' | 'fetching' | 'ready' | 'error';
+
+/**
  * Re-entrancy guard for ingestHandoffJob: cold-boot discovery and a
  * 'backgroundCompile' event can race (both call discoverBackgroundJobs, and
  * the native record stays 'finished' until acknowledged), so the same job
@@ -94,9 +101,18 @@ interface CompilerState {
    *  failed (native record unacknowledged, so retry is safe). */
   pendingHandoffJobs: PendingHandoffJob[];
 
+  // ── P-SOV.C2b: raw-input fetch (two-step region flow) ─────────────────────
+  fetchStage: FetchStage;
+  /** Source being (or last) fetched; null when idle. */
+  activeSourceId: string | null;
+  /** Human-readable failure when fetchStage === 'error'. */
+  fetchError: string | null;
+
   setCompiling: (isCompiling: boolean) => void;
   setPhase: (phase: string) => void;
   setThermalThrottling: (throttling: boolean) => void;
+  /** 'idle' clears the source and error; 'error' requires a reason. */
+  setFetchStage: (stage: FetchStage, sourceId?: string, error?: string) => void;
 
   /**
    * Discovers the durable background-job record and dispatches on its state.
@@ -154,10 +170,19 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
   isBackgroundCompiling: false,
   backgroundProgress: IDLE_PROGRESS,
   pendingHandoffJobs: [],
+  fetchStage: 'idle',
+  activeSourceId: null,
+  fetchError: null,
 
   setCompiling: (isCompiling) => set({ isCompiling }),
   setPhase: (currentPhase) => set({ currentPhase }),
   setThermalThrottling: (thermalThrottling) => set({ thermalThrottling }),
+  setFetchStage: (stage, sourceId, error) =>
+    set({
+      fetchStage: stage,
+      activeSourceId: stage === 'idle' ? null : (sourceId ?? get().activeSourceId),
+      fetchError: stage === 'error' ? (error ?? 'Download failed.') : null,
+    }),
 
   discoverBackgroundJobs: async () => {
     let record;

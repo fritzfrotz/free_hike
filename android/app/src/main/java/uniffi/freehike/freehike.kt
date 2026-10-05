@@ -746,6 +746,14 @@ internal open class UniffiVTableCallbackInterfaceProgressCallback(
 
 
 
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -767,9 +775,17 @@ fun uniffi_freehike_ffi_checksum_func_emit_test_progress(
 ): Short
 fun uniffi_freehike_ffi_checksum_func_engine_version(
 ): Short
+fun uniffi_freehike_ffi_checksum_func_fetch_chunk(
+): Short
+fun uniffi_freehike_ffi_checksum_func_list_sources(
+): Short
+fun uniffi_freehike_ffi_checksum_func_purge_fetch(
+): Short
 fun uniffi_freehike_ffi_checksum_func_purge_job(
 ): Short
 fun uniffi_freehike_ffi_checksum_func_query_checkpoint(
+): Short
+fun uniffi_freehike_ffi_checksum_func_query_fetch(
 ): Short
 fun uniffi_freehike_ffi_checksum_func_set_thermal_state(
 ): Short
@@ -831,9 +847,17 @@ fun uniffi_freehike_ffi_fn_func_emit_test_progress(`callback`: Long,`steps`: Int
 ): Int
 fun uniffi_freehike_ffi_fn_func_engine_version(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_freehike_ffi_fn_func_fetch_chunk(`sourceId`: RustBuffer.ByValue,`destDir`: RustBuffer.ByValue,`budgetMs`: Int,`callback`: Long,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freehike_ffi_fn_func_list_sources(uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freehike_ffi_fn_func_purge_fetch(`sourceId`: RustBuffer.ByValue,`destDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_freehike_ffi_fn_func_purge_job(`jobId`: RustBuffer.ByValue,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Byte
 fun uniffi_freehike_ffi_fn_func_query_checkpoint(`jobId`: RustBuffer.ByValue,`outputDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_freehike_ffi_fn_func_query_fetch(`sourceId`: RustBuffer.ByValue,`destDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_freehike_ffi_fn_func_set_thermal_state(`state`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
@@ -974,10 +998,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_freehike_ffi_checksum_func_engine_version() != 51964.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_freehike_ffi_checksum_func_fetch_chunk() != 7733.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_func_list_sources() != 46299.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_func_purge_fetch() != 52367.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_freehike_ffi_checksum_func_purge_job() != 63403.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freehike_ffi_checksum_func_query_checkpoint() != 56823.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_freehike_ffi_checksum_func_query_fetch() != 57953.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_freehike_ffi_checksum_func_set_thermal_state() != 35667.toShort()) {
@@ -1451,6 +1487,121 @@ public object FfiConverterTypeCompileSummary: FfiConverterRustBuffer<CompileSumm
 
 
 /**
+ * One fetchable raw-extract origin (display data for the UI; the id is
+ * what goes back into `fetch_chunk`).
+ */
+data class FetchSource (
+    var `id`: kotlin.String, 
+    var `label`: kotlin.String, 
+    /**
+     * Entry URL, for display/provenance only — never fetched by the WebView.
+     */
+    var `url`: kotlin.String, 
+    var `kind`: FetchKind
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFetchSource: FfiConverterRustBuffer<FetchSource> {
+    override fun read(buf: ByteBuffer): FetchSource {
+        return FetchSource(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeFetchKind.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FetchSource) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`label`) +
+            FfiConverterString.allocationSize(value.`url`) +
+            FfiConverterTypeFetchKind.allocationSize(value.`kind`)
+    )
+
+    override fun write(value: FetchSource, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`label`, buf)
+            FfiConverterString.write(value.`url`, buf)
+            FfiConverterTypeFetchKind.write(value.`kind`, buf)
+    }
+}
+
+
+
+/**
+ * Durable fetch state for a source in a destination directory.
+ */
+data class FetchState (
+    var `sourceId`: kotlin.String, 
+    /**
+     * Final URL after redirect resolution; empty until resolved.
+     */
+    var `pinnedUrl`: kotlin.String, 
+    /**
+     * Absolute path of the data file (`<dest_dir>/<pinned basename>`);
+     * empty until resolved. This is the `pbf_path` a `CompileJob` takes.
+     */
+    var `path`: kotlin.String, 
+    var `bytesHave`: kotlin.ULong, 
+    var `bytesTotal`: kotlin.ULong, 
+    /**
+     * True only after magic-byte + MD5 verification: the enqueue gate.
+     */
+    var `verified`: kotlin.Boolean, 
+    /**
+     * Restart-clean events so far (entity rotated, Range ignored…).
+     */
+    var `restarts`: kotlin.UInt
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFetchState: FfiConverterRustBuffer<FetchState> {
+    override fun read(buf: ByteBuffer): FetchState {
+        return FetchState(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FetchState) = (
+            FfiConverterString.allocationSize(value.`sourceId`) +
+            FfiConverterString.allocationSize(value.`pinnedUrl`) +
+            FfiConverterString.allocationSize(value.`path`) +
+            FfiConverterULong.allocationSize(value.`bytesHave`) +
+            FfiConverterULong.allocationSize(value.`bytesTotal`) +
+            FfiConverterBoolean.allocationSize(value.`verified`) +
+            FfiConverterUInt.allocationSize(value.`restarts`)
+    )
+
+    override fun write(value: FetchState, buf: ByteBuffer) {
+            FfiConverterString.write(value.`sourceId`, buf)
+            FfiConverterString.write(value.`pinnedUrl`, buf)
+            FfiConverterString.write(value.`path`, buf)
+            FfiConverterULong.write(value.`bytesHave`, buf)
+            FfiConverterULong.write(value.`bytesTotal`, buf)
+            FfiConverterBoolean.write(value.`verified`, buf)
+            FfiConverterUInt.write(value.`restarts`, buf)
+    }
+}
+
+
+
+/**
  * Result of one execution slice.
  *
  * Surface v1 revision (operator-directed hardening pass): the former
@@ -1619,6 +1770,165 @@ public object FfiConverterTypeCompilePhase: FfiConverterRustBuffer<CompilePhase>
 
     override fun write(value: CompilePhase, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Payload family of a source, mirrored from the fetcher crate.
+ */
+
+enum class FetchKind {
+    
+    OSM_PBF,
+    TIFF;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFetchKind: FfiConverterRustBuffer<FetchKind> {
+    override fun read(buf: ByteBuffer) = try {
+        FetchKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FetchKind) = 4UL
+
+    override fun write(value: FetchKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Result of one fetch slice.
+ */
+sealed class FetchStatus {
+    
+    /**
+     * Complete and verified; `state.path` is safe to compile from.
+     */
+    data class Finished(
+        val `state`: FetchState) : FetchStatus() {
+        companion object
+    }
+    
+    /**
+     * Budget expired; `state.bytes_have` bytes are durable. Re-invoke.
+     */
+    data class Yielded(
+        val `state`: FetchState) : FetchStatus() {
+        companion object
+    }
+    
+    /**
+     * Non-retryable (bad payload, checksum mismatch, refused URL, restart
+     * cap, unreadable sidecar). `purge_fetch` clears the state.
+     */
+    data class FailedFatal(
+        val `reason`: kotlin.String) : FetchStatus() {
+        companion object
+    }
+    
+    /**
+     * Network/disk refused the slice; durable state untouched. Retry later.
+     */
+    data class FailedTransient(
+        val `reason`: kotlin.String) : FetchStatus() {
+        companion object
+    }
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFetchStatus : FfiConverterRustBuffer<FetchStatus>{
+    override fun read(buf: ByteBuffer): FetchStatus {
+        return when(buf.getInt()) {
+            1 -> FetchStatus.Finished(
+                FfiConverterTypeFetchState.read(buf),
+                )
+            2 -> FetchStatus.Yielded(
+                FfiConverterTypeFetchState.read(buf),
+                )
+            3 -> FetchStatus.FailedFatal(
+                FfiConverterString.read(buf),
+                )
+            4 -> FetchStatus.FailedTransient(
+                FfiConverterString.read(buf),
+                )
+            else -> throw RuntimeException("invalid enum value, something is very wrong!!")
+        }
+    }
+
+    override fun allocationSize(value: FetchStatus) = when(value) {
+        is FetchStatus.Finished -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeFetchState.allocationSize(value.`state`)
+            )
+        }
+        is FetchStatus.Yielded -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterTypeFetchState.allocationSize(value.`state`)
+            )
+        }
+        is FetchStatus.FailedFatal -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+        is FetchStatus.FailedTransient -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`reason`)
+            )
+        }
+    }
+
+    override fun write(value: FetchStatus, buf: ByteBuffer) {
+        when(value) {
+            is FetchStatus.Finished -> {
+                buf.putInt(1)
+                FfiConverterTypeFetchState.write(value.`state`, buf)
+                Unit
+            }
+            is FetchStatus.Yielded -> {
+                buf.putInt(2)
+                FfiConverterTypeFetchState.write(value.`state`, buf)
+                Unit
+            }
+            is FetchStatus.FailedFatal -> {
+                buf.putInt(3)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+            is FetchStatus.FailedTransient -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`reason`, buf)
+                Unit
+            }
+        }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
     }
 }
 
@@ -1798,6 +2108,66 @@ public object FfiConverterOptionalTypeCheckpointState: FfiConverterRustBuffer<Ch
         }
     }
 }
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFetchState: FfiConverterRustBuffer<FetchState?> {
+    override fun read(buf: ByteBuffer): FetchState? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFetchState.read(buf)
+    }
+
+    override fun allocationSize(value: FetchState?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFetchState.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FetchState?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFetchState.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFetchSource: FfiConverterRustBuffer<List<FetchSource>> {
+    override fun read(buf: ByteBuffer): List<FetchSource> {
+        val len = buf.getInt()
+        return List<FetchSource>(len) {
+            FfiConverterTypeFetchSource.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FetchSource>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFetchSource.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FetchSource>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFetchSource.write(it, buf)
+        }
+    }
+}
         /**
          * Runs one budget-bounded slice of `job`. See module docs for the
          * Finished / Yielded / FailedFatal / FailedTransient contract. Never
@@ -1839,6 +2209,46 @@ public object FfiConverterOptionalTypeCheckpointState: FfiConverterRustBuffer<Ch
     
 
         /**
+         * Runs one budget-bounded fetch slice of `source_id` into `dest_dir`.
+         * Never throws: all failures are values. Resume by calling again with the
+         * same arguments; the engine reloads its own sidecar and the data file's
+         * length. See `FetchStatus`.
+         */ fun `fetchChunk`(`sourceId`: kotlin.String, `destDir`: kotlin.String, `budgetMs`: kotlin.UInt, `callback`: ProgressCallback): FetchStatus {
+            return FfiConverterTypeFetchStatus.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_fetch_chunk(
+        FfiConverterString.lower(`sourceId`),FfiConverterString.lower(`destDir`),FfiConverterUInt.lower(`budgetMs`),FfiConverterTypeProgressCallback.lower(`callback`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * The source table, in declaration order.
+         */ fun `listSources`(): List<FetchSource> {
+            return FfiConverterSequenceTypeFetchSource.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_list_sources(
+        _status)
+}
+    )
+    }
+    
+
+        /**
+         * Removes the sidecar and the data file (partial or complete) for
+         * `source_id` in `dest_dir`. Returns true if anything existed.
+         */ fun `purgeFetch`(`sourceId`: kotlin.String, `destDir`: kotlin.String): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_purge_fetch(
+        FfiConverterString.lower(`sourceId`),FfiConverterString.lower(`destDir`),_status)
+}
+    )
+    }
+    
+
+        /**
          * Cancels a job between slices by deleting its durable state. Returns true
          * if state existed and was removed. (In-slice cancellation is not needed:
          * slices are budget-bounded, so the runner simply stops re-invoking.)
@@ -1862,6 +2272,21 @@ public object FfiConverterOptionalTypeCheckpointState: FfiConverterRustBuffer<Ch
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_query_checkpoint(
         FfiConverterString.lower(`jobId`),FfiConverterString.lower(`outputDir`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * Durable fetch state for `source_id` in `dest_dir`, or None if nothing
+         * was ever resolved there. `verified == true` is the compile-enqueue gate.
+         * Unreadable state reports None (the next `fetch_chunk` surfaces the
+         * precise error), mirroring `query_checkpoint`.
+         */ fun `queryFetch`(`sourceId`: kotlin.String, `destDir`: kotlin.String): FetchState? {
+            return FfiConverterOptionalTypeFetchState.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_freehike_ffi_fn_func_query_fetch(
+        FfiConverterString.lower(`sourceId`),FfiConverterString.lower(`destDir`),_status)
 }
     )
     }

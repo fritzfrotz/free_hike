@@ -86,6 +86,48 @@ export interface BackgroundCompileEvent {
   reason?: string;
 }
 
+/** One fetchable raw-extract origin, from the Rust source table (P-SOV.C2b).
+ *  `url` is display/provenance only — the WebView never fetches it (CSP). */
+export interface FetchSourceInfo {
+  id: string;
+  label: string;
+  url: string;
+  kind: 'osmPbf' | 'tiff';
+}
+
+/** Durable fetch state for a source in the native raw-input directory. */
+export interface FetchStateInfo {
+  sourceId: string;
+  /** Final URL after redirect resolution; empty until resolved. */
+  pinnedUrl: string;
+  /** Absolute sandbox path of the data file; empty until resolved. */
+  path: string;
+  bytesHave: number;
+  bytesTotal: number;
+  /** True only after magic-byte + MD5 verification — the compile-enqueue gate. */
+  verified: boolean;
+  restarts: number;
+}
+
+/** Payload of the 'fetchProgress' event (throttled to ~1 MiB by Rust). */
+export interface FetchProgressEvent {
+  percentage: number;
+  status: string;
+}
+
+/** Terminal result resolved by fetchInputs. */
+export interface FetchInputsResult {
+  status: 'finished' | 'failed' | 'cancelled';
+  sourceId: string;
+  /** fetch_chunk slices executed by this call. */
+  slices: number;
+  /** Present when status === 'finished': the verified file's absolute path. */
+  path?: string;
+  /** Present when status === 'failed'. */
+  reason?: string;
+  transient?: boolean;
+}
+
 export interface StartJobOptions {
   /** "west,south,east,north" in WGS84 degrees. Required. */
   bbox: string;
@@ -133,6 +175,12 @@ export interface MapCompilerPlugin {
    * queryBackgroundJob or the 'backgroundCompile' event.
    */
   enqueueBackgroundJob(options: {
+    /**
+     * Source id from listSources(). The native layer resolves it through
+     * the Rust fetch state and REFUSES unless that state is verified
+     * (P-SOV.C2b, D6 gate) — the record's pbfPath is the verified file.
+     */
+    sourceId: string;
     bbox: string;
     jobId?: string;
     minZoom?: number;
@@ -166,6 +214,26 @@ export interface MapCompilerPlugin {
    */
   cancelBackgroundJob(): Promise<{ cancelled: boolean; jobId?: string }>;
 
+  /** The Rust source table (P-SOV.C2b). The WebView never names a host. */
+  listSources(): Promise<{ sources: FetchSourceInfo[] }>;
+
+  /**
+   * Downloads a source's raw extract into the native raw-input directory
+   * via the fetch_chunk budget-yield loop (resumable across process death,
+   * pinned against mirror rotation, MD5-verified). One long-lived promise
+   * resolving the terminal status; 'fetchProgress' events stream meanwhile.
+   */
+  fetchInputs(options: { sourceId: string; budgetMs?: number }): Promise<FetchInputsResult>;
+
+  /** Requests cancellation of the running fetch (honored between slices). */
+  cancelFetch(): Promise<{ requested: boolean }>;
+
+  /** Durable fetch state for a source; `found: false` if never resolved. */
+  queryFetch(options: { sourceId: string }): Promise<{ found: boolean; state?: FetchStateInfo }>;
+
+  /** Removes a source's sidecar and data file (partial or complete). */
+  purgeFetch(options: { sourceId: string }): Promise<{ purged: boolean }>;
+
   /** Smoke test: proves the Rust core is linked and callable. */
   getEngineVersion(): Promise<{ version: string }>;
 
@@ -188,6 +256,11 @@ export interface MapCompilerPlugin {
   addListener(
     eventName: 'backgroundCompile',
     listenerFunc: (event: BackgroundCompileEvent) => void,
+  ): Promise<PluginListenerHandle>;
+
+  addListener(
+    eventName: 'fetchProgress',
+    listenerFunc: (event: FetchProgressEvent) => void,
   ): Promise<PluginListenerHandle>;
 
   removeAllListeners(): Promise<void>;

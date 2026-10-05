@@ -61,6 +61,11 @@ object PendingJobStore {
          * the previous run died and [dirtyAttempts] is incremented.
          */
         val cleanStop: Boolean = false,
+        /**
+         * Source id the verified `pbfPath` came from (P-SOV.C2b). Null on
+         * records written before the fetch surface existed.
+         */
+        val sourceId: String? = null,
     ) {
         fun toCompileJob() = CompileJob(
             jobId = jobId,
@@ -95,6 +100,7 @@ object PendingJobStore {
             .putLong("bytesWritten", record.bytesWritten)
             .putInt("dirtyAttempts", record.dirtyAttempts)
             .putBoolean("cleanStop", record.cleanStop)
+            .putString("sourceId", record.sourceId)
             .commit()
     }
 
@@ -117,6 +123,7 @@ object PendingJobStore {
             bytesWritten = p.getLong("bytesWritten", 0),
             dirtyAttempts = p.getInt("dirtyAttempts", 0),
             cleanStop = p.getBoolean("cleanStop", false),
+            sourceId = p.getString("sourceId", null),
         )
     }
 

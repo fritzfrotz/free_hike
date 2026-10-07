@@ -17,7 +17,7 @@ This phase implements the live OpenStreetMap (OSM) trail ingestion pipeline and 
 
 ### Shared Communication Layer
 
-#### [MODIFY] [src/shared/types.ts](file:///Users/macbook2025/code/Antigravity/free_hike/src/shared/types.ts)
+#### [MODIFY] [src/shared/types.ts](../src/shared/types.ts)
 Adds new RPC message types to the communication contract:
 *   `'TRAILS_FETCH_BOUNDS'`: Request to query Overpass for a specific bbox, build the Flatbush index, and save the dataset.
 *   `'TRAILS_QUERY_NEAREST'`: Request to find the closest trail coordinate to a given `[lng, lat]` point.
@@ -28,7 +28,7 @@ Adds new RPC message types to the communication contract:
 
 ### Ingestion & Index Web Worker
 
-#### [NEW] [src/workers/spatial.worker.ts](file:///Users/macbook2025/code/Antigravity/free_hike/src/workers/spatial.worker.ts)
+#### [NEW] `src/workers/spatial.worker.ts`
 A dedicated worker thread responsible for heavy spatial operations:
 1.  **Overpass Client:** Fetches features inside the bounds via a POST request with the custom client headers.
 2.  **Flatbush Indexer:** Iterates over the raw way geometries, computes their bounding boxes, and packs them into a flat R-Tree index.
@@ -40,7 +40,7 @@ A dedicated worker thread responsible for heavy spatial operations:
 
 ### UI Map Component
 
-#### [MODIFY] [src/ui/components/MapView.tsx](file:///Users/macbook2025/code/Antigravity/free_hike/src/ui/components/MapView.tsx)
+#### [MODIFY] [src/ui/components/MapView.tsx](../src/ui/components/MapView.tsx)
 Updates the map interface and interactive behaviors:
 1.  **Floating Control:** Adds a sleek, absolute-positioned glassmorphism button: `"Scan Viewport for Trails"`.
 2.  **Layer Registration:** Mounts a dynamic MapLibre GeoJSON source (`'osm-trails'`) and line layer (`'osm-trails-layer'`) styled with a glowing emerald or teal aesthetic.

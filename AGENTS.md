@@ -46,6 +46,14 @@ violate these most)
 - `git commit` belongs to the operator unless explicitly delegated this session.
 - Never hand-edit `TRACKER.md` (generated) or rewrite LOOPLOG history
   (append-only).
+- Anything written to a tracked file (LOOPLOG, reports, code, docs)
+  names a device or machine by model and OS version only — never
+  serials, UDIDs, hostnames, login names, home-folder paths, email
+  addresses or local network addresses. The janitor's privacy pass
+  checks staged content at pre-commit and the tree in CI for the
+  common shapes; the rule holds whether or not the check catches it.
+  A false positive is fixed by tightening the pattern, never by an
+  exemption.
 
 ## Operator interaction (v2.1 — see manual Part 3)
 

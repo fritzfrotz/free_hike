@@ -128,7 +128,10 @@ gates for irreversible decisions, and an append-only build log (`freehike-core/L
 
 Debt/bug tracking and mechanical architecture rules are enforced by the tracker
 janitor (see [`docs/tracker_tags.md`](docs/tracker_tags.md)); `TRACKER.md` is
-generated, never hand-edited. Enable the pre-commit check once per clone:
+generated, never hand-edited. `npm install` enables the pre-commit check
+(the `prepare` script sets `core.hooksPath` to `.githooks`); it also refuses
+commits whose staged content carries device serials, home-folder paths,
+email addresses or local network addresses. Without npm:
 
 ```sh
 git config core.hooksPath .githooks

@@ -185,3 +185,139 @@ test('generated trees and ignore list are not scanned', () => {
   assert.equal(check.status, 0, check.output);
   assert.match(check.output, /0 debt, 0 bug/);
 });
+
+// ---------------------------------------------------------------------------
+// Privacy pass (P-HYG.C1). Every identifier below is made up.
+// ---------------------------------------------------------------------------
+
+/** Runs the janitor with arbitrary args; returns { status, output }. */
+function runArgs(root, ...args) {
+  try {
+    const output = execFileSync(process.execPath, [JANITOR, ...args, '--root', root], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { status: 0, output };
+  } catch (e) {
+    return { status: e.status, output: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+  }
+}
+
+function git(root, ...args) {
+  execFileSync('git', ['-c', 'init.defaultBranch=main', ...args], { cwd: root, stdio: 'ignore' });
+}
+
+const LEAKS = {
+  'docs/serial_kw.md': ['intro\n', 'serial: XQ7700112233\n', 'serial'],
+  'notes/samsung.txt': ['a\n', 'R9ZZ0000000\n', 'serial'],
+  'notes/adb.txt': ['List of devices attached\n', 'XQ7700112233\tdevice\n', 'serial'],
+  'notes/udid.md': ['x\n', 'UDID 00008120-000A1B2C3D4E5F60\n', 'udid'],
+  'notes/users.md': ['x\n', 'see /Users/jdoe/code/app\n', 'home-path'],
+  'notes/home.sh': ['#!/bin/sh\n', 'cd /home/jdoe/app\n', 'home-path'],
+  'notes/win.md': ['x\n', 'C:\\Users\\jdoe\\app\n', 'home-path'],
+  'notes/dash.md': ['x\n', 'scratch at -private-tmp-claude-501-Users-jdoe-code-app\n', 'home-path'],
+  'notes/email.ts': ['// x\n', 'const who = "jdoe@corp.invalid";\n', 'email'],
+  'notes/lan.yml': ['a: 1\n', 'host: 192.168.1.23\n', 'local-network'],
+  'notes/ten.md': ['x\n', 'dev box at 10.0.0.7\n', 'local-network'],
+  'notes/mac.md': ['x\n', 'wifi a4:5e:60:00:11:22\n', 'local-network'],
+};
+const LEAK_VALUES = [
+  'XQ7700112233', 'R9ZZ0000000', '00008120-000A1B2C3D4E5F60', 'jdoe', 'corp.invalid',
+  '192.168.1.23', '10.0.0.7', 'a4:5e:60:00:11:22',
+];
+
+test('privacy: each class is flagged by file:line and class, value never printed', () => {
+  const files = { 'freehike-core/LOOPLOG.md': '# log\n' };
+  for (const [rel, [first, second]] of Object.entries(LEAKS)) files[rel] = first + second;
+  const root = fixture(files);
+  const check = run(root, '--check');
+  assert.equal(check.status, 1, check.output);
+  for (const [rel, [, , cls]] of Object.entries(LEAKS)) {
+    assert.match(check.output, new RegExp(`${rel.replace(/\./g, '\\.')}:2: privacy \\(${cls}\\)`), rel);
+  }
+  for (const v of LEAK_VALUES) assert.ok(!check.output.includes(v), `value leaked into output: class of ${v.length}-char value`);
+});
+
+test('privacy: a serial split across a line wrap is caught', () => {
+  const root = fixture({
+    'freehike-core/LOOPLOG.md': '# log\n\n- Device: Phone X, Android 16, USB adb, serial\n  `XQ7700112233`.\n',
+  });
+  const check = run(root, '--check');
+  assert.equal(check.status, 1, check.output);
+  assert.match(check.output, /freehike-core\/LOOPLOG\.md:3: privacy \(serial\)/);
+});
+
+test('privacy: placeholders, image names, loopback and look-alikes pass', () => {
+  const root = fixture({
+    'freehike-core/LOOPLOG.md': '# log\n',
+    'docs/ok.md': [
+      'Placeholders: /Users/<you>/code, /Users/$USER/code, ~/code, /Users/Shared/data, /home/<you>',
+      'Images: icon@2x.png, AppIcon@3x.png',
+      'Loopback: http://127.0.0.1:5173 and 0.0.0.0:8080',
+      'Allowed mail: someone@example.com, bot@users.noreply.github.com',
+      'REGENERATED is a word; commit 0123456789abcdef0123456789abcdef01234567',
+      'the serial number field; the serial followed by prose; serialization; serial format v7',
+      'UUID 123e4567-e89b-12d3-a456-426614174000; version 10.2.3; Samsung SM-S918B, Android 16',
+      '',
+    ].join('\n'),
+    'ios/Contents.json': '{ "filename" : "AppIcon@2x.png" }\n',
+  });
+  const check = run(root, '--check');
+  assert.equal(check.status, 0, check.output);
+  assert.doesNotMatch(check.output, /privacy/);
+});
+
+test('privacy: Markdown and docs/ are scanned, generated trees are not', () => {
+  const root = fixture({
+    'freehike-core/LOOPLOG.md': '# log\n',
+    'freehike-core/ffi/bindings/freehike.swift': '// built in /Users/jdoe/code\n',
+    'node_modules/pkg/README.md': 'author jdoe@corp.invalid\n',
+    'docs/guide.md': '# guide\nfrom /Users/jdoe/code\n',
+  });
+  const check = run(root, '--check');
+  assert.equal(check.status, 1, check.output);
+  assert.match(check.output, /docs\/guide\.md:2: privacy \(home-path\)/);
+  assert.doesNotMatch(check.output, /bindings|node_modules/);
+});
+
+test('privacy --staged: reads the index, not the disk (both directions)', () => {
+  const root = fixture({ 'freehike-core/LOOPLOG.md': '# log\n', 'notes.md': '# clean\n' });
+  git(root, 'init', '-q');
+  git(root, 'add', '-A');
+
+  // Staged clean, leak only on disk: the hook passes, a tree check fails.
+  fs.writeFileSync(path.join(root, 'notes.md'), '# clean\nserial XQ7700112233\n');
+  let staged = runArgs(root, '--check', '--staged');
+  assert.equal(staged.status, 0, staged.output);
+  let disk = run(root, '--check');
+  assert.equal(disk.status, 1, disk.output);
+  assert.match(disk.output, /notes\.md:2: privacy \(serial\)/);
+
+  // Leak staged, disk fixed afterwards: the hook still refuses.
+  git(root, 'add', 'notes.md');
+  fs.writeFileSync(path.join(root, 'notes.md'), '# clean\n');
+  staged = runArgs(root, '--check', '--staged');
+  assert.equal(staged.status, 1, staged.output);
+  assert.match(staged.output, /notes\.md:2: privacy \(serial\)/);
+  disk = run(root, '--check');
+  assert.equal(disk.status, 0, disk.output);
+});
+
+test('privacy --staged: refused outside a git work tree', () => {
+  const root = fixture({ 'freehike-core/LOOPLOG.md': '# log\n' });
+  const staged = runArgs(root, '--check', '--staged');
+  assert.equal(staged.status, 2, staged.output);
+  assert.match(staged.output, /--staged needs a git work tree/);
+});
+
+test('privacy: a serial a few words after the keyword is caught; port/baud/format prose passes', () => {
+  const root = fixture({
+    'freehike-core/LOOPLOG.md': '# log\n\nthe phone serial is XQ77A0112233\n',
+    'docs/ok.md': 'serial port ttyUSB0\nserial console 115200\nserial format v7\n',
+  });
+  const check = run(root, '--check');
+  assert.equal(check.status, 1, check.output);
+  assert.match(check.output, /freehike-core\/LOOPLOG\.md:3: privacy \(serial\)/);
+  assert.doesNotMatch(check.output, /docs\/ok\.md/);
+  assert.ok(!check.output.includes('XQ77A0112233'));
+});

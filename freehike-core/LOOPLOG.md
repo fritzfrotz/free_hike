@@ -3926,3 +3926,121 @@ Addendum (operator's screen, 08:28, screenshot taken by the operator):
   above); jump menu on "Innsbruck Center".
 - Run-2 cancel taps (08:26:16 / 08:26:17): intentional, by the operator's
   recollection, not certain.
+
+## P-HYG.C1 — privacy pass in the janitor + hook enablement (plan, 2026-10-07)
+
+**Operator calls:** separate janitor pass (not an ARCHITECTURE rule),
+whole-file matching, Markdown included, no inline exemption marker;
+staged-content mode for the hook, privacy pass only (tag/rule passes keep
+reading disk); hook enabled via npm `prepare` (option b), no pre-push hook;
+contract line in the AGENTS.md hard rules only, wording approved verbatim
+by the operator; redact the three home paths in
+`research/implementation_plan_phase3.md`; README hook line updated.
+Flagged deviations, accepted: serial values must contain a digit (an
+11-letter capitalised word matched the Samsung shape); the legacy 40-hex
+UDID form is dropped (indistinguishable from a git commit hash). The
+deleted wip commit is never named by hash in any tracked file. Budget 24.
+Base: main `9120144`.
+
+**Trigger:** the Samsung smoke entry on the deleted wip commit carried a
+device serial, split across a line wrap, in LOOPLOG — a file the janitor
+never read. Hook fact: `core.hooksPath=.githooks` is set at local scope
+(`.git/config`); when it was set is unknown.
+
+**Goal:** a commit whose staged content contains a device serial, UDID,
+home-folder path, email address, private network or MAC address in any
+tracked text file (Markdown included) is refused by the pre-commit hook,
+and the same tree fails `--check` in CI; matched values never appear in
+the janitor's output.
+
+**Design:** `checkPrivacy` in `scripts/tracker-janitor.mjs`. File set:
+`git ls-files` when `--root` is a git work tree (disk content, or index
+blobs via one `git cat-file --batch` with `--staged`); non-git roots walk
+the disk (keeps the existing fixture tests valid); `--staged` on a non-git
+root is a usage error. Excluded: generated/vendored trees from
+IGNORE_PREFIXES minus `docs/`, the janitor itself, binary blobs (NUL
+byte). Whole-file regexes, report `file:line: privacy (<class>)` only.
+Hook: `--check --staged`. `prepare`: a `node -e` call that sets
+`core.hooksPath` and swallows failure (runs under `npm ci` in CI; must not
+break a non-git install; portable to Windows shells).
+
+**Files:** `scripts/tracker-janitor.mjs`, `scripts/tracker-janitor.test.mjs`,
+`.githooks/pre-commit`, `package.json`, `README.md`,
+`research/implementation_plan_phase3.md`, `AGENTS.md`, `TRACKER.md`
+(generated), LOOPLOG.
+
+**Proofs (named before implementation),** in `tracker-janitor.test.mjs`:
+`privacy: each class is flagged by file:line and class, value never
+printed`; `privacy: a serial split across a line wrap is caught`;
+`privacy: placeholders, image names, loopback and look-alikes pass`;
+`privacy: Markdown and docs/ are scanned, generated trees are not`;
+`privacy --staged: reads the index, not the disk (both directions)`;
+`privacy --staged: refused outside a git work tree`. Janitor suite 8 → 14
+tests. Tree proof: `--check` clean after the redaction (3 → 0 home-path
+hits). `npm run prepare` exit 0 and hooksPath unchanged.
+
+**Steps [E]/[D]:** 1 [E] calls + wording (done). 2 [D] red tests. 3 [D]
+janitor pass + `--staged`. 4 [D] hook, `prepare`, README. 5 [D] redaction.
+6 [D] AGENTS.md line (approved text). 7 [D] ladder ×2: janitor tests +
+`--check`; frontend L1 (`package.json` changed). 8 [D] janitor `--fix`,
+close entry, stage → STOP.
+Allocation (24): plan 1, red tests 2, red run 1, janitor 3, hook/prepare/
+README 3, redaction 1, AGENTS 1, ladder 4, fix/close/stage 3 = 19; fixes 5.
+
+### P-HYG.C1 — execution + close (2026-10-07)
+
+- Red: suite 8 → 14 tests; 5 privacy tests failed as expected; the
+  negatives test passed vacuously before the pass existed (it only bites
+  after). Green after one implementation round; no fix attempts.
+- Tree: `--check` flagged exactly the 3 research-doc home paths and
+  nothing else (the 11-letter word in LOOPLOG, the commit hash in
+  `android/app/build.gradle`, the `@2x` icon name all pass) → redacted
+  → clean. This entry and the plan entry pass the check.
+- End-to-end (scratch repo outside the tree, not a proof test): the
+  `prepare` command set an unset `core.hooksPath`; in a non-git folder it
+  exited 0; the hook let a clean commit through and refused one whose
+  staged copy held a wrapped serial while the disk copy was clean (log: 1
+  commit). In this clone `npm run prepare` exit 0, hooksPath unchanged
+  (local, `.githooks`), hook mode 755.
+- Ladder ×2 consecutive: janitor `node --test` 14/14, `--check` clean;
+  frontend L1 `tsc -b` ok, `eslint .` ok, vitest 12 files / 72 tests
+  (unchanged — the janitor suite is not part of `npm test`; CI runs it
+  in the janitor job). Janitor `--fix`: TRACKER.md unchanged (no tags
+  touched; 3 debt, 1 bug).
+- Flagged deviations (operator veto offered): (1) the redaction turns
+  the three `file:///` links into relative `../src/...` links instead of
+  placeholders, so they still resolve; (2) the error text says "name
+  devices by model and OS version" for every class, home paths
+  included — wording only.
+- Not covered by the check (rule still binding): hostnames and login
+  names in free text (no shape to match), bare serials of other vendors
+  without a keyword, git author metadata, commits with `--no-verify` or
+  from a clone where `npm install` never ran (CI then catches it after
+  the push).
+- Promotion valve: the lesson is promoted in this chunk (AGENTS.md hard
+  rule + mechanical pass). No tracked item closed.
+- Steps: 18/24 (plan 1, red tests 1, red run 1, janitor 3, green run 1,
+  redaction 1, hook/prepare/README 3, AGENTS 1, ladder 1 + e2e 1 +
+  ladder 1, `--fix` 1, this entry 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+Reopen (2026-10-07, operator review, two findings; budget 24 → 26 by
+operator call, counted per action):
+- Finding 1 (gap): a serial a few words after the keyword ("the phone
+  serial is <value>") was missed. Added a second keyword pattern: up to
+  three filler words, value 8+ chars with both letters and digits; the
+  adjacent-value pattern is unchanged. Red first: new test
+  `privacy: a serial a few words after the keyword is caught;
+  port/baud/format prose passes` failed (15 tests, 1 fail), then green.
+  Negatives in it: "serial port ttyUSB0", "serial console 115200",
+  "serial format v7". Tree check: 0 new hits.
+- Finding 2: the redacted spatial-worker link pointed at a file deleted
+  in `3a2bb55`; now plain text. The other two links resolve.
+- Ladder ×2 consecutive: janitor `node --test` 15/15, `--check` clean;
+  `tsc -b` ok, `eslint .` ok, vitest 12 files / 72 tests. TRACKER.md
+  unchanged.
+- Steps: 26/26 (red test 1, red run 1, pattern 1, link 1, ladder 2, this
+  addendum 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — second commit by the operator (same wip branch).

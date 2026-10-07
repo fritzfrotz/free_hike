@@ -17,6 +17,7 @@
 //
 // Node built-ins only. Boring by design: file walks + regex.
 
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
@@ -245,6 +246,130 @@ function checkForbiddenPatterns(root, files, rules, exemptions, errors) {
 }
 
 // ---------------------------------------------------------------------------
+// Scanning: privacy (AGENTS.md hard rule — a tracked file names a device or
+// machine by model and OS version only)
+// ---------------------------------------------------------------------------
+
+/** The tag-scan ignore list minus docs/: prose is exactly where a pasted
+ *  identifier lands. Markdown and every other text file are scanned. */
+const PRIVACY_IGNORE_PREFIXES = IGNORE_PREFIXES.filter((p) => p !== 'docs/');
+
+/** [class, whole-file regex]. Whole-file so a value wrapped onto the next
+ *  line still matches. No inline exemption marker: a false positive is fixed
+ *  by tightening the pattern. Matched values are never printed (CI logs). */
+const PRIVACY_PATTERNS = [
+  // Keyword + value. The value must contain a digit, so prose ("serial
+  // number", "serial followed by") never matches.
+  ['serial', /\b(?:serial(?:[ _-]?(?:no|number))?|adb\s+-s)\b[\s:=#`"'*]*(?=[A-Za-z0-9]{6,}\b)(?=[A-Za-z]*\d)[A-Za-z0-9]+/gi],
+  // Keyword, up to three filler words ("serial is", "serial of the phone
+  // is"), then a value of 8+ chars with both letters and digits — so port
+  // names (ttyUSB0), baud rates (115200) and versions (v7) pass.
+  ['serial', /\bserial(?:[ _-]?(?:no|number))?\b(?:[\s:=#`"'*]+[A-Za-z]+){0,3}?[\s:=#`"'*]+(?=[A-Za-z0-9]{8,}\b)(?=[0-9]*[A-Za-z])(?=[A-Za-z]*\d)[A-Za-z0-9]+/gi],
+  // Samsung serial shape: R, a digit, nine more caps/digits.
+  ['serial', /\bR\d[0-9A-Z]{9}\b/g],
+  // Pasted `adb devices` lines.
+  ['serial', /^[ \t]*(?=[A-Za-z]*\d)[A-Za-z0-9]{8,}[ \t]+(?:device|unauthorized|offline)[ \t]*$/gm],
+  // iOS UDID, 2018+ shape. The legacy 40-hex form is deliberately not
+  // matched: it cannot be told apart from a git commit hash.
+  ['udid', /\b[0-9A-F]{8}-[0-9A-F]{16}\b/gi],
+  // Placeholders (/Users/<you>, /Users/$USER, ~) never match the name class.
+  ['home-path', /(?<![A-Za-z0-9.~_-])\/(?:Users\/(?!Shared\b)|home\/)[A-Za-z0-9._-]+/g],
+  ['home-path', /\b[A-Za-z]:\\{1,2}Users\\{1,2}(?!Public\b)[A-Za-z0-9._-]+/gi],
+  // Dash-encoded home paths (Claude project/scratchpad directory names).
+  ['home-path', /-Users-(?!Shared-)[A-Za-z0-9._]+-/g],
+  ['email', /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g],
+  // Private, link-local and MAC addresses; loopback and 0.0.0.0 identify nobody.
+  ['local-network', /\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168|169\.254)\.\d{1,3}\.\d{1,3}\b/g],
+  ['local-network', /\b[0-9A-F]{2}(?::[0-9A-F]{2}){5}\b/gi],
+];
+
+/** Email-shaped strings that identify nobody: image scale suffixes
+ *  (icon@2x.png), example.* domains, noreply addresses. */
+function emailAllowed(value) {
+  const domain = value.slice(value.indexOf('@') + 1);
+  return /^\d+x\./i.test(domain) || /(^|\.)example\.(com|org|net)$/i.test(domain) || /no-?reply/i.test(value);
+}
+
+function isIgnored(rel, prefixes) {
+  return prefixes.some((p) => rel === p.replace(/\/$/, '') || `${rel}/`.startsWith(p) || rel.startsWith(p));
+}
+
+function git(root, args, input) {
+  return execFileSync('git', args, { cwd: root, input, maxBuffer: 1 << 30, stdio: ['pipe', 'pipe', 'ignore'] });
+}
+
+/** True when `root` is the top of a git work tree. */
+function isGitWorkTreeRoot(root) {
+  try {
+    const top = git(root, ['rev-parse', '--show-toplevel']).toString().trim();
+    return fs.realpathSync(top) === fs.realpathSync(root);
+  } catch {
+    return false;
+  }
+}
+
+/** Yields [rel, Buffer] for every file the privacy pass reads: tracked files
+ *  from disk, index blobs with `staged` (what the commit will contain), or a
+ *  plain disk walk when `root` is not a git work tree (test fixtures). */
+function* privacySources(root, { gitRoot, staged }) {
+  if (staged) {
+    const entries = git(root, ['ls-files', '-s', '-z']).toString().split('\0').filter(Boolean)
+      .map((e) => { const [meta, rel] = e.split('\t'); const [mode, sha] = meta.split(' '); return { mode, sha, rel }; })
+      .filter((e) => e.mode.startsWith('100') && !isIgnored(e.rel, PRIVACY_IGNORE_PREFIXES));
+    if (entries.length === 0) return;
+    const out = git(root, ['cat-file', '--batch'], entries.map((e) => e.sha).join('\n') + '\n');
+    let pos = 0;
+    for (const e of entries) {
+      const nl = out.indexOf(0x0a, pos);
+      const size = Number(out.subarray(pos, nl).toString().split(' ')[2]);
+      yield [e.rel, out.subarray(nl + 1, nl + 1 + size)];
+      pos = nl + 1 + size + 1;
+    }
+    return;
+  }
+  const rels = gitRoot
+    ? git(root, ['ls-files', '-z']).toString().split('\0').filter(Boolean)
+    : walkAll(root);
+  for (const rel of rels) {
+    if (isIgnored(rel, PRIVACY_IGNORE_PREFIXES)) continue;
+    const abs = path.join(root, rel);
+    const st = fs.lstatSync(abs, { throwIfNoEntry: false });
+    if (st?.isFile()) yield [rel, fs.readFileSync(abs)];
+  }
+}
+
+function walkAll(root, rel = '', out = []) {
+  for (const entry of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+    const childRel = rel === '' ? entry.name : `${rel}/${entry.name}`;
+    if (isIgnored(childRel, PRIVACY_IGNORE_PREFIXES)) continue;
+    if (entry.isDirectory()) walkAll(root, childRel, out);
+    else if (entry.isFile()) out.push(childRel);
+  }
+  return out;
+}
+
+function checkPrivacy(root, opts, errors) {
+  for (const [rel, buf] of privacySources(root, opts)) {
+    if (buf.includes(0)) continue; // binary
+    const text = buf.toString('utf8');
+    const seen = new Set();
+    for (const [cls, re] of PRIVACY_PATTERNS) {
+      for (const m of text.matchAll(re)) {
+        if (cls === 'email' && emailAllowed(m[0])) continue;
+        const line = text.slice(0, m.index).split('\n').length;
+        const key = `${line}:${cls}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        errors.push(
+          `${rel}:${line}: privacy (${cls}) — tracked files name devices by model and OS version only ` +
+          `(AGENTS.md); remove the value (it is not printed here)`
+        );
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // TRACKER.md generation + drift checks
 // ---------------------------------------------------------------------------
 
@@ -327,8 +452,16 @@ function main() {
   const mode = args.includes('--fix') ? 'fix' : args.includes('--check') ? 'check' : null;
   const rootIdx = args.indexOf('--root');
   const root = rootIdx >= 0 ? path.resolve(args[rootIdx + 1]) : path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-  if (!mode) {
-    console.error('usage: tracker-janitor.mjs --check|--fix [--root <dir>]');
+  // --staged: the privacy pass reads the index (pre-commit hook); the tag and
+  // rule passes keep reading the disk.
+  const staged = args.includes('--staged');
+  if (!mode || (staged && mode !== 'check')) {
+    console.error('usage: tracker-janitor.mjs --check [--staged] | --fix  [--root <dir>]');
+    process.exit(2);
+  }
+  const gitRoot = isGitWorkTreeRoot(root);
+  if (staged && !gitRoot) {
+    console.error('tracker-janitor: --staged needs a git work tree at the root (it reads the index)');
     process.exit(2);
   }
 
@@ -339,6 +472,7 @@ function main() {
   checkMirrors(scan.debts, errors);
   const rules = parseRules(root, errors);
   checkForbiddenPatterns(root, files, rules, scan.exemptions, errors);
+  checkPrivacy(root, { gitRoot, staged }, errors);
 
   if (mode === 'fix') {
     fs.writeFileSync(path.join(root, 'TRACKER.md'), renderTracker(scan));

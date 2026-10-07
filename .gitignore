@@ -85,3 +85,7 @@ DerivedData/
 # Preview-only pre-compiled archives (see dev_assets/README.md). Covered by
 # the *.pmtiles rule above; listed here so the intent is explicit.
 dev_assets/local/*.pmtiles
+
+# Raw on-device captures (logcat, device console, anything copied from a
+# device log). Never committed; LOOPLOG carries a summary only (AGENTS.md).
+device-logs/

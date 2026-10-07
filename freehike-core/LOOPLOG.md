@@ -4044,3 +4044,74 @@ operator call, counted per action):
   addendum 1, stage 1). Pivots: 0.
 
 **Status:** AGENT-CLOSED — second commit by the operator (same wip branch).
+
+## P-HYG.C2 — device-run output stays out of tracked files (plan, 2026-10-07)
+
+**Operator calls:** raw device output lives in a git-ignored
+`device-logs/` folder at the repo root (option A: ignore line plus a local
+folder, nothing tracked inside it); new AGENTS.md hard rule directly after
+the privacy line, wording approved by the operator, with "build commit"
+replaced by a build-identity clause (main hash, or for a pre-merge build
+the chunk ID plus APK size and checksum, never a wip hash); one new line
+under "Operator interaction" about pasted messages, wording approved by
+the operator; existing LOOPLOG entries untouched. Budget 10. Base: main
+`f5a7d9e`.
+
+**Goal:** `git check-ignore device-logs/x` matches, and AGENTS.md carries
+both lines verbatim.
+
+**Files:** `.gitignore`, `AGENTS.md`, `TRACKER.md` (generated), LOOPLOG.
+
+**Proofs:** `git check-ignore -v device-logs/probe.txt` names the new
+`.gitignore` line; `git status --short` lists no file under `device-logs/`;
+`node scripts/tracker-janitor.mjs --check` clean. No code changes, so
+there is no test ladder.
+
+**Steps [E]/[D]:** 1 [E] calls + wording (done). 2 [D] `.gitignore` line +
+local folder. 3 [D] the two AGENTS.md lines. 4 [D] janitor `--check` +
+`--fix`, close entry, stage → STOP.
+Allocation (10): plan 1, ignore 1, mkdir 1, AGENTS 2, `--fix` 1, close 1,
+stage 1 = 8; spare 2.
+
+### P-HYG.C2 — execution + close (2026-10-07)
+
+- `.gitignore:91` `device-logs/` added; `git check-ignore -v
+  device-logs/probe.txt` names that line (probe file created and removed
+  inside the ignored folder). Folder exists locally only; fresh clones
+  do not have it (option A, by design).
+- AGENTS.md: device-run line added directly after the privacy line;
+  pasted-messages line added as the last bullet of "Operator
+  interaction". Both are the operator's text verbatim.
+- Janitor `--check` clean (3 debt, 1 bug, 0 exemptions); `--fix`: TRACKER.md
+  unchanged.
+- Enforcement gap (operator call: note it here): nothing mechanical
+  enforces the device-run rule. The privacy pass matches serial, UDID,
+  path, email and network shapes; raw log lines, process and job
+  identifiers and device log timestamps have no shape it checks, so a
+  logcat paste without those shapes passes the hook and CI. `git add -f`
+  bypasses the ignore line. The rule binds regardless.
+- Wording note: the build-identity clause names an APK, so a pre-merge
+  iOS build has no stated identity form yet (iOS device runs are pending
+  under D004).
+- Promotion valve: the rule is itself the promotion; no tracked item
+  closed.
+- Steps: 9/10 (plan 1, ignore line 1, mkdir 1, AGENTS 2, ignore probe 1,
+  `--fix` 1, this entry 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+Addendum (2026-10-07, operator correction; budget 10 → 12 by operator
+call):
+- The operator withdrew the pasted-messages line before review. It is
+  removed; the "Operator interaction" section of AGENTS.md matches main
+  exactly. The close entry above is wrong where it says that line was
+  added; that entry stays as written (append-only) and this addendum
+  corrects it. AGENTS.md now carries the device-run line only.
+- Process note: the agent took a tool rejection to mean the command never
+  ran; it had run in full (`--fix`, close entry, stage). Found through
+  `git status` after the removal; reported to the operator.
+- Janitor `--check` clean after the removal (3 debt, 1 bug, 0 exemptions).
+- Steps: 12/12 (the 9 above plus removal 1, this addendum 1, re-stage 1).
+  Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).

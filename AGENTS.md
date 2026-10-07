@@ -54,6 +54,14 @@ violate these most)
   common shapes; the rule holds whether or not the check catches it.
   A false positive is fixed by tightening the pattern, never by an
   exemption.
+- On-device runs: raw captures and device detail (log lines,
+  device-side paths, process and job identifiers, device log
+  timestamps) stay in device-logs/, which is git-ignored and never
+  committed. The LOOPLOG entry for a device run is a summary: date,
+  device model and OS version, build identity (the main commit hash;
+  for a pre-merge build, the chunk ID plus the APK size and checksum,
+  never a wip hash), what was done, pass/fail per item, findings in
+  plain words.
 
 ## Operator interaction (v2.1 — see manual Part 3)
 

@@ -3796,3 +3796,133 @@ janitor 1 = 17; fixes 3; contingency 2.
   steps: 22/22** (janitor 1, two rewords 2, this addendum 1).
 
 **Status:** AGENT-CLOSED — commit by the operator (wip/c3b).
+
+## Samsung fetch smoke — observed (2026-10-07)
+
+Mode: execute and observe; no code changes, no fixes, no retries with
+changes. Prediction scoring is the operator's (not done here).
+
+- **Device:** Samsung SM-S918B (S23 Ultra), Android 16, USB adb.
+- **Build:** commit `8c3a3ed` (P-SOV.C3b). `app-debug.apk` 37,477,863 B,
+  SHA-256 `3171fb98676238436c3bf1fd3afb3726f5c59ad9ac9c13fe30a4b984d180e25f`
+  (installed `base.apk` hash-equal); `lib/arm64-v8a/libfreehike_ffi.so`
+  5,065,152 B, SHA-256
+  `ce17c371182e5e94d872f087e9a16e986804d01c56412220e9b507787b0c1323`
+  (jniLibs copy == APK copy). Built 2026-10-05: `npm run build`,
+  `npx cap sync android`, `cargo ndk -t arm64-v8a -o
+  ../android/app/src/main/jniLibs build --release -p ffi`, gradle
+  `--offline assembleDebug`, all exit 0. No separate build entry
+  (operator call).
+- **Install:** `adb uninstall com.freehike.app` (July 2026-07-18 build
+  and its data discarded, operator call) → fresh install 08:12:30.
+- **Capture:** logcat `-s MapCompilerPlugin BackgroundCompileWorker` as
+  specified, plus (flagged deviation, offered for veto, not vetoed) a
+  second file with `freehike-core`, `Capacitor/Console`, `MainActivity`,
+  `ThermalStateBridge`. Kept outside the repo (session scratchpad
+  `smoke/`). Instrumentation limit: no tag logs the HTTP status or
+  Content-Range of a successful request.
+
+### Run 1 — clean download, no kill (08:16–08:21)
+
+- Resolve OK: `fetch: resolved portugal-261006.osm.pbf (424970644 bytes,
+  content-type "application/octet-stream", etag "19548994-65d37d13b1052")`
+  at 08:16:35; first bytes 08:16:36 (`1.0 MiB / 405.3 MiB`). No TLS /
+  certificate error anywhere.
+- Finished 08:17:28.035: `fetch geofabrik-portugal finished in 11 slices:
+  424970644 bytes at …/map_jobs/raw/portugal-261006.osm.pbf`, restarts=0
+  on every slice. Checksum: `fetch: verified …` then `query_fetch -> found
+  (424970644/424970644 bytes, verified=true)` (verified = MD5 against the
+  Geofabrik `.md5`; hash values not logged).
+- Compile enqueued 08:17:32: sidecar gate accepted (`{"scheduled":true,
+  "jobId":"bg_portugal_muxrz4u5"}`), `no checkpoint on disk — fresh start
+  (phase=pass1_nodes)`. Ran to 2,123 blocks (6%) by 08:20:59, each 2s
+  slice ending `checkpoint durable` and the next `resuming from durable
+  checkpoint`. Slices were single, 10–60s apart until 08:20:14, then
+  back-to-back. One `FGS promotion refused; continuing under the
+  10-minute cap` (JobCancellationException) at 08:18:20. A second web boot
+  at 08:19:34 found the job still pending and the extract still verified.
+- Ended by the operator-requested `pm clear` (compile killed mid-pass1);
+  same APK kept installed.
+
+### Run 2 — download, cancel, swipe-kill, reopen, compile (08:25–08:33)
+
+- 08:26:05 resolve OK (same size/etag). 08:26:16.4 and 08:26:17.3 two
+  `cancelFetch` calls (`{"requested":true}`; the only caller is the
+  Cancel button in FetchProgressBar) → 08:26:20.1 `fetch
+  geofabrik-portugal cancelled after 3 slices; partial kept for resume`
+  at 39,214,616 B (`verified=false`).
+- 08:26:23 download restarted in the same process from 39,214,616 B
+  (progress continues 38.4 → 82.4 MiB, no reset).
+- **Kill:** 08:26:26.850 `ActivityManager: Killing 26045:com.freehike.app
+  … (adj 900): remove task` (swipe from recents), mid-slice at ~82–83 MiB.
+- **Reopen** (new process 26398, 08:26:29): `query_fetch -> found
+  (87449112/424970644 bytes, verified=false)`, restarts=0 → resumed from
+  the saved position, not zero; first resumed slice yields 101,195,288 B.
+  Server answer: not logged. By the code (`fetcher/src/lib.rs`
+  `download`), a non-zero resume only proceeds without a restart on a 206
+  whose Content-Range starts exactly at the held length and matches the
+  pinned total; a 200, 404, 416 or mismatched range would count a restart.
+  restarts stayed 0, so it was a 206 from 87,449,112 — inferred from code,
+  not observed.
+- Finished 08:27:01.676 in 6 slices, `verified=true`, restarts=0.
+- Compile enqueued 08:27:36: sidecar gate accepted (`scheduled:true`,
+  `bg_portugal_muxsc2cq`), fresh start. By 08:33:25: 1,116 blocks (3%),
+  single 2s slices 10–85s apart, every one `checkpoint durable`. 08:28:18
+  one overlapping runner refused by the slice lock (`locked by another
+  runner (slice already in progress): Try again (os error 11)`) → logged
+  transient refusal, no damage. No FGS line in run 2. Compile left
+  running; completion is out of scope.
+
+### Both runs — map boot and index
+
+- Every web boot (2 in run 1, 4 in run 2): terrain skipped quietly as
+  optional (`Optional "alps_terrain.pmtiles" is absent — continuing
+  without it`). The basemap is a required file and fails to provision on a
+  fresh install (`Failed to provision "alps_basemap.pmtiles" (expected on
+  native builds — no /local/ path)`), followed by `[MapLibre] Offset is
+  outside the bounds of the DataView` and the B008 sprite error. With a
+  required-file failure, MapView's banner condition is met. Operator's
+  visual observation of the banner: not yet recorded.
+- Other console errors: `Error injecting safe area CSS … null (reading
+  'style')` ×3 at the 08:26:29 cold boot; touchmove-cancel warnings at
+  08:27:50.
+- On-device index: no open/repair/corruption lines in either run (not
+  searched for beyond the capture).
+
+**Status:** observed; uncommitted for the operator.
+
+Addendum (operator observations, code-traced, facts only):
+- **Innsbruck still offered.** The list is `HIKE_LOCATIONS` in
+  `src/ui/components/MapView.tsx:123` (Innsbruck Center, Nordkette Range,
+  Patscherkofel), rendered as the header `<select>` at :935. These are
+  camera fly-to bookmarks from `91110e3` (2026-07-10), set to the old
+  bundled Alps dev archive; they are not download regions. C2b
+  (`d8f89e7`) replaced the presets in `RegionPicker.tsx` only and did
+  not touch MapView. On a phone build there is no data under these points.
+- **Compile progress never wired to the UI.** Since the Android worker
+  first landed (`913865c`, 2026-07-17), its progress callback is
+  `LoggingProgressSink` (`BackgroundCompileWorker.kt:264`), which only
+  writes to logcat (the `BG compile N%` lines). The worker sends the
+  WebView terminal events only (`emitBackgroundEvent` at :85 circuit
+  breaker, :130 threw, :183 finished, :201 failed) as a doorbell.
+  `BackgroundHandoffBar` shows only the post-compile handoff stages
+  (copying/swapping/done/error); its live bar runs only while copying into
+  OPFS. The one path that streams per-block progress to JS
+  (`compilationProgress`) is the foreground `startJob` debug compile in
+  `App.tsx:181` (hardcoded Innsbruck bbox), which the region flow does not
+  use. So it did not stop receiving updates; it never received any.
+
+Addendum (operator's screen, 08:28, screenshot taken by the operator):
+- Map-data banner shown: "Map data unavailable: Couldn't load offline map
+  data for: alps_basemap.pmtiles. The map may be missing trail layers."
+  Expected on a fresh install (no basemap exists yet); it names the Alps
+  file. Matches the required-file provisioning failure logged on every boot.
+- Storage-persistence warning shown above it ("Storage is not
+  persistent…"), matching the console `WARNING: Storage is not persistent`.
+- No terrain or elevation message anywhere → the no-terrain boot path
+  holds on device.
+- Also on screen: a "Compiling…" pill and "Background compile queued"
+  (status only, no percentage — consistent with the progress addendum
+  above); jump menu on "Innsbruck Center".
+- Run-2 cancel taps (08:26:16 / 08:26:17): intentional, by the operator's
+  recollection, not certain.

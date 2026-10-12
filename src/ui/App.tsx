@@ -3,7 +3,9 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import MapView from './components/MapView';
 import BackgroundHandoffBar from './components/BackgroundHandoffBar';
 import RegionPicker from './components/RegionPicker';
-import { requestPersistentStorage } from './services/storageGuard';
+import { Capacitor } from '@capacitor/core';
+import { requestPersistentStorage, showStorageWarning } from './services/storageGuard';
+import { savedRegionMissingMessage } from '../services/regionLabel';
 import { MapCompiler } from '../plugins/MapCompiler';
 import { useCompilerStore } from '../store/compilerStore';
 
@@ -48,6 +50,8 @@ export default function App() {
   // ── User-facing error banners (surfaced instead of console-only logging) ────
   const [locationPermissionDenied, setLocationPermissionDenied] = useState(false);
   const [mapDataError, setMapDataError] = useState<string | null>(null);
+  /** P9.C10: the saved region's archive was gone at boot (an eviction we can see). */
+  const [savedRegionMissing, setSavedRegionMissing] = useState<string | null>(null);
 
   // ── Phase 1 debug: native MapCompiler round-trip log ────────────────────────
   /** Rolling log (last 8 lines) of the native compile debug round-trip. */
@@ -221,12 +225,17 @@ export default function App() {
     setMapDataError(message);
   }, []);
 
+  const handleSavedRegionMissing = useCallback((regionLabel: string) => {
+    setSavedRegionMissing(savedRegionMissingMessage(regionLabel));
+  }, []);
+
   // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-between p-6 md:p-12 font-sans selection:bg-emerald-500/30 selection:text-emerald-300">
 
-      {isStorageDurable === false && (
+      {/* P9.C10: web builds only — on native the web view cannot grant persistence */}
+      {showStorageWarning(Capacitor.isNativePlatform(), isStorageDurable) && (
         <div className="w-full max-w-6xl mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between text-sm text-amber-400">
           <div className="flex items-center gap-2.5">
             <svg className="h-5 w-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -252,6 +261,28 @@ export default function App() {
           </div>
           <button
             onClick={() => setLocationPermissionDenied(false)}
+            className="ml-3 p-1 rounded text-amber-400 hover:text-amber-200 shrink-0 cursor-pointer"
+            title="Dismiss"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
+
+      {savedRegionMissing && (
+        <div className="w-full max-w-6xl mb-6 p-4 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between text-sm text-amber-400">
+          <div className="flex items-center gap-2.5">
+            <svg className="h-5 w-5 text-amber-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <span>
+              <strong>Offline map removed:</strong> {savedRegionMissing}
+            </span>
+          </div>
+          <button
+            onClick={() => setSavedRegionMissing(null)}
             className="ml-3 p-1 rounded text-amber-400 hover:text-amber-200 shrink-0 cursor-pointer"
             title="Dismiss"
           >
@@ -342,6 +373,7 @@ export default function App() {
           }}
           onLocationPermissionDenied={handleLocationPermissionDenied}
           onMapDataError={handleMapDataError}
+          onSavedRegionMissing={handleSavedRegionMissing}
           onPositionUpdate={handlePositionUpdate}
         />
       </section>

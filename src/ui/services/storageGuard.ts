@@ -13,6 +13,18 @@ export interface StorageStatus {
 }
 
 /**
+ * P9.C10 — whether to show the "storage is not persistent" warning. Never on
+ * native: Android's web view answered persist() === false on every boot of
+ * the device runs and has no way to grant it, so the warning was noise the
+ * user could not act on. An eviction that actually happens is announced
+ * instead (the saved region's file is gone at boot — MapView's
+ * onSavedRegionMissing). `isPersistent` null = not answered yet.
+ */
+export function showStorageWarning(isNative: boolean, isPersistent: boolean | null): boolean {
+  return !isNative && isPersistent === false;
+}
+
+/**
  * Requests that the browser retain storage durably (preventing automatic OS eviction)
  * and estimates the remaining storage quota in Gigabytes.
  */

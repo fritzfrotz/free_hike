@@ -11,6 +11,7 @@ import { planBoot, type BootPlan } from '../../services/regionBootPolicy';
 import { registerPMTilesSource, type TelemetryData } from '../../services/pmtilesRegistry';
 import { mapInitOutcome, stripBasemap, stripTerrain } from '../../services/styleTerrain';
 import { viewClampFromHeader, type ViewClamp } from '../../services/viewClamp';
+import { regionDisplayName } from '../../services/regionLabel';
 import RegionSelectorOverlay from './RegionSelectorOverlay';
 
 export type { TelemetryData };
@@ -111,25 +112,6 @@ async function getBlankDemTile(): Promise<Blob> {
 }
 
 // ---------------------------------------------------------------------------
-// Static hiking location presets
-// ---------------------------------------------------------------------------
-
-interface HikeLocation {
-  name: string;
-  region: string;
-  coords: [number, number];
-  zoom: number;
-}
-
-const HIKE_LOCATIONS: HikeLocation[] = [
-  // All three points are within the alps_basemap.pmtiles / alps_terrain.pmtiles
-  // boundary box (approx. z5-z14, Innsbruck/Alps region).
-  { name: 'Innsbruck Center', region: 'Tyrol, Austria', coords: [11.3908, 47.2757], zoom: 12 },
-  { name: 'Nordkette Range',  region: 'Alps, Austria',  coords: [11.3794, 47.3061], zoom: 13 },
-  { name: 'Patscherkofel',    region: 'Alps, Austria',  coords: [11.4619, 47.2086], zoom: 13 },
-];
-
-// ---------------------------------------------------------------------------
 // OPFS existence probe (P9.C2 cold-boot replay guard)
 // ---------------------------------------------------------------------------
 
@@ -202,6 +184,8 @@ export interface MapViewProps {
   onLocationPermissionDenied?: () => void;
   /** Called with a human-readable message when offline map data fails to provision. */
   onMapDataError?: (message: string) => void;
+  /** P9.C10: the saved region was dropped at boot — its OPFS archive is gone. */
+  onSavedRegionMissing?: (regionLabel: string) => void;
   /** Called with every live GPS fix — drives the Active Trip HUD's distance tracking. */
   onPositionUpdate?: (pos: { lng: number; lat: number; accuracy: number }) => void;
   /**
@@ -218,6 +202,7 @@ export default function MapView({
   onMapDataWorkerReady,
   onLocationPermissionDenied,
   onMapDataError,
+  onSavedRegionMissing,
   onPositionUpdate,
   onRegionSwitcherReady,
 }: MapViewProps) {
@@ -239,7 +224,8 @@ export default function MapView({
   const [liveMap, setLiveMap] = useState<maplibregl.Map | null>(null);
   const [statusMessage,  setStatusMessage]  = useState('Booting offline mapping engines...');
   const [fileSize,       setFileSize]       = useState<number | null>(null);
-  const [selectedHike,   setSelectedHike]   = useState(HIKE_LOCATIONS[0].name);
+  /** P9.C10: the basemap archive the map is bound to (pill + telemetry box). */
+  const [boundBasemap,   setBoundBasemap]   = useState<string | null>(null);
   /** P9.C9: the boot found no archive to show (native, nothing compiled yet). */
   const [noRegion,       setNoRegion]       = useState(false);
   /** P9.C9: bumped once when the first region arrives on a no-archive boot —
@@ -494,6 +480,7 @@ export default function MapView({
                 if (terrainToBind && tSrc?.setUrl) tSrc.setUrl(`pmtiles://local/${terrainToBind}`);
 
                 activeFilesRef.current = { basemap: basemapFile, terrain: nextTerrain };
+                setBoundBasemap(basemapFile);
 
                 // P9.C9: the new archive's header bounds the view.
                 if (newBasemap) {
@@ -733,9 +720,11 @@ export default function MapView({
       if (plan.dropped) {
         console.warn(`[MapView] Saved region "${plan.dropped.regionLabel}" dropped — its OPFS file is gone.`);
         useMapStore.getState().clearActiveRegion();
+        onSavedRegionMissing?.(plan.dropped.regionLabel);
       }
       bootPlan = plan;
       activeFilesRef.current = { basemap: plan.basemap, terrain: plan.terrain };
+      setBoundBasemap(plan.basemap);
       if (plan.basemap === null) {
         bootMap(null); // nothing to open: no MAP_INIT, the empty state
         return;
@@ -908,25 +897,6 @@ export default function MapView({
   }, [setTrackingCamera]);
 
   // ---------------------------------------------------------------------------
-  // Location selector handler
-  // ---------------------------------------------------------------------------
-
-  const handleLocationSelect = (locationName: string) => {
-    setSelectedHike(locationName);
-
-    const loc = HIKE_LOCATIONS.find(l => l.name === locationName);
-    if (loc && mapRef.current) {
-      mapRef.current.flyTo({
-        center: loc.coords,
-        zoom:   loc.zoom,
-        speed:  1.2,
-        curve:  1.4,
-        essential: true,
-      });
-    }
-  };
-
-  // ---------------------------------------------------------------------------
   // Derived UI labels
   // ---------------------------------------------------------------------------
 
@@ -983,21 +953,13 @@ export default function MapView({
       {showChrome && (
         <div className="absolute top-4 left-4 right-4 z-20 flex flex-wrap items-center justify-between gap-3 pointer-events-none">
 
-          {/* Location selector */}
+          {/* Bound region (P9.C10): the archive the map shows, by name */}
           <div className="pointer-events-auto backdrop-blur-md bg-slate-950/70 border border-slate-800 rounded-2xl p-2.5 flex items-center space-x-3 shadow-lg max-w-sm">
             <span className="text-[10px] uppercase font-mono tracking-widest text-slate-500">Region</span>
             <div className="h-4 w-px bg-slate-800" />
-            <select
-              value={selectedHike}
-              onChange={(e) => handleLocationSelect(e.target.value)}
-              className="bg-transparent text-slate-200 font-semibold text-xs focus:outline-none cursor-pointer pr-4"
-            >
-              {HIKE_LOCATIONS.map(loc => (
-                <option key={loc.name} value={loc.name} className="bg-slate-950 text-slate-200">
-                  {loc.name} ({loc.region})
-                </option>
-              ))}
-            </select>
+            <span className="text-slate-200 font-semibold text-xs pr-1">
+              {boundBasemap ? regionDisplayName(boundBasemap) : 'No offline map'}
+            </span>
           </div>
 
           {/* OPFS mode pill */}
@@ -1021,7 +983,7 @@ export default function MapView({
             <div className="grid grid-cols-2 gap-2 text-xs font-mono">
               <div className="p-2 rounded-xl bg-slate-900/40 border border-slate-800">
                 <span className="text-[9px] text-slate-500 uppercase block leading-none">Database</span>
-                <span className="text-slate-300 font-bold block mt-1">alps_basemap.pmtiles</span>
+                <span className="text-slate-300 font-bold block mt-1 truncate" title={boundBasemap ?? undefined}>{boundBasemap ?? '—'}</span>
               </div>
               <div className="p-2 rounded-xl bg-slate-900/40 border border-slate-800">
                 <span className="text-[9px] text-slate-500 uppercase block leading-none">Local Size</span>

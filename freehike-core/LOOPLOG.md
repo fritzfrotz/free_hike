@@ -4430,3 +4430,97 @@ MapView 3, ladder 2, preview 1, build 2, fix/close/stage 3 = 19; fixes 3.
   this entry 1, stage 1). Pivots: 0.
 
 **Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+## P9.C10 — demo labels and the storage banner (chunk B) (plan, 2026-10-12)
+
+**Operator calls:** on top of `wip/boot` (`51a16b6`, P9.C9), same branch;
+one device run covers both. Budget 18. Storage: drop the persistence
+warning on native, add a banner for the one visible eviction case (the
+saved region's file is gone at boot). Not load-bearing. Stop at staged;
+commands inside the repo only.
+
+**Goal:** no Innsbruck presets on the demo screen; the Region pill and the
+telemetry box name the archive actually bound ("Portugal" for a compiled
+region); no storage warning on native; a dropped region is announced.
+
+**Change:** remove `HIKE_LOCATIONS`, the Region dropdown and its fly-to;
+the pill shows `regionDisplayName(bound file)` ("No offline map" when
+none); the telemetry box shows the bound file. App shows the persistence
+warning only on a web build that is not persistent
+(`showStorageWarning`); MapView reports a dropped saved region
+(`onSavedRegionMissing`) and App shows `savedRegionMissingMessage`.
+
+**Files:** `src/services/regionLabel.ts` + test (new),
+`src/ui/services/storageGuard.ts` + `storageGuard.test.ts` (new),
+`src/ui/components/MapView.tsx`, `src/ui/App.tsx`, `TRACKER.md`
+(generated), LOOPLOG.
+
+**Proofs (named before implementation):**
+- `regionDisplayName: job ID slug becomes the region name`
+- `regionDisplayName: anything else is shown as given, minus .pmtiles`
+- `savedRegionMissingMessage: names the region`
+- `showStorageWarning: never on native, only when a web build is not
+  persistent`
+
+**APK recipe (device build for P9.C9 + P9.C10):** `npm run build` →
+`npx cap sync android` → `cd android && gradlew --offline assembleDebug`
+(JAVA_HOME openjdk@21); then size + SHA-256 and a bundle string check.
+
+**Steps [E]/[D]:** 1 [E] calls (done). 2 [D] red tests. 3 [D] helpers.
+4 [D] MapView + App. 5 [D] ladder ×2 + dev preview check. 6 [D] APK by
+the recipe, janitor `--fix`, close entry, stage → STOP.
+Allocation (18): plan 1, red tests 2, red run 1, helpers 2, MapView +
+App 2, ladder 2, preview 1, build 2, fix/close/stage 3 = 16; fixes 2.
+
+### P9.C10 — execution + close (2026-10-12)
+
+- Red: `regionLabel` suite failed on import; `showStorageWarning is not a
+  function`. Green after one implementation round.
+- Process slip, fixed inside the chunk: the agent wrote
+  `src/ui/services/storageGuard.test.ts` as a new file without reading
+  it first; the file existed (P-FE.C1, 5 tests for
+  `requestPersistentStorage`) and the write replaced it. Found from the
+  tool's "updated" reply right after the red run; restored from HEAD and
+  the new test appended. Against HEAD the file differs only by the import
+  line and the added `describe`; all 5 original tests run (suite count
+  below includes them). Cost: 1 fix step.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 15 files /
+  86 tests (was 14 / 82; +4 = the named proofs), janitor `--check` clean.
+  Janitor `--fix`: B008's MapView line moved 388 → 374; nothing else.
+- Dev preview check: no dropdown (0 `<select>`), no Innsbruck / Nordkette
+  / Patscherkofel text; the Region pill reads "alps_basemap" and the
+  telemetry box "alps_basemap.pmtiles" (the dev preview archive, shown as
+  given); storage warning still shown (web build, not persistent —
+  intended); no missing-region banner. Getting past the boot overlay again
+  needed an in-page jump to z12 (the P9.C9 dev-preview finding, reproduced;
+  native unaffected).
+- Not exercised here (native-only): the pill reading "Portugal", no
+  storage warning on native, the missing-region banner (needs an evicted
+  or deleted archive).
+- Build identity for the device run (P9.C9 + P9.C10), by the recipe in the
+  plan: debug APK 12,160,222 B, SHA-256
+  `1140a0e37b0cb994ade02090ca7d47e56b38aec1d6c664c162d5f2da7aae16a8`.
+  Bundle check: "No offline map yet", "continues while charging", "is no
+  longer on this device" present; "Innsbruck Center", "Patscherkofel"
+  absent; one app bundle (`index-Bow2XYY-.js`, 1,340,434 B, same as the
+  assets folder); no `assets/public/local/`; arm64 release
+  `libfreehike_ffi.so` 5,065,152 B. Supersedes the P9.C9 APK. The
+  418,252 B drop from the P9.C9 APK (12,578,474 B) is not explained by
+  this diff; not investigated.
+- Flagged deviations (operator veto offered): (1) the dev preview pill
+  shows the raw file name ("alps_basemap") — no special case for the
+  preview archive; (2) the missing-region banner is amber and
+  dismissible, worded "Offline map removed: The offline map for <name>
+  is no longer on this device — download it again."
+- Device run (adds to the P9.C9 pass): pill reads "Portugal"; no storage
+  warning; no Innsbruck text anywhere.
+- Promotion valve: candidate lesson — never write a "new" file without
+  checking it does not exist (the slip above); the Write tool already
+  enforces read-before-overwrite for files read in-session, so the
+  durable fix is agent discipline, not a rule. Not promoted; operator
+  call.
+- Steps: 17/18 (plan 1, red tests 2, red run 1, restore 1, helpers 2,
+  MapView 1, App 1, ladder 2, preview 1, web build + sync 1, APK 1,
+  `--fix` 1, this entry 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).

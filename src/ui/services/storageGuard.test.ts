@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // P-FE.C1 priority 5 — durable-storage request + quota estimation.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { requestPersistentStorage } from './storageGuard';
+import { requestPersistentStorage, showStorageWarning } from './storageGuard';
 
 const GB = 1024 * 1024 * 1024;
 
@@ -75,5 +75,20 @@ describe('requestPersistentStorage', () => {
     const status = await requestPersistentStorage();
     expect(status).toEqual({ isPersistent: false, quotaGb: 0, usageGb: 0 });
     expect(errorSpy).toHaveBeenCalled();
+  });
+});
+
+// P9.C10 — Android's web view returned persist() === false on every boot
+// (device runs 10-07, 10-12) and offers no way to grant it, so on native the
+// warning is noise the user cannot act on.
+describe('showStorageWarning', () => {
+  it('showStorageWarning: never on native, only when a web build is not persistent', () => {
+    expect(showStorageWarning(true, false)).toBe(false);
+    expect(showStorageWarning(true, true)).toBe(false);
+    expect(showStorageWarning(true, null)).toBe(false);
+    expect(showStorageWarning(false, false)).toBe(true);
+    expect(showStorageWarning(false, true)).toBe(false);
+    // Not answered yet: no warning.
+    expect(showStorageWarning(false, null)).toBe(false);
   });
 });

@@ -4524,3 +4524,117 @@ App 2, ladder 2, preview 1, build 2, fix/close/stage 3 = 16; fixes 2.
   `--fix` 1, this entry 1, stage 1). Pivots: 0.
 
 **Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+## Samsung release-candidate run — observed (2026-10-12, rc1)
+
+Mode: execute and observe; no code changes. Summary only; raw captures
+stay in the git-ignored device-logs folder.
+
+- **Device:** Samsung SM-S918B (S23 Ultra), Android 16.
+- **Build:** pre-merge, P9.C8 + P9.C9 + P9.C10 (`wip/boot`), debug APK
+  12,160,222 B, SHA-256
+  `1140a0e37b0cb994ade02090ca7d47e56b38aec1d6c664c162d5f2da7aae16a8`
+  (as built at the P9.C10 close; the installed copy was not hash-checked
+  in the logs).
+- **Evidence:** the live two-tag capture stops at the USB unplug, about
+  26 s into the compile. The all-buffers dump (taken after the run; the
+  first two dump attempts produced empty files because the phone was not
+  connected) has system and event buffers for the whole run, but its main
+  buffer had rotated: our progress lines and the web console are missing
+  from about 6 % to about 60 % of the compile, and the first boot's web
+  console is not captured at all. Screen states come from the operator.
+
+### Steps
+
+0. **Fresh install + capture — pass (capture partial).** The install
+   itself is not in the logs; the first launch is. Capture limits above.
+1. **First open, empty state — pass (operator).** Screenshot: empty
+   state, "No offline map" pill, "Compiling 3%" in the bar (taken later
+   in the run), airplane icon. The first boot's web console is not
+   captured.
+2. **Fetch Portugal, then airplane on — pass.** 425,467,579 B in 28
+   slices of about 5 s, 0 restarts, about 2 min 22 s. A state query later
+   in the run reports the extract verified. Airplane on about 10 s after
+   the fetch finished: cellular radio off and data networks torn down at
+   once; Wi-Fi came back only after airplane off.
+3. **Compile from the foreground, bar Queued → Compiling — pass (log);
+   wording: operator observation pending for "Queued".** Enqueued about
+   20 s after the fetch; foreground-service start allowed (app on screen);
+   first progress 2.1 s after the request; slices every 2.0–2.05 s in the
+   captured start.
+4. **USB unplug → Paused — log pass; wording: operator observation
+   pending.** The job stopped within 0.1 s of the unplug at 6 % (last
+   captured progress) and its foreground service stopped with it. No poll
+   lines survive for this window, so what the bar showed is not in the
+   logs; by design it shows "Paused at 6%" once the last save is older
+   than 15 s.
+5. **Wall charger → Compiling resumes — log pass; wording: operator
+   observation pending.** The job and a new foreground service started
+   0.2 s after the charger connected; stopped for about 43 s in all.
+6. **Unlock after finish, handoff, map without restart — FAIL
+   (operator: white screen, never recovered; map bound after a restart).**
+   Log: the compile finished with the phone locked. On unlock, discovery
+   found the finished job at once; the copy into app storage
+   (93,988,534 B) took about 5 s on the first attempt, with no activity
+   destroy; the acknowledge cleared about 0.5 s later. 27 ms after that the
+   page threw an uncaught "Cannot read properties of undefined (reading
+   'destroy')", and the GPS watcher was removed right after (the whole page
+   unmounted). Cause, from the code: this is the P9.C9 first-region remount
+   on a fresh install. The boot effect's cleanup calls MapLibre's
+   `remove()` twice on the same map instance (`map` and `mapRef.current`);
+   MapLibre 5.24 deletes its handler set in the first call, so the second
+   throws. That cleanup predates P9.C9, but this was the first time it
+   ran on a live map (StrictMode remounts run it before the map exists).
+   The relaunch after the operator's swipe-kill bound the compiled archive
+   directly.
+7. **Pinch-out / pan clamp — pass (operator).**
+8. **Street-level browse — pass (operator).**
+9. **Force stop → cold boot on Portugal, screenshot — pass (operator).**
+   Screenshot: Portugal pill, no banners, map drawn. Log: no force-stop
+   event; a removal from recents killed the process once (after the white
+   screen); a later removal destroyed only the screen, the process
+   survived and the screen was recreated. Each captured boot opened only
+   the compiled archive and served it from app storage: no preview-archive
+   request, no "Map data unavailable", no data-view error; the only error
+   was the known sprite one (B008). The persistence warning is now
+   console-only.
+10. **Airplane off, dumps — pass.** Airplane off about 15 min after on;
+    Wi-Fi reconnected within about 4 s. Dumps as described above.
+
+### Findings (plain words)
+
+- The white screen at handoff is a defect in P9.C9's remount path (the
+  double `remove()`), not a renderer crash and not a low-memory destroy:
+  the web view's renderer died only with the app, 0.1 s after the
+  operator's swipe-kill.
+- GPS tap (operator: the map disappears and does not return): no error
+  of any kind is logged in either session. The GPS fixes are inside the
+  region's bounding box, so the fly-to target is inside the clamp. From the
+  code: while camera tracking is on, every fix (about one per second here)
+  starts a new 3-D `flyTo` to zoom 15. Whether that causes the blank map
+  is not established.
+- Battery at 80 %: the phone reached 80 % about 9 min into the compile
+  and reported "not charging" from then on. The worker did not stop: its
+  foreground service ran unbroken from the re-plug to the finish, and the
+  captured progress lines (last ~6 min) arrive every 2.0–2.6 s. The
+  stop-and-go the operator saw does not appear in the worker. Two things
+  that can look like it: the web view's 3 s poll stops while the screen is
+  off, so the bar only moves with the screen on; and in Pass 3 one
+  percent took up to about 30 s.
+- Thermal status was light (skin about 40 °C) for the first ~3 min of the
+  compile, normal afterwards.
+- No network request by the app while airplane mode was on: no
+  non-local URL from the app's process; the network errors in that window
+  came from another process.
+- Compile totals: 339 slices, about 13.5 min from request to finish
+  including the ~43 s unplug stop; 2,433,767 blocks; archive 93,988,534 B.
+- The debug build logs every plugin result: each 3 s poll result, and
+  during the handoff every base64 chunk of the archive (about 94 MB through
+  the log). Debug-build noise and extra load during the copy (relevant to
+  D011).
+- Comparison with the 11:15 run of the same day (observation only): same
+  input, same blocks and archive size; that run took 253 slices and about
+  8 min 51 s, this one 339 slices and about 13.5 min including the unplug
+  stop; both reached 6 % in about 24–26 s. That run lost its first handoff
+  attempt to a low-memory destroy; this one copied on the first attempt
+  and then failed at the remount.

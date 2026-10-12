@@ -10,7 +10,7 @@
  * compileStateLabel straight to the DOM. Per ARCHITECTURE.md P8 the number
  * never touches React or Zustand.
  *
- * iOS saves no progress (D004), so there the label stays "Queued".
+ * iOS saves no progress (D004), so there the label stays queued.
  */
 
 export interface CompileProgressSnapshot {
@@ -54,7 +54,7 @@ export function compileStateLabel(
   nowMs: number,
 ): { word: CompileStateWord; text: string } {
   if (snap.percent === null || snap.atMs === null) {
-    return { word: 'queued', text: 'Queued' };
+    return { word: 'queued', text: 'Queued — runs while the device is charging' };
   }
   if (nowMs - snap.atMs > PAUSED_AFTER_MS) {
     return { word: 'paused', text: `Paused at ${snap.percent}% — continues while charging` };

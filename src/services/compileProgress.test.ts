@@ -33,7 +33,7 @@ describe('compileProgress', () => {
     // No percent saved yet (also the permanent iOS case): queued, no number.
     expect(compileStateLabel({ jobId: 'j', percent: null, atMs: null }, now)).toEqual({
       word: 'queued',
-      text: 'Queued',
+      text: 'Queued — runs while the device is charging',
     });
 
     // Fresh save: compiling.

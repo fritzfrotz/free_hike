@@ -4285,3 +4285,35 @@ ladder 4, APK 1, fix/close/stage 3 = 22; fixes 8.
   check 1, `--fix` 1, this entry 1, stage 1). Pivots: 0.
 
 **Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+Review addendum (2026-10-12, operator review of `23ac65a`, three items;
+budget 30 → 34 by operator call):
+- Item 1 (deviation 3 reversed): the queued label is again
+  "Background compile: Queued — runs while the device is charging"
+  (`compileStateLabel`'s queued text); the label test asserts the new
+  text. Compiling and Paused unchanged.
+- Item 2: D011 tag text gains one sentence — the 3 s progress poll
+  re-runs discovery, so it is a second entry point into the handoff copy.
+  Janitor `--fix`: TRACKER.md regenerated (4 debt, 1 bug).
+- Item 3 (APK size): open, waiting for the 8c3a3ed APK pulled from the
+  Samsung. The two-build comparison as specified can no longer show it:
+  ladder run 2's `--rerun-tasks` replaced the stale intermediates, so a
+  cached build and a forced build now both give the 12 MB APK, and no
+  copy of the 37 MB APK is left. Facts so far: the 12 MB APK has no
+  `assets/public/local/`; `dev_assets/local` holds the two preview
+  archives (13,247,300 B + 6,073,840 B); the size gap is 25,338,465 B,
+  not an exact match. Unconfirmed reading: the 37 MB builds carried
+  leftover preview archives in their assets.
+- The 12,139,398 B APK recorded above predates item 1's text change; the
+  device run needs a rebuild after this addendum.
+- Process note: while looking for a copy of the 37 MB APK the agent ran a
+  file search over the whole home folder, which raised a macOS prompt for
+  Documents, Music and Desktop (operator denied). Operator rule from here:
+  every command runs inside the repo, no search, listing or temp files
+  outside it.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 13 files /
+  75 tests, janitor `--check` clean. No Kotlin change, so no Gradle run.
+- Steps: 32/34 (text + test 1, D011 1, `--fix` 1, ladder 2, this
+  addendum 1, stage 1, on top of 25). Pivots: 0.
+
+**Status:** AGENT-CLOSED — item 3 open; commit by the operator (wip branch).

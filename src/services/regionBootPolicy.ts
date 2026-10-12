@@ -59,3 +59,56 @@ export function decideRegionBoot(
   if (toVerify.length === 0) return { action: 'noop' };
   return { action: 'bind' };
 }
+
+/** The two preview archives the Vite dev server serves (dev_assets/local). */
+export interface BootFiles {
+  basemapFile: string;
+  terrainFile: string;
+}
+
+export interface BootPlan {
+  /** Archive the map boots on; null = no map yet (native, nothing compiled). */
+  basemap: string | null;
+  /** Optional terrain archive to try; null = none. */
+  terrain: string | null;
+  /** The saved region, when it was dropped because a file is gone. */
+  dropped: OfflineRegion | null;
+}
+
+/**
+ * P9.C9 — picks the boot files BEFORE the mapData worker opens anything.
+ * The worker opens with `{ create: true }`, so naming a file there
+ * fabricates it: a native boot must therefore never name a dev preview
+ * archive. Order: the saved region if every file it references holds bytes;
+ * else, on the Vite dev server only, the preview archives; else nothing.
+ *
+ * On the dev server the preview archives are exempt from the probe (the
+ * worker provisions them on open); on native every file is probed, so a
+ * region saved by an older build that points at a preview archive drops.
+ */
+export async function planBoot(
+  persisted: OfflineRegion | null,
+  opts: { isDev: boolean; devDefaults: BootFiles; hasBytes: (filename: string) => Promise<boolean> },
+): Promise<BootPlan> {
+  const { isDev, devDefaults, hasBytes } = opts;
+  let dropped: OfflineRegion | null = null;
+
+  if (persisted) {
+    const exempt = isDev ? devDefaults : { basemapFile: '', terrainFile: '' };
+    const toVerify = regionFilesToVerify(persisted, exempt);
+    const exists = await Promise.all(toVerify.map(hasBytes));
+    if (decideRegionBoot(toVerify, exists).action !== 'clear') {
+      return {
+        basemap: persisted.basemapFile,
+        terrain: persisted.terrainFile ?? (isDev ? devDefaults.terrainFile : null),
+        dropped: null,
+      };
+    }
+    dropped = persisted;
+  }
+
+  if (isDev) {
+    return { basemap: devDefaults.basemapFile, terrain: devDefaults.terrainFile, dropped };
+  }
+  return { basemap: null, terrain: null, dropped };
+}

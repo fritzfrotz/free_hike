@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { StyleSpecification } from 'maplibre-gl';
-import { mapInitOutcome, stripTerrain } from './styleTerrain';
+import { mapInitOutcome, stripBasemap, stripTerrain } from './styleTerrain';
 
 const TERRAIN = 'alps_terrain.pmtiles';
 
@@ -63,5 +63,20 @@ describe('mapInitOutcome', () => {
         TERRAIN,
       ),
     ).toEqual({ hasTerrain: true, userFacingFailures: ['alps_basemap.pmtiles'] });
+  });
+});
+
+// P9.C9 — a native boot with no compiled region yet mounts the map with no
+// basemap at all (the empty state), instead of a zero-byte placeholder.
+describe('stripBasemap', () => {
+  it('stripBasemap: drops the basemap source and every layer drawn from it', () => {
+    const before = realStyle();
+    const after = stripBasemap(stripTerrain(before));
+    expect(after.sources['basemap-local']).toBeUndefined();
+    expect(Object.keys(after.sources)).toEqual([]);
+    expect(after.layers.map((l) => l.id)).toEqual(['background-layer']);
+    // Input untouched.
+    expect(before.sources['basemap-local']).toBeDefined();
+    expect(before.layers).toHaveLength(22);
   });
 });

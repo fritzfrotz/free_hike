@@ -20,7 +20,7 @@
 ## Open Bugs
 
 - **B008** — [minor] style asset gaps, sprite URL rejected as relative by MapLibre and a contour-label fontstack is not in the vendored glyph set (local glyph fallback renders digits) — repro: boot dev app, console shows sprite error + glyph range warnings
-  - src/ui/components/MapView.tsx:348
+  - src/ui/components/MapView.tsx:388
 
 ## Rule Exemptions
 

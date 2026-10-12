@@ -7,9 +7,10 @@ import mlcontour from 'maplibre-contour';
 import type { Feature as GeoJSONFeature } from 'geojson';
 import { startTracking, stopTracking, type TrackerHandle } from '../services/locationTracker';
 import { useMapStore } from '../../store/mapStore';
-import { decideRegionBoot, regionFilesToVerify } from '../../services/regionBootPolicy';
+import { planBoot, type BootPlan } from '../../services/regionBootPolicy';
 import { registerPMTilesSource, type TelemetryData } from '../../services/pmtilesRegistry';
-import { mapInitOutcome, stripTerrain } from '../../services/styleTerrain';
+import { mapInitOutcome, stripBasemap, stripTerrain } from '../../services/styleTerrain';
+import { viewClampFromHeader, type ViewClamp } from '../../services/viewClamp';
 import RegionSelectorOverlay from './RegionSelectorOverlay';
 
 export type { TelemetryData };
@@ -132,6 +133,16 @@ const HIKE_LOCATIONS: HikeLocation[] = [
 // OPFS existence probe (P9.C2 cold-boot replay guard)
 // ---------------------------------------------------------------------------
 
+/** P9.C9: points the style's basemap source at `filename` (pmtiles:// URL). */
+function withBasemapFile(style: StyleSpecification, filename: string): StyleSpecification {
+  const source = style.sources['basemap-local'];
+  if (!source || source.type !== 'vector') return style;
+  return {
+    ...style,
+    sources: { ...style.sources, 'basemap-local': { ...source, url: `pmtiles://local/${filename}` } },
+  };
+}
+
 /**
  * True if `filename` exists at the OPFS root with at least one byte. Used to
  * validate a persisted region before binding the map to it — OPFS can be
@@ -217,7 +228,7 @@ export default function MapView({
    *  loadOfflineRegion() skip re-registering a source that hasn't changed
    *  (re-registering an already-active PMTiles source duplicates its worker
    *  reader and corrupts in-flight tile transfers). */
-  const activeFilesRef = useRef<{ basemap: string; terrain: string }>({ basemap: '', terrain: '' });
+  const activeFilesRef = useRef<{ basemap: string | null; terrain: string | null }>({ basemap: null, terrain: null });
   const mapDataWorkerRef = useRef<Worker | null>(null);   // OPFS / PMTiles worker
 
   // Map bootstrap state
@@ -229,6 +240,11 @@ export default function MapView({
   const [statusMessage,  setStatusMessage]  = useState('Booting offline mapping engines...');
   const [fileSize,       setFileSize]       = useState<number | null>(null);
   const [selectedHike,   setSelectedHike]   = useState(HIKE_LOCATIONS[0].name);
+  /** P9.C9: the boot found no archive to show (native, nothing compiled yet). */
+  const [noRegion,       setNoRegion]       = useState(false);
+  /** P9.C9: bumped once when the first region arrives on a no-archive boot —
+   *  re-runs the boot effect (teardown gate included) so the map binds it. */
+  const [bootGeneration, setBootGeneration] = useState(0);
 
   // Tile-read telemetry
   const [telemetry, setTelemetry] = useState<TelemetryData>({
@@ -286,16 +302,16 @@ export default function MapView({
     mapDataWorkerRef.current = mapDataWorker;
     onMapDataWorkerReady?.(mapDataWorker);
 
-    // The two OPFS filenames that back the style's pmtiles:// sources.
-    // These names match the URL fragments in high_contrast_outdoor_style.json:
-    //   pmtiles://local/alps_basemap.pmtiles  → basemap-local MapLibre source
-    //   pmtiles://local/alps_terrain.pmtiles  → terrain-local MapLibre source
-    // The terrain archive is OPTIONAL (P-SOV.C3b, DL-004): no compile job
-    // produces one in v0.1, so native builds boot without it.
-    const DEFAULT_BASEMAP  = 'alps_basemap.pmtiles';
-    const DEFAULT_TERRAIN  = 'alps_terrain.pmtiles';
+    // P9.C9: the boot files are picked by planBoot BEFORE the worker opens
+    // anything (its opens use { create: true }, so naming a file fabricates
+    // it). The preview archives below exist only on the Vite dev server
+    // (dev_assets/local); a native boot binds the saved region's archive or
+    // nothing. The style JSON names the preview basemap; its URL is rewritten
+    // to the boot file before MapLibre sees it. Terrain stays OPTIONAL
+    // (P-SOV.C3b, DL-004): no compile job produces one in v0.1.
+    const DEV_PREVIEW = { basemapFile: 'alps_basemap.pmtiles', terrainFile: 'alps_terrain.pmtiles' };
     const STYLE_URL = '/styles/high_contrast_outdoor_style.json';
-    activeFilesRef.current = { basemap: DEFAULT_BASEMAP, terrain: DEFAULT_TERRAIN };
+    let bootPlan: BootPlan = { basemap: null, terrain: null, dropped: null };
 
     let map: maplibregl.Map | null = null;
 
@@ -314,368 +330,382 @@ export default function MapView({
       mapDataWorker.removeEventListener('message', handleInitMessage);
 
       if (response.type === 'MAP_INIT_SUCCESS') {
-        if (!active) return;
-        const init = response.payload as MapInitSuccessPayload;
-        const sizeBytes = init.size;
-        setFileSize(sizeBytes);
-        setStatusMessage(`OPFS storage bound. Database: ${(sizeBytes / 1024 / 1024).toFixed(2)} MB`);
-
-        // A missing terrain archive is the normal v0.1 state on device: it
-        // turns terrain off rather than raising the "map data" banner.
-        const { hasTerrain, userFacingFailures } = mapInitOutcome(init, DEFAULT_TERRAIN);
-        if (userFacingFailures.length > 0) {
-          onMapDataError?.(
-            `Couldn't load offline map data for: ${userFacingFailures.join(', ')}. ` +
-            'The map may be missing trail layers.',
-          );
-        }
-
-        // Register the default sources upfront — terrain only if it exists
-        // (an unregistered key referenced by the style would trip the
-        // registry's fail-loud miss guard).
-        registerSource(DEFAULT_BASEMAP, (tData) => {
-          setTelemetry(prev => ({
-            ...tData,
-            totalBytes: tData.totalBytes > 0 ? tData.totalBytes : prev.totalBytes,
-          }));
-        });
-        const terrainPMTiles = hasTerrain ? registerSource(DEFAULT_TERRAIN) : null;
-
-        const mountMap = (style: string | StyleSpecification) => {
-          if (!mapContainerRef.current) return;
-          setStatusMessage('Mounting map container canvas…');
-
-          // BUG(B008): style asset gaps, sprite URL rejected as relative by MapLibre and a contour-label fontstack is not in the vendored glyph set (local glyph fallback renders digits) — severity: minor — repro: boot dev app, console shows sprite error + glyph range warnings
-          map = new maplibregl.Map({
-            container: mapContainerRef.current,
-            // ── Phase Block-1: High-contrast 3D alpine style ─────────────
-            // External style JSON bundles sources (basemap-local + terrain-local),
-            // the terrain block (exaggeration 1.3), hillshading, contours,
-            // dynamic trail rendering, and peak labels. Without a terrain
-            // archive it arrives here already stripped (stripTerrain).
-            style,
-            center: HIKE_LOCATIONS[0].coords,
-            zoom: HIKE_LOCATIONS[0].zoom,
-            pitch: 45,
-            maxZoom: 18,
-            // Prevent zooming out past the tile extent of our offline
-            // alps_basemap.pmtiles / alps_terrain.pmtiles files (z5-z14).
-            // z4 gives just enough overview to orient without hitting empty space.
-            minZoom: 4,
-            // GPU fill-rate guardrail: prevents horizon overdraw that exhausts
-            // mobile GPU bandwidth at high pitch angles.
-            maxPitch: 60,
-          });
-
-          const activeMap = map;
-          mapRef.current = activeMap;
-          setLiveMap(activeMap);
-          activeMap.on('load', () => {
-            // ── Memory management: WebGL texture-cache OOM guards ────────
-            // Clamp each source cache to 25 tiles max to prevent GPU VRAM
-            // exhaustion on memory-constrained mobile devices.
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (activeMap as any).style?.sourceCaches?.['basemap-local']?.setMaxTiles(25);
-            if (hasTerrain) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              (activeMap as any).style?.sourceCaches?.['terrain-local']?.setMaxTiles(25);
-
-              // Enable 3D terrain mesh mapping using the offline raster DEM source
-              activeMap.setTerrain({
-                source: 'terrain-local',
-                exaggeration: 1.3,
-              });
-            }
-
-            // ── Build the imperative region-switcher ──────────────────────
-            // loadOfflineRegion() hot-swaps the tile sources without a full
-            // style reload. Stored in a ref so the activeRegion effect below
-            // can invoke it directly; also handed to onRegionSwitcherReady
-            // for any external caller that still wants it.
-            {
-              const switcher: OfflineRegionSwitcher = {
-                async loadOfflineRegion(basemapFile: string, terrainFile: string | null) {
-                  const worker = mapDataWorkerRef.current;
-                  if (!worker) throw new Error('[loadOfflineRegion] mapData worker not ready.');
-
-                  // Only touch sources whose filename actually changed —
-                  // re-registering an already-active PMTiles source spins up
-                  // a second WorkerPMTilesSource/PMTiles pair for the same
-                  // file, which corrupts in-flight tile transfers on the
-                  // pre-existing source (surfaces as MapLibre "ArrayBuffer
-                  // already detached" postMessage errors). A null terrain
-                  // keeps whatever terrain the boot found (P-SOV.C3b).
-                  const nextTerrain = terrainFile ?? activeFilesRef.current.terrain;
-                  const basemapChanged = basemapFile !== activeFilesRef.current.basemap;
-                  const terrainChanged = nextTerrain !== activeFilesRef.current.terrain;
-                  if (!basemapChanged && !terrainChanged) return;
-
-                  const changedFilenames = [
-                    ...(basemapChanged ? [basemapFile] : []),
-                    ...(terrainChanged ? [nextTerrain] : []),
-                  ];
-
-                  // 1. Ask the worker to open SyncAccessHandles for the new files.
-                  const loadId  = Math.random().toString(36).substring(2, 9);
-                  await new Promise<void>((resolve, reject) => {
-                    const onMsg = (ev: MessageEvent<WorkerResponseMessage>) => {
-                      if (ev.data.id !== loadId) return;
-                      worker.removeEventListener('message', onMsg);
-                      if (ev.data.type === 'LOAD_OFFLINE_REGION_SUCCESS') resolve();
-                      else reject(new Error(ev.data.error ?? 'LOAD_OFFLINE_REGION failed'));
-                    };
-                    worker.addEventListener('message', onMsg);
-                    worker.postMessage({
-                      id:      loadId,
-                      type:    'LOAD_OFFLINE_REGION',
-                      payload: { filenames: changedFilenames },
-                    } satisfies WorkerRequestMessage);
-                  });
-
-                  // 2. Register new WorkerPMTilesSource + PMTiles instances
-                  //    only for the files that changed.
-                  if (basemapChanged) registerSource(basemapFile);
-                  if (terrainChanged) registerSource(nextTerrain);
-
-                  // 3. Swap the live MapLibre sources to the new pmtiles:// URLs.
-                  //    setUrl() updates the source in-place — no layer teardown.
-                  const bSrc = activeMap.getSource('basemap-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
-                  const tSrc = activeMap.getSource('terrain-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
-
-                  if (basemapChanged && bSrc?.setUrl) bSrc.setUrl(`pmtiles://local/${basemapFile}`);
-                  if (terrainChanged && tSrc?.setUrl) tSrc.setUrl(`pmtiles://local/${nextTerrain}`);
-
-                  activeFilesRef.current = { basemap: basemapFile, terrain: nextTerrain };
-
-                  console.log(
-                    `[MapView] Offline region swapped → basemap: ${basemapFile}, terrain: ${terrainFile ?? '(unchanged)'}`,
-                  );
-                },
-              };
-              regionSwitcherRef.current = switcher;
-              onRegionSwitcherReady?.(switcher);
-
-              // ── P9.C2: cold-boot replay of the persisted region ────────
-              // The activeRegion effect below fires on mount, BEFORE this
-              // 'load' handler builds the switcher, and bails — a region
-              // rehydrated from localStorage would otherwise never re-bind.
-              // Replay it here exactly once, after validating its OPFS files
-              // still hold bytes (localStorage and OPFS can diverge: cleared
-              // site data, storage eviction). A missing file drops the
-              // persisted binding entirely so the map stays on the defaults
-              // it just booted with instead of binding to an empty archive.
-              {
-                const { activeRegion: persisted, clearActiveRegion } = useMapStore.getState();
-                if (persisted) {
-                  void (async () => {
-                    // Decision logic lives in services/regionBootPolicy
-                    // (extracted P-FE.C1, behavior-identical); the probe and
-                    // the MapLibre call stay here.
-                    const toVerify = regionFilesToVerify(persisted, {
-                      basemapFile: DEFAULT_BASEMAP,
-                      terrainFile: DEFAULT_TERRAIN,
-                    });
-                    const exists = await Promise.all(toVerify.map(opfsFileHasBytes));
-                    const decision = decideRegionBoot(toVerify, exists);
-                    if (decision.action === 'clear') {
-                      console.warn(
-                        `[MapView] Persisted region "${persisted.regionLabel}" dropped — missing OPFS file(s): ${decision.missing.join(', ')}`,
-                      );
-                      clearActiveRegion();
-                      return;
-                    }
-                    if (decision.action === 'noop') return; // persisted region IS the default binding
-                    try {
-                      await switcher.loadOfflineRegion(persisted.basemapFile, persisted.terrainFile);
-                    } catch (err) {
-                      console.error('[MapView] Cold-boot region replay failed:', err);
-                    }
-                  })();
-                }
-              }
-            }
-
-            // Contours exist only with a terrain archive (P-SOV.C3b): the
-            // DEM they are derived from is the same terrain PMTiles.
-            if (terrainPMTiles) {
-              // Instantiate demSource for dynamic contours, sourcing raw DEM
-              // tiles directly from the already-provisioned offline
-              // 'terrain-local' PMTiles instance instead of a remote network
-              // endpoint — contours must generate with zero connectivity, in
-              // line with the rest of the offline-first pipeline.
-              const LOCAL_TERRAIN_DEM_URL = 'local-terrain-dem://{z}/{x}/{y}';
-              const demSource = new mlcontour.DemSource({
-                url: LOCAL_TERRAIN_DEM_URL,
-                encoding: 'mapbox',
-                maxzoom: 12,
-                worker: false,
-              });
-              demSource.manager = new mlcontour.LocalDemManager({
-                demUrlPattern: LOCAL_TERRAIN_DEM_URL,
-                cacheSize: 100,
-                encoding: 'mapbox',
-                maxzoom: 12,
-                timeoutMs: 10_000,
-                getTile: async (url: string) => {
-                  const [, z, x, y] = /\/\/(\d+)\/(\d+)\/(\d+)/.exec(url) || [];
-                  const tile = await terrainPMTiles.getZxy(Number(z), Number(x), Number(y));
-                  if (!tile) {
-                    // Outside our clipped terrain coverage — return a flat
-                    // placeholder rather than throwing (see getBlankDemTile).
-                    return { data: await getBlankDemTile() };
-                  }
-                  return { data: new Blob([tile.data]) };
-                },
-              });
-              demSource.setupMaplibre(maplibregl);
-
-              // Add the contour vector source
-              activeMap.addSource('contour-source', {
-                type: 'vector',
-                tiles: [
-                  demSource.contourProtocolUrl({
-                    multiplier: 1,
-                    thresholds: {
-                      9: [20, 100],
-                    },
-                  }),
-                ],
-                maxzoom: 15,
-              });
-
-              // Add contour lines layer
-              activeMap.addLayer({
-                id: 'contour-lines-layer',
-                type: 'line',
-                source: 'contour-source',
-                'source-layer': 'contours',
-                layout: {
-                  'line-join': 'round',
-                  'line-cap': 'round',
-                },
-                paint: {
-                  'line-color': [
-                    'case',
-                    ['>=', ['get', 'level'], 1],
-                    'rgba(148, 163, 184, 0.35)', // major lines: slate-400 at 35% opacity
-                    'rgba(148, 163, 184, 0.15)', // minor lines: slate-400 at 15% opacity
-                  ],
-                  'line-width': [
-                    'case',
-                    ['>=', ['get', 'level'], 1],
-                    1.2, // major line thickness
-                    0.6, // minor line thickness
-                  ],
-                },
-              });
-
-              // Add contour labels layer
-              activeMap.addLayer({
-                id: 'contour-labels-layer',
-                type: 'symbol',
-                source: 'contour-source',
-                'source-layer': 'contours',
-                filter: ['>=', ['get', 'level'], 1], // only label major lines
-                layout: {
-                  'symbol-placement': 'line',
-                  'text-field': ['concat', ['to-string', ['get', 'ele']], 'm'],
-                  'text-size': 9,
-                  'text-max-angle': 45,
-                  'text-pitch-alignment': 'viewport',
-                  'text-rotation-alignment': 'map',
-                  'text-keep-upright': true,
-                },
-                paint: {
-                  'text-color': 'rgba(148, 163, 184, 0.7)',
-                  'text-halo-color': '#020617', // match slate-950 background
-                  'text-halo-width': 1,
-                },
-              });
-            }
-
-            // ── Phase 9: user-location source + layers ──────────────────────
-            // Registered once on load; data is updated dynamically by the GPS
-            // watcher via source.setData() — no layer teardown ever needed.
-            const emptyFC = { type: 'FeatureCollection' as const, features: [] as GeoJSONFeature[] };
-            activeMap.addSource('user-location-source', {
-              type: 'geojson',
-              data: emptyFC,
-            });
-
-            // Accuracy halo — translucent blue fill polygon (circle approximation)
-            activeMap.addLayer({
-              id:     'user-location-accuracy',
-              type:   'circle',
-              source: 'user-location-source',
-              filter: ['==', ['get', 'type'], 'accuracy'],
-              paint: {
-                // radius driven by accuracy metres; scale with zoom via
-                // a style expression so it stays geographically sized.
-                'circle-radius': [
-                  'interpolate', ['exponential', 2], ['zoom'],
-                  0,  0,
-                  20, [
-                    '/',
-                    ['*', ['get', 'accuracyMeters'], ['cos', ['*', ['/', ['get', 'lat'], 180], Math.PI]]],
-                    0.075,  // metres-per-pixel at zoom 0 (web mercator constant)
-                  ],
-                ],
-                'circle-color':   '#3b82f6',
-                'circle-opacity': 0.15,
-                'circle-stroke-color':   '#3b82f6',
-                'circle-stroke-width':   1,
-                'circle-stroke-opacity': 0.35,
-              },
-            });
-
-            // Core blue dot
-            activeMap.addLayer({
-              id:     'user-location-dot',
-              type:   'circle',
-              source: 'user-location-source',
-              filter: ['==', ['get', 'type'], 'dot'],
-              paint: {
-                'circle-radius':       6,
-                'circle-color':        '#2563eb',
-                'circle-stroke-color': '#ffffff',
-                'circle-stroke-width': 2.5,
-              },
-            });
-
-            setInitStatus('ready');
-          });
-          // Surface the underlying Error message/stack — logging the raw event
-          // object prints "[object Object]" and hides the actual failure.
-          activeMap.on('error', (e) => console.error('[MapLibre]', e.error?.message ?? e.error ?? e));
-        };
-
-        if (hasTerrain) {
-          mountMap(STYLE_URL);
-        } else {
-          // S4 (c′): same style file, fetched here and stripped of its
-          // terrain source/block/hillshade BEFORE MapLibre sees it — MapLibre
-          // requests a raster-dem TileJSON at style load, so stripping after
-          // construction would be too late. No runtime style swap (P8a), relative
-          // URL (P10a / connect-src 'self').
-          void fetch(STYLE_URL)
-            .then((res) => {
-              if (!res.ok) throw new Error(`style fetch failed: HTTP ${res.status}`);
-              return res.json() as Promise<StyleSpecification>;
-            })
-            .then((style) => {
-              if (active) mountMap(stripTerrain(style));
-            })
-            .catch((err: unknown) => {
-              console.error('[MapView] No-terrain style load failed:', err);
-              if (!active) return;
-              setInitStatus('error');
-              setStatusMessage(`Style load failed: ${err instanceof Error ? err.message : String(err)}`);
-            });
-        }
+        bootMap(response.payload as MapInitSuccessPayload);
       } else {
         setInitStatus('error');
         setStatusMessage(`Initialization failed: ${response.error ?? 'Unknown error'}`);
       }
+    };
+
+    // P9.C9: mounts MapLibre on the boot plan. `init` is the worker's
+    // MAP_INIT report, or null when the plan has no archive (no MAP_INIT).
+    const bootMap = (init: MapInitSuccessPayload | null) => {
+      if (!active) return;
+      const plan = bootPlan;
+      if (init) {
+        setFileSize(init.size);
+        setStatusMessage(`OPFS storage bound. Database: ${(init.size / 1024 / 1024).toFixed(2)} MB`);
+      } else {
+        setStatusMessage('No offline map on this device yet.');
+      }
+
+      // A missing terrain archive is the normal v0.1 state on device: it
+      // turns terrain off rather than raising the "map data" banner.
+      const outcome = init
+        ? mapInitOutcome(init, plan.terrain ?? '')
+        : { hasTerrain: false, userFacingFailures: [] as string[] };
+      const hasTerrain = plan.terrain !== null && outcome.hasTerrain;
+      const { userFacingFailures } = outcome;
+      if (userFacingFailures.length > 0) {
+        onMapDataError?.(
+          `Couldn't load offline map data for: ${userFacingFailures.join(', ')}. ` +
+          'The map may be missing trail layers.',
+        );
+      }
+
+      // Register the default sources upfront — terrain only if it exists
+      // (an unregistered key referenced by the style would trip the
+      // registry's fail-loud miss guard).
+      const basemapPMTiles = plan.basemap === null ? null : registerSource(plan.basemap, (tData) => {
+        setTelemetry(prev => ({
+          ...tData,
+          totalBytes: tData.totalBytes > 0 ? tData.totalBytes : prev.totalBytes,
+        }));
+      });
+      const terrainPMTiles = hasTerrain && plan.terrain ? registerSource(plan.terrain) : null;
+      // P9.C9: the archive header bounds the view; unreadable → no clamp.
+      const clampPromise: Promise<ViewClamp | null> = basemapPMTiles
+        ? basemapPMTiles.getHeader().then(viewClampFromHeader).catch((err: unknown) => {
+            console.warn('[MapView] Archive header unreadable; view not clamped:', err);
+            return null;
+          })
+        : Promise.resolve(null);
+
+      const mountMap = (style: StyleSpecification, clamp: ViewClamp | null) => {
+        if (!mapContainerRef.current) return;
+        setStatusMessage('Mounting map container canvas…');
+
+        // BUG(B008): style asset gaps, sprite URL rejected as relative by MapLibre and a contour-label fontstack is not in the vendored glyph set (local glyph fallback renders digits) — severity: minor — repro: boot dev app, console shows sprite error + glyph range warnings
+        map = new maplibregl.Map({
+          container: mapContainerRef.current,
+          // ── Phase Block-1: High-contrast 3D alpine style ─────────────
+          // External style JSON bundles sources (basemap-local + terrain-local),
+          // the terrain block (exaggeration 1.3), hillshading, contours,
+          // dynamic trail rendering, and peak labels. Without a terrain
+          // archive it arrives here already stripped (stripTerrain).
+          style,
+          // P9.C9: start on the archive and keep the view on it — its
+          // header bounds clamp panning and zoom-out (viewClamp). No
+          // archive: a neutral world view under the empty state.
+          ...(clamp
+            ? { bounds: clamp.bounds, maxBounds: clamp.bounds, minZoom: clamp.minZoom }
+            : { center: [0, 20] as [number, number], zoom: 1 }),
+          pitch: 45,
+          maxZoom: 18,
+          // GPU fill-rate guardrail: prevents horizon overdraw that exhausts
+          // mobile GPU bandwidth at high pitch angles.
+          maxPitch: 60,
+        });
+
+        const activeMap = map;
+        mapRef.current = activeMap;
+        setLiveMap(activeMap);
+        activeMap.on('load', () => {
+          // ── Memory management: WebGL texture-cache OOM guards ────────
+          // Clamp each source cache to 25 tiles max to prevent GPU VRAM
+          // exhaustion on memory-constrained mobile devices.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (activeMap as any).style?.sourceCaches?.['basemap-local']?.setMaxTiles(25);
+          if (hasTerrain) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (activeMap as any).style?.sourceCaches?.['terrain-local']?.setMaxTiles(25);
+
+            // Enable 3D terrain mesh mapping using the offline raster DEM source
+            activeMap.setTerrain({
+              source: 'terrain-local',
+              exaggeration: 1.3,
+            });
+          }
+
+          // ── Build the imperative region-switcher ──────────────────────
+          // loadOfflineRegion() hot-swaps the tile sources without a full
+          // style reload. Stored in a ref so the activeRegion effect below
+          // can invoke it directly; also handed to onRegionSwitcherReady
+          // for any external caller that still wants it.
+          {
+            const switcher: OfflineRegionSwitcher = {
+              async loadOfflineRegion(basemapFile: string, terrainFile: string | null) {
+                // P9.C9: a boot with no archive has no basemap source to
+                // swap; the first region re-runs the boot instead (once).
+                if (activeFilesRef.current.basemap === null) {
+                  setBootGeneration((g) => g + 1);
+                  return;
+                }
+                const worker = mapDataWorkerRef.current;
+                if (!worker) throw new Error('[loadOfflineRegion] mapData worker not ready.');
+
+                // Only touch sources whose filename actually changed —
+                // re-registering an already-active PMTiles source spins up
+                // a second WorkerPMTilesSource/PMTiles pair for the same
+                // file, which corrupts in-flight tile transfers on the
+                // pre-existing source (surfaces as MapLibre "ArrayBuffer
+                // already detached" postMessage errors). A null terrain
+                // keeps whatever terrain the boot found (P-SOV.C3b).
+                const nextTerrain = terrainFile ?? activeFilesRef.current.terrain;
+                const basemapChanged = basemapFile !== activeFilesRef.current.basemap;
+                const terrainToBind =
+                  nextTerrain !== null && nextTerrain !== activeFilesRef.current.terrain ? nextTerrain : null;
+                const terrainChanged = terrainToBind !== null;
+                if (!basemapChanged && !terrainChanged) return;
+
+                const changedFilenames = [
+                  ...(basemapChanged ? [basemapFile] : []),
+                  ...(terrainToBind ? [terrainToBind] : []),
+                ];
+
+                // 1. Ask the worker to open SyncAccessHandles for the new files.
+                const loadId  = Math.random().toString(36).substring(2, 9);
+                await new Promise<void>((resolve, reject) => {
+                  const onMsg = (ev: MessageEvent<WorkerResponseMessage>) => {
+                    if (ev.data.id !== loadId) return;
+                    worker.removeEventListener('message', onMsg);
+                    if (ev.data.type === 'LOAD_OFFLINE_REGION_SUCCESS') resolve();
+                    else reject(new Error(ev.data.error ?? 'LOAD_OFFLINE_REGION failed'));
+                  };
+                  worker.addEventListener('message', onMsg);
+                  worker.postMessage({
+                    id:      loadId,
+                    type:    'LOAD_OFFLINE_REGION',
+                    payload: { filenames: changedFilenames },
+                  } satisfies WorkerRequestMessage);
+                });
+
+                // 2. Register new WorkerPMTilesSource + PMTiles instances
+                //    only for the files that changed.
+                const newBasemap = basemapChanged ? registerSource(basemapFile) : null;
+                if (terrainToBind) registerSource(terrainToBind);
+
+                // 3. Swap the live MapLibre sources to the new pmtiles:// URLs.
+                //    setUrl() updates the source in-place — no layer teardown.
+                const bSrc = activeMap.getSource('basemap-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
+                const tSrc = activeMap.getSource('terrain-local') as (maplibregl.RasterTileSource & { setUrl?: (url: string) => void }) | undefined;
+
+                if (basemapChanged && bSrc?.setUrl) bSrc.setUrl(`pmtiles://local/${basemapFile}`);
+                if (terrainToBind && tSrc?.setUrl) tSrc.setUrl(`pmtiles://local/${terrainToBind}`);
+
+                activeFilesRef.current = { basemap: basemapFile, terrain: nextTerrain };
+
+                // P9.C9: the new archive's header bounds the view.
+                if (newBasemap) {
+                  const clamp = await newBasemap.getHeader().then(viewClampFromHeader).catch(() => null);
+                  activeMap.setMaxBounds(clamp ? clamp.bounds : null);
+                  activeMap.setMinZoom(clamp ? clamp.minZoom : 0);
+                  if (clamp) activeMap.fitBounds(clamp.bounds, { duration: 0 });
+                }
+
+                console.log(
+                  `[MapView] Offline region swapped → basemap: ${basemapFile}, terrain: ${terrainFile ?? '(unchanged)'}`,
+                );
+              },
+            };
+            regionSwitcherRef.current = switcher;
+            onRegionSwitcherReady?.(switcher);
+
+            // P9.C2's cold-boot replay is gone (P9.C9): planBoot binds the
+            // saved region at boot after the same validate-before-bind
+            // probe. A region set while the map was still loading found no
+            // switcher — catch up once here.
+            {
+              const latest = useMapStore.getState().activeRegion;
+              if (latest && latest.basemapFile !== activeFilesRef.current.basemap) {
+                switcher.loadOfflineRegion(latest.basemapFile, latest.terrainFile).catch((err) => {
+                  console.error('[MapView] Catch-up region bind failed:', err);
+                });
+              }
+            }
+          }
+
+          // Contours exist only with a terrain archive (P-SOV.C3b): the
+          // DEM they are derived from is the same terrain PMTiles.
+          if (terrainPMTiles) {
+            // Instantiate demSource for dynamic contours, sourcing raw DEM
+            // tiles directly from the already-provisioned offline
+            // 'terrain-local' PMTiles instance instead of a remote network
+            // endpoint — contours must generate with zero connectivity, in
+            // line with the rest of the offline-first pipeline.
+            const LOCAL_TERRAIN_DEM_URL = 'local-terrain-dem://{z}/{x}/{y}';
+            const demSource = new mlcontour.DemSource({
+              url: LOCAL_TERRAIN_DEM_URL,
+              encoding: 'mapbox',
+              maxzoom: 12,
+              worker: false,
+            });
+            demSource.manager = new mlcontour.LocalDemManager({
+              demUrlPattern: LOCAL_TERRAIN_DEM_URL,
+              cacheSize: 100,
+              encoding: 'mapbox',
+              maxzoom: 12,
+              timeoutMs: 10_000,
+              getTile: async (url: string) => {
+                const [, z, x, y] = /\/\/(\d+)\/(\d+)\/(\d+)/.exec(url) || [];
+                const tile = await terrainPMTiles.getZxy(Number(z), Number(x), Number(y));
+                if (!tile) {
+                  // Outside our clipped terrain coverage — return a flat
+                  // placeholder rather than throwing (see getBlankDemTile).
+                  return { data: await getBlankDemTile() };
+                }
+                return { data: new Blob([tile.data]) };
+              },
+            });
+            demSource.setupMaplibre(maplibregl);
+
+            // Add the contour vector source
+            activeMap.addSource('contour-source', {
+              type: 'vector',
+              tiles: [
+                demSource.contourProtocolUrl({
+                  multiplier: 1,
+                  thresholds: {
+                    9: [20, 100],
+                  },
+                }),
+              ],
+              maxzoom: 15,
+            });
+
+            // Add contour lines layer
+            activeMap.addLayer({
+              id: 'contour-lines-layer',
+              type: 'line',
+              source: 'contour-source',
+              'source-layer': 'contours',
+              layout: {
+                'line-join': 'round',
+                'line-cap': 'round',
+              },
+              paint: {
+                'line-color': [
+                  'case',
+                  ['>=', ['get', 'level'], 1],
+                  'rgba(148, 163, 184, 0.35)', // major lines: slate-400 at 35% opacity
+                  'rgba(148, 163, 184, 0.15)', // minor lines: slate-400 at 15% opacity
+                ],
+                'line-width': [
+                  'case',
+                  ['>=', ['get', 'level'], 1],
+                  1.2, // major line thickness
+                  0.6, // minor line thickness
+                ],
+              },
+            });
+
+            // Add contour labels layer
+            activeMap.addLayer({
+              id: 'contour-labels-layer',
+              type: 'symbol',
+              source: 'contour-source',
+              'source-layer': 'contours',
+              filter: ['>=', ['get', 'level'], 1], // only label major lines
+              layout: {
+                'symbol-placement': 'line',
+                'text-field': ['concat', ['to-string', ['get', 'ele']], 'm'],
+                'text-size': 9,
+                'text-max-angle': 45,
+                'text-pitch-alignment': 'viewport',
+                'text-rotation-alignment': 'map',
+                'text-keep-upright': true,
+              },
+              paint: {
+                'text-color': 'rgba(148, 163, 184, 0.7)',
+                'text-halo-color': '#020617', // match slate-950 background
+                'text-halo-width': 1,
+              },
+            });
+          }
+
+          // ── Phase 9: user-location source + layers ──────────────────────
+          // Registered once on load; data is updated dynamically by the GPS
+          // watcher via source.setData() — no layer teardown ever needed.
+          const emptyFC = { type: 'FeatureCollection' as const, features: [] as GeoJSONFeature[] };
+          activeMap.addSource('user-location-source', {
+            type: 'geojson',
+            data: emptyFC,
+          });
+
+          // Accuracy halo — translucent blue fill polygon (circle approximation)
+          activeMap.addLayer({
+            id:     'user-location-accuracy',
+            type:   'circle',
+            source: 'user-location-source',
+            filter: ['==', ['get', 'type'], 'accuracy'],
+            paint: {
+              // radius driven by accuracy metres; scale with zoom via
+              // a style expression so it stays geographically sized.
+              'circle-radius': [
+                'interpolate', ['exponential', 2], ['zoom'],
+                0,  0,
+                20, [
+                  '/',
+                  ['*', ['get', 'accuracyMeters'], ['cos', ['*', ['/', ['get', 'lat'], 180], Math.PI]]],
+                  0.075,  // metres-per-pixel at zoom 0 (web mercator constant)
+                ],
+              ],
+              'circle-color':   '#3b82f6',
+              'circle-opacity': 0.15,
+              'circle-stroke-color':   '#3b82f6',
+              'circle-stroke-width':   1,
+              'circle-stroke-opacity': 0.35,
+            },
+          });
+
+          // Core blue dot
+          activeMap.addLayer({
+            id:     'user-location-dot',
+            type:   'circle',
+            source: 'user-location-source',
+            filter: ['==', ['get', 'type'], 'dot'],
+            paint: {
+              'circle-radius':       6,
+              'circle-color':        '#2563eb',
+              'circle-stroke-color': '#ffffff',
+              'circle-stroke-width': 2.5,
+            },
+          });
+
+          setInitStatus('ready');
+        });
+        // Surface the underlying Error message/stack — logging the raw event
+        // object prints "[object Object]" and hides the actual failure.
+        activeMap.on('error', (e) => console.error('[MapLibre]', e.error?.message ?? e.error ?? e));
+      };
+
+      // One style file, fetched here and shaped BEFORE MapLibre sees it —
+      // MapLibre requests every source's TileJSON at style load. No runtime
+      // style swap (P8a), relative URL (P10a / connect-src 'self'). No
+      // terrain archive: terrain stripped (S4 (c′)). Basemap: pointed at
+      // the boot archive, or stripped when there is none (P9.C9).
+      void Promise.all([
+        fetch(STYLE_URL).then((res) => {
+          if (!res.ok) throw new Error(`style fetch failed: HTTP ${res.status}`);
+          return res.json() as Promise<StyleSpecification>;
+        }),
+        clampPromise,
+      ])
+        .then(([fetched, clamp]) => {
+          if (!active) return;
+          const terrainShaped = hasTerrain ? fetched : stripTerrain(fetched);
+          const style = plan.basemap === null
+            ? stripBasemap(terrainShaped)
+            : withBasemapFile(terrainShaped, plan.basemap);
+          setNoRegion(plan.basemap === null);
+          mountMap(style, clamp);
+        })
+        .catch((err: unknown) => {
+          console.error('[MapView] Style load failed:', err);
+          if (!active) return;
+          setInitStatus('error');
+          setStatusMessage(`Style load failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
     };
 
     mapDataWorker.addEventListener('message', handleInitMessage);
@@ -690,16 +720,34 @@ export default function MapView({
     // pendingWorkerTeardown comment above. On a normal first mount this
     // promise is already resolved, so the send fires on the next microtask
     // with no perceptible delay.
-    pendingWorkerTeardown.then(() => {
+    pendingWorkerTeardown.then(async () => {
       if (!active) return; // unmounted again before this mount's init could fire
-      // Send the two default filenames so the worker opens SyncAccessHandles
-      // for both OPFS files during init.  Subsequent MAP_READ_BYTES requests
-      // will find the handles ready without an extra round-trip. The terrain
-      // archive is optional: its absence is reported, not raised.
+      // P9.C9: pick the boot files first (lock-free OPFS probes), then open
+      // only those. A saved region whose file is gone is dropped here.
+      const plan = await planBoot(useMapStore.getState().activeRegion, {
+        isDev: import.meta.env.DEV,
+        devDefaults: DEV_PREVIEW,
+        hasBytes: opfsFileHasBytes,
+      });
+      if (!active) return;
+      if (plan.dropped) {
+        console.warn(`[MapView] Saved region "${plan.dropped.regionLabel}" dropped — its OPFS file is gone.`);
+        useMapStore.getState().clearActiveRegion();
+      }
+      bootPlan = plan;
+      activeFilesRef.current = { basemap: plan.basemap, terrain: plan.terrain };
+      if (plan.basemap === null) {
+        bootMap(null); // nothing to open: no MAP_INIT, the empty state
+        return;
+      }
+      // The terrain archive is optional: its absence is reported, not raised.
       mapDataWorker.postMessage({
         id:      initId,
         type:    'MAP_INIT',
-        payload: { filenames: [DEFAULT_BASEMAP, DEFAULT_TERRAIN], optionalFilenames: [DEFAULT_TERRAIN] },
+        payload: {
+          filenames: [plan.basemap, ...(plan.terrain ? [plan.terrain] : [])],
+          optionalFilenames: plan.terrain ? [plan.terrain] : [],
+        },
       } satisfies WorkerRequestMessage);
     });
 
@@ -733,7 +781,9 @@ export default function MapView({
   // intentionally omitted: the mapData worker and MapLibre map are
   // instantiated exactly once on mount; re-running on prop changes would
   // spawn duplicate workers/map instances and re-trigger MAP_INIT.
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // bootGeneration re-runs it exactly once, for the first region on a
+  // no-archive boot (P9.C9), through the same teardown gate as a remount.
+  }, [bootGeneration]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---------------------------------------------------------------------------
   // Hot-swap the active PMTiles source whenever useMapStore's activeRegion
@@ -916,6 +966,16 @@ export default function MapView({
               Retry Storage Bind
             </button>
           )}
+        </div>
+      )}
+
+      {/* ── P9.C9: no archive on this device yet ─────────────────────────── */}
+      {initStatus === 'ready' && noRegion && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none p-8 text-center">
+          <div className="backdrop-blur-md bg-slate-950/70 border border-slate-800 rounded-2xl px-6 py-4 max-w-sm">
+            <h3 className="text-sm font-bold text-slate-100">No offline map yet</h3>
+            <p className="text-xs text-slate-400 mt-1">Download a region to see it here.</p>
+          </div>
         </div>
       )}
 

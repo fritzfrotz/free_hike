@@ -4317,3 +4317,116 @@ budget 30 → 34 by operator call):
   addendum 1, stage 1, on top of 25). Pivots: 0.
 
 **Status:** AGENT-CLOSED — item 3 open; commit by the operator (wip branch).
+
+## P9.C9 — boot binds the right archive (chunk A of the demo cleanup) (plan, 2026-10-12)
+
+**Operator calls:** two chunks, this one first (load-bearing: which OPFS
+files are opened and locked at boot). Budget 22. Base: main `7304817`,
+branch `wip/boot`; stop at a staged tree; commands inside the repo only.
+Operator prediction: lands clean, nothing breaks; wrong if the agent
+stops at any of the three named risks or the device run fails a boot
+item. Second opinion (Claude): breaks first at the one-time remount on a
+fresh install; wrong if the fresh-install step shows the map without a
+restart.
+
+**Correction to P9.C8 (found while planning):** the P9.C8 APK
+(12,139,398 B, `c527ec9f…`) was built with `assembleDebug` alone, so its
+web bundle is the one copied on Oct 5 (8c3a3ed era): it carries the P9.C8
+Kotlin side but not the P9.C8 web code (it still shows "Background compile
+queued"). That APK is not a valid P9.C8 device build. This chunk's APK is
+built with `npm run build` → `npx cap sync android` → `gradlew --offline
+assembleDebug`, and it carries both P9.C8 and P9.C9.
+
+**Goal:** a native boot opens only the saved region's archive (or no
+archive), never a dev preview file; the map starts on the region with
+zoom and panning clamped to the archive's header; no "Map data
+unavailable" banner and no placeholder map on a working boot.
+
+**Change:** `planBoot` (regionBootPolicy) picks the boot files before the
+worker opens anything: saved region whose files hold bytes → that file;
+otherwise the dev preview archives on the Vite dev server only; otherwise
+none (basemap stripped from the style, empty state shown). The style's
+basemap URL is rewritten to the boot file before MapLibre sees it. The
+archive header sets min zoom, max bounds and the starting view
+(`viewClamp`), at boot and after every swap. With no basemap, the first
+region bound remounts MapView once through the existing teardown gate.
+The cold-boot replay in the 'load' handler goes away (boot binds directly).
+
+**Files:** `src/services/regionBootPolicy.ts` + test,
+`src/services/styleTerrain.ts` + test, `src/services/viewClamp.ts` + test
+(new), `src/ui/components/MapView.tsx`, `TRACKER.md` (generated), LOOPLOG.
+
+**Proofs (named before implementation):**
+- `planBoot: binds the saved region directly when its file holds bytes`
+- `planBoot: native with no usable region boots with no basemap and never
+  names a dev archive`
+- `planBoot: dev server falls back to the preview archives`
+- `planBoot: a saved region with a missing file is dropped`
+- `stripBasemap: drops the basemap source and every layer drawn from it`
+- `viewClampFromHeader: min zoom, bounds and start view from the archive
+  header`
+- `viewClampFromHeader: an invalid header gives no clamp`
+Not unit-testable here (component): the remount and the swap-path clamp;
+the device run and the dev preview cover them.
+
+**Steps [E]/[D]:** 1 [E] calls (done). 2 [D] red tests. 3 [D] planBoot,
+stripBasemap, viewClamp. 4 [D] MapView boot, swap clamp, remount.
+5 [D] ladder ×2 (frontend L1, janitor `--check`) + dev preview boot check.
+6 [D] web build + cap sync + offline APK + checksum, janitor `--fix`,
+close entry, stage → STOP.
+Allocation (22): branch 1, plan 1, red tests 2, red run 1, helpers 3,
+MapView 3, ladder 2, preview 1, build 2, fix/close/stage 3 = 19; fixes 3.
+
+### P9.C9 — execution + close (2026-10-12)
+
+- Red: 5 failures (`planBoot` / `stripBasemap` not functions) and the
+  `viewClamp` suite failing on import. Green after one implementation
+  round; no fix attempts.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 14 files /
+  82 tests (was 13 / 75; +7 = the named proofs), janitor `--check` clean.
+  Janitor `--fix`: B008's MapView line moved 348 → 388; nothing else.
+- MapView diff is large because the MAP_INIT success body moved into
+  `bootMap` (two spaces less indent): `git diff` +419/−359,
+  `git diff -w` +151/−91.
+- Dev preview check (Vite dev server, built-in browser pane): the boot
+  bound the two preview archives through `planBoot`, provisioned both
+  from `/local/`, served both from OPFS; no "Map data unavailable"
+  banner; only error the known sprite one (B008). The header clamp
+  applied: max bounds = the alps basemap header bounds, start view fitted
+  to them (z8.4 near Innsbruck). Finding: at that start view MapLibre's
+  'load' did not fire — the terrain source never finished loading; after
+  a manual jump to Innsbruck z12 in the page it did and the boot overlay
+  cleared. The pane ran about 1 frame per second (16 frames in 15 s), so
+  whether this is slow loading under throttling or a real hang at the
+  wider view is not established. Dev preview only: native builds have no
+  terrain archive and strip terrain before MapLibre sees the style.
+- Not exercised here (native-only paths, the device run is the proof):
+  boot on a saved region, the no-archive empty state, the one-time
+  remount on the first region, the swap-path clamp, the catch-up bind.
+- Build identity for the next device run: P9.C9 debug APK, built with
+  `npm run build` → `npx cap sync android` → `gradlew --offline
+  assembleDebug`: 12,578,474 B, SHA-256
+  `3e69551fdaeac2da5cd357f264711f60628245d024b7563dac8ddd36bdb1e771`.
+  Carries the P9.C8 and P9.C9 web code (both strings found in the
+  bundle), no `assets/public/local/`, arm64 release `libfreehike_ffi.so`
+  5,065,152 B. Supersedes the P9.C8 APK (see the plan's correction).
+  `cap sync` changed no tracked file.
+- Flagged deviations (operator veto offered): (1) a catch-up bind in the
+  'load' handler replaces the old replay: a region set while the map was
+  still loading would otherwise find no switcher (not in the proposal);
+  (2) the style is now always fetched by MapView (the terrain path used to
+  hand MapLibre the URL); (3) a swap sets the new max bounds before the
+  fit, so the camera jumps to the new region; (4) the Innsbruck dropdown
+  still exists until chunk B and, under the clamp, cannot leave the
+  region.
+- Device run (one pass, Samsung): cold boot with the Portugal region
+  saved — no banner, no placeholder, no data-view error, view on the
+  Lisbon bbox; pinch out stops before blank, pan stops at the bbox edge;
+  fresh install — empty state, then the first compile shows the map
+  without an app restart (scores both predictions).
+- Promotion valve: none; no tracked item closed.
+- Steps: 17/22 (branch 1, plan 1, red tests 2, red run 1, helpers 3,
+  MapView 1, ladder 2, preview 1, web build + sync 1, APK 1, `--fix` 1,
+  this entry 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).

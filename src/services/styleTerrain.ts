@@ -37,6 +37,23 @@ export function stripTerrain(style: StyleSpecification): StyleSpecification {
   return out;
 }
 
+/**
+ * P9.C9 — the no-region boot: drops the `basemap-local` source and every
+ * layer drawn from it, so a native install with nothing compiled yet mounts
+ * an empty map instead of a zero-byte placeholder archive. Returns a new
+ * object; the input is never mutated.
+ */
+export function stripBasemap(style: StyleSpecification): StyleSpecification {
+  const BASEMAP = 'basemap-local';
+  return {
+    ...style,
+    sources: Object.fromEntries(Object.entries(style.sources).filter(([id]) => id !== BASEMAP)),
+    layers: style.layers.filter(
+      (layer) => !('source' in layer && layer.source === BASEMAP),
+    ),
+  };
+}
+
 /** What the mapData worker reports for MAP_INIT (see MapInitSuccessPayload). */
 export interface MapInitReport {
   /** Required files that could not be provisioned — user-facing. */

@@ -62,6 +62,7 @@ function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+// DEBT(D011): post-compile handoff copies the archive through the web view in chunks; interrupted by a low-memory destroy on 10-12, succeeded on the next open — platforms: web
 /**
  * Wraps Filesystem.readFileInChunks' callback API in a Promise that settles
  * once the native side signals end-of-file (a null or empty chunk) or an

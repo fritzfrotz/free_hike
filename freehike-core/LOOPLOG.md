@@ -4115,3 +4115,76 @@ call):
   Pivots: 0.
 
 **Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+## Samsung airplane-mode compile smoke — observed (2026-10-12)
+
+Mode: execute and observe; no functional code changes. Summary only; the raw
+captures stay in the git-ignored device-logs folder.
+
+- **Device:** Samsung SM-S918B (S23 Ultra), Android 16.
+- **Build:** main `8c3a3ed`, the same APK as the 2026-10-07 smoke: 37,477,863 B,
+  SHA-256 `3171fb98676238436c3bf1fd3afb3726f5c59ad9ac9c13fe30a4b984d180e25f`
+  (installed copy hash-checked on the phone after the run). Main's later
+  commits change the janitor, hooks, docs and LOOPLOG only; no app code.
+- **Setup (operator):** airplane mode switched on after the fetch verified
+  and before tapping compile; phone moved from laptop USB to a wall charger
+  after enqueue; screen locked for the compile.
+
+### Steps
+
+1. **Fresh install — pass.** Old install removed, same APK installed.
+2. **Fetch verified — pass.** Portugal extract from Geofabrik, 425,467,579 B,
+   on Wi-Fi. One transient refusal mid-download ("error decoding response
+   body"); the next slice resumed from the bytes on disk, restarts stayed 0.
+   A later state query reports the extract complete and verified.
+3. **Airplane mode on — pass.** On about 45 s after the fetch finished and
+   about 13 s before the compile started. Wi-Fi disconnected and cellular
+   data was torn down at the same moment. No airplane-off and no Wi-Fi
+   reconnect until airplane mode went off about 9 min after the compile
+   finished. A settings check over adb after the run read 0 (off).
+4. **Compile offline — pass.** About 8 min 51 s from the compile request to
+   finish, in 253 slices: 2,433,767 blocks, 2,979,664 features packed,
+   28,354 tiles, 93,988,534 B archive. The longest gap between progress
+   lines was 2.5 s. The foreground-service promotion was accepted at start
+   and stopped at finish. No cancel, retry, restart or refusal line. No
+   network request by the app found during the compile (limits below).
+   Charger: USB unplugged, wall charger connected about 3 s before the
+   compile started; battery held at 79–80 %, reported plugged in but not
+   charging after the first minute; the compile ran on.
+5. **Handoff — pass on the second attempt.** The copy into app storage
+   started as the compile finished. Two seconds in, the system marked the
+   backgrounded app screen for destruction for low memory; the screen went
+   down just after the last chunk was read, before the job was
+   acknowledged. When the operator woke the phone about 3 min later the
+   app found the job still finished, ran the copy again, acknowledged it,
+   cleared the native job, and swapped the map to the new archive (the
+   copied file's size equals the archive's).
+6. **Browse at street level — operator observation pending.** The log
+   shows the archive load and the first tile-source request, not what was
+   on screen.
+7. **Persistence after swipe — real kill: not exercised.** The swipe
+   closed the screen; the process was not killed. The reopen reloaded the
+   app and loaded the Portugal archive from storage.
+
+### Findings (plain words, no conclusions)
+
+- Compared to 2026-10-07: that compile took about 35 min on a wall
+  charger (operator figure) with rationed slices and one refused
+  foreground-service promotion; this one took about 9 min with
+  back-to-back slices and an accepted promotion. Observation only.
+- The first handoff attempt lost its screen to a low-memory destroy while
+  the archive was being read into the web view as 8 MiB chunks; the
+  retry on the next open recovered it. The archive crossed the bridge
+  twice in this run. Tracked as D011.
+- Every boot loads the empty placeholder basemap first and logs a MapLibre
+  data-view bounds error plus the sprite error (B008) before the swap.
+- The storage-not-persistent warning shows on every boot.
+- GPS fixes kept arriving to the app in airplane mode.
+- Evidence limits: the on-device capture stops at the fetch finish (USB
+  unplugged). The all-buffers dump lost app-level lines older than about
+  the first 1.5 min of the compile; the two-tag dump covers our tags for
+  the whole run. The build does not log successful HTTP requests, so the
+  no-request claim rests on absent errors, absent non-local URLs and no
+  network request registered by the app's user ID during the compile.
+  Airplane, Wi-Fi and charger events come from the system and radio
+  logs, which cover the whole window.

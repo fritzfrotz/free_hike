@@ -14,6 +14,8 @@
   - ios/App/App/MapCompilerPlugin.swift:5
 - **D010** — manual §3b L3b SIGKILL torture harness (scripts/kill_resume_test.sh + CLI driver) was never built; in-process resume proofs stand in since P-SOV.C3a — platforms: core
   - freehike-core/scripts/mem_gate.sh:29
+- **D011** — post-compile handoff copies the archive through the web view in chunks; interrupted by a low-memory destroy on 10-12, succeeded on the next open — platforms: web
+  - src/services/opfsMover.ts:65
 
 ## Open Bugs
 

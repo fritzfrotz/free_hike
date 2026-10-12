@@ -1,7 +1,7 @@
 import BackgroundTasks
 import Foundation
 import Capacitor
-// DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
+// DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified. The iOS background compile shows Queued and no percent while pending, its sink saves no progress (P9.C8) — platforms: ios,android
 // DEBT(D009): mem gate needs a harness-free CLI driver plus the in-process allocator peak counter, an Austria-scale on-device run, and the iOS increased-memory entitlement — platforms: ios,core
 
 /// Layer 2 of the tri-layer bridge — Surface v1 (suspendable state machine).

@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import { Directory, Filesystem } from '@capacitor/filesystem';
 import { moveNativeFileToOPFS } from '../services/opfsMover';
 import { resetHandoffProgress, reportHandoffProgress } from '../services/handoffProgress';
+import { clearCompileProgress, seedCompileProgress } from '../services/compileProgress';
 import { MapCompiler } from '../plugins/MapCompiler';
 import { useMapStore } from './mapStore';
 
@@ -188,6 +189,9 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
       return;
     }
 
+    // P9.C8: the compile percent lives in a ref sink, not in the store.
+    if (record.state !== 'pending' || !record.jobId) clearCompileProgress();
+
     switch (record.state) {
       case 'idle':
         set({ isBackgroundCompiling: false });
@@ -196,6 +200,18 @@ export const useCompilerStore = create<CompilerState>((set, get) => ({
       case 'pending':
         // Queued or mid-window; the durable checkpoint makes any partial
         // work resumable, so there is nothing for JS to do but reflect it.
+        // Saved progress counts only when it was saved by THIS job.
+        if (record.jobId) {
+          const ours =
+            record.progressJobId === record.jobId &&
+            typeof record.progressPercent === 'number' &&
+            typeof record.progressAtMs === 'number';
+          seedCompileProgress(
+            record.jobId,
+            ours ? record.progressPercent! : null,
+            ours ? record.progressAtMs! : null,
+          );
+        }
         set({ isBackgroundCompiling: true });
         return;
 

@@ -634,6 +634,16 @@ class MapCompilerPlugin : Plugin() {
                 .put("bytesWritten", record.bytesWritten)
         }
         record.reason?.let { data.put("reason", it) }
+        // P9.C8: the worker's last progress point while the job is pending.
+        // progressJobId goes along so the JS layer can refuse a stale one.
+        if (record.state == PendingJobStore.STATE_PENDING) {
+            PendingJobStore.loadProgress(context)?.let { p ->
+                data.put("progressJobId", p.jobId)
+                    .put("progressPercent", p.percent)
+                    .put("progressStatus", p.status)
+                    .put("progressAtMs", p.atMs)
+            }
+        }
         call.resolve(data)
     }
 

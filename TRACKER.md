@@ -6,8 +6,8 @@
 
 ## Open Debt
 
-- **D004** — iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
-  - android/app/src/main/java/com/freehike/app/BackgroundCompileWorker.kt:29
+- **D004** — iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified. The iOS background compile shows Queued and no percent while pending, its sink saves no progress (P9.C8) — platforms: ios,android
+  - android/app/src/main/java/com/freehike/app/BackgroundCompileWorker.kt:28
   - ios/App/App/MapCompilerPlugin.swift:4
 - **D009** — mem gate needs a harness-free CLI driver plus the in-process allocator peak counter, an Austria-scale on-device run, and the iOS increased-memory entitlement — platforms: ios,core
   - freehike-core/scripts/mem_gate.sh:28

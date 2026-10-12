@@ -68,6 +68,18 @@ export interface BackgroundJobQueryResult {
   bytesWritten?: number;
   /** Present when state === 'failed'. */
   reason?: string;
+  /**
+   * P9.C8, Android only, state === 'pending': the worker's last saved
+   * progress. Saved on integer change or a 5 s heartbeat. `progressJobId`
+   * names the job that saved it — use the fields only when it equals `jobId`.
+   */
+  progressJobId?: string;
+  /** Integer 0–100 across the whole job. */
+  progressPercent?: number;
+  /** The engine's status line at that save (not displayed in v0.1). */
+  progressStatus?: string;
+  /** Device wall-clock ms of the save. */
+  progressAtMs?: number;
 }
 
 /**

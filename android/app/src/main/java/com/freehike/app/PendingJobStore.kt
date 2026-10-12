@@ -161,6 +161,40 @@ object PendingJobStore {
     fun markFailed(context: Context, record: Record, reason: String): Boolean =
         updatePending(context, record.jobId) { it.copy(state = STATE_FAILED, reason = reason) }
 
+    /**
+     * P9.C8: the worker's last progress point, in its own keys beside the
+     * record (never part of [Record], so the circuit-breaker writes above
+     * are untouched). Written only while the store still holds the PENDING
+     * record for the same job — under the same lock as [clear], so a slice
+     * running past a cancel cannot bring the keys back. apply(), not
+     * commit(): display data, and losing the last write to a kill costs at
+     * most one point. [clear] removes these keys with the record.
+     */
+    @Synchronized
+    fun saveProgress(context: Context, progress: CompileProgress) {
+        val current = loadAny(context) ?: return
+        if (current.jobId != progress.jobId || current.state != STATE_PENDING) return
+        prefs(context).edit()
+            .putString("progressJobId", progress.jobId)
+            .putInt("progressPercent", progress.percent)
+            .putString("progressStatus", progress.status)
+            .putLong("progressAtMs", progress.atMs)
+            .apply()
+    }
+
+    /** The last saved progress point, or null if none. */
+    @Synchronized
+    fun loadProgress(context: Context): CompileProgress? {
+        val p = prefs(context)
+        val jobId = p.getString("progressJobId", null) ?: return null
+        return CompileProgress(
+            jobId = jobId,
+            percent = p.getInt("progressPercent", 0),
+            status = p.getString("progressStatus", "") ?: "",
+            atMs = p.getLong("progressAtMs", 0),
+        )
+    }
+
     @SuppressLint("ApplySharedPref")
     @Synchronized
     fun clear(context: Context) {

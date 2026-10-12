@@ -36,6 +36,7 @@ vi.mock('../services/handoffProgress', async (importOriginal) => {
   };
 });
 import { resetHandoffProgress } from '../services/handoffProgress';
+import { clearCompileProgress, readCompileProgress } from '../services/compileProgress';
 
 import { useCompilerStore } from './compilerStore';
 import { useMapStore } from './mapStore';
@@ -75,6 +76,37 @@ describe('discoverBackgroundJobs — cold-boot record dispatch', () => {
     expect(s.isBackgroundCompiling).toBe(true);
     expect(s.pendingHandoffJobs).toEqual([]);
     expect(mapCompiler.acknowledgeBackgroundJob).not.toHaveBeenCalled();
+  });
+
+  it('pending record seeds the display for the matching job and ignores a mismatch', async () => {
+    clearCompileProgress();
+    mapCompiler.queryBackgroundJob.mockResolvedValue({
+      state: 'pending',
+      jobId: 'bg_a',
+      progressJobId: 'bg_a',
+      progressPercent: 42,
+      progressStatus: 'pass2: indexing ways (120 blocks scanned)',
+      progressAtMs: 1_000,
+    });
+    await useCompilerStore.getState().discoverBackgroundJobs();
+    expect(readCompileProgress()).toEqual({ jobId: 'bg_a', percent: 42, atMs: 1_000 });
+
+    // Progress keys left by another job: the job is known, the number is not.
+    mapCompiler.queryBackgroundJob.mockResolvedValue({
+      state: 'pending',
+      jobId: 'bg_new',
+      progressJobId: 'bg_old',
+      progressPercent: 87,
+      progressStatus: 'finalize',
+      progressAtMs: 2_000,
+    });
+    await useCompilerStore.getState().discoverBackgroundJobs();
+    expect(readCompileProgress()).toEqual({ jobId: 'bg_new', percent: null, atMs: null });
+
+    // A record that is no longer pending clears the display.
+    mapCompiler.queryBackgroundJob.mockResolvedValue({ state: 'idle' });
+    await useCompilerStore.getState().discoverBackgroundJobs();
+    expect(readCompileProgress()).toEqual({ jobId: null, percent: null, atMs: null });
   });
 
   it('failed record surfaces the reason and acknowledges (releases) it', async () => {

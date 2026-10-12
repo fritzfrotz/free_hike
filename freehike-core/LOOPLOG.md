@@ -4188,3 +4188,100 @@ captures stay in the git-ignored device-logs folder.
   network request registered by the app's user ID during the compile.
   Airplane, Wi-Fi and charger events come from the system and radio
   logs, which cover the whole window.
+
+## P9.C8 — background compile percent on screen (plan, 2026-10-12)
+
+**Operator calls:** option B′ (poll the native job record; no new event
+type). The worker saves the integer percent, the engine's status line and
+a timestamp, on integer change or after a 5 s heartbeat (heartbeat added
+after the 10-12 log showed integer gaps up to 29.6 s against the 15 s
+paused threshold). While a job is pending the WebView re-reads the record
+every 3 s; the existing handoff bar shows "Queued" / "Compiling N%" /
+"Paused at N% — continues while charging" (paused = saved more than 15 s
+ago). The sink body inside the FFI callback gets a catch-all guard. iOS:
+state word only, never a number; gap recorded as one sentence in D004.
+Out of scope: bar graphic, phase label, notification, time estimate.
+Engine, FFI surface, checkpoint/resume untouched. Budget 30. Base: main
+`13dabf7`, branch `wip/progress`; stop at a staged tree.
+
+**Goal:** during a background compile on Android the bar shows the
+engine's integer percent with a state word, and a reopen shows the last
+saved percent instead of 0.
+
+**Files:** `android/.../CompileProgressSink.kt` (new),
+`android/.../BackgroundCompileWorker.kt`, `android/.../PendingJobStore.kt`,
+`android/.../MapCompilerPlugin.kt`,
+`android/app/src/test/java/com/freehike/app/CompileProgressSinkTest.kt`
+(new), `ios/App/App/MapCompilerPlugin.swift` (D004 tag text only),
+`src/services/compileProgress.ts` + `.test.ts` (new),
+`src/plugins/MapCompiler.ts`, `src/store/compilerStore.ts` + `.test.ts`,
+`src/ui/components/BackgroundHandoffBar.tsx`, `TRACKER.md` (generated),
+LOOPLOG.
+
+**Proofs (named before implementation):**
+- vitest `compileProgress: sink round-trip (seed, read, clear)`
+- vitest `compileStateLabel: queued / compiling / paused by staleness`
+- vitest `pending record seeds the display for the matching job and
+  ignores a mismatch`
+- JUnit `sink never throws into the callback`
+- JUnit `saves on integer change or after the 5 s heartbeat, never
+  otherwise`
+
+**Steps [E]/[D]:** 1 [E] calls (done). 2 [D] red tests (JS + Kotlin).
+3 [D] JS sink, types, store seeding, bar poll + paint. 4 [D] Kotlin sink,
+store progress keys (written only while the pending record holds the
+same job), plugin query fields, worker wiring, D004 text. 5 [D] ladder ×2:
+frontend L1; `gradlew testDebugUnitTest assembleDebug`; janitor `--check`.
+6 [D] APK size + checksum, janitor `--fix`, close entry, stage → STOP.
+Allocation (30): branch 1, plan 1, red tests 3, red run 1, JS 4, Kotlin 4,
+ladder 4, APK 1, fix/close/stage 3 = 22; fixes 8.
+
+### P9.C8 — execution + close (2026-10-12)
+
+- Red: vitest — both suites failed on the missing `compileProgress`
+  module. JUnit — the first offline run failed resolving the test
+  classpath (JUnit 4.13.2 declared since the template, never cached; no
+  earlier chunk ran the unit-test task). Operator call: one online
+  Gradle run to resolve the declared JUnit (+ hamcrest-core), everything
+  after offline. That run doubled as the Kotlin red: `Unresolved
+  reference 'CompileProgressSink'`. Green after one implementation round;
+  no fix attempts.
+- Ladder (all Gradle runs `--offline`):
+  run 1 — `tsc -b` ok, `eslint .` ok, vitest 13 files / 75 tests (was
+  12 / 72), JUnit `CompileProgressSinkTest` 2/2, `assembleDebug` ok,
+  janitor `--check` clean (TRACKER stale until `--fix`).
+  run 2 — same plus `--rerun-tasks` on Gradle: all green.
+  run 3 — run 1's exact command: all green; Gradle reported everything
+  up to date, so the JUnit results are run 2's (not re-executed).
+  Green-lock pair: runs 2 and 3.
+- Build identity for the device run: chunk P9.C8, debug APK 12,139,398 B,
+  SHA-256 `c527ec9f525e979228ecd9efb64f08b22d5946b483bf31ebd06e733fbb0c586d`
+  (runs 2 and 3 identical). Native lib inside: the arm64 release
+  `libfreehike_ffi.so` from `jniLibs` (5,065,152 B, built after 8c3a3ed;
+  no Rust change since).
+- Finding (not resolved here): run 1 produced a 37,477,863 B APK — the
+  same byte count as the 8c3a3ed device APK — from Gradle intermediates
+  marked up to date; after the forced rebuild the APK is 12,139,398 B. The
+  new sink class is in the dex of both. Which native lib the 37 MB build
+  carried is unknown (that APK was overwritten).
+- Flagged deviations (operator veto offered): (1) the bar paints one
+  frame per poll, not a continuous rAF loop; (2) the 3 s poll re-runs the
+  whole `discoverBackgroundJobs`, so it also notices a finished job and
+  starts the copy without the event; (3) the queued text is now
+  "Background compile: Queued" — the old "it will run while the device is
+  charging" line is gone from that state; (4) the JS slot keeps percent
+  and timestamp only; the status line travels in the record but is not
+  displayed; (5) on iOS the label is always "Queued" while pending — the
+  only word available without a Swift change; D004 text says so.
+- Not covered by a test: the plugin's `queryBackgroundJob` fields, the
+  `saveProgress` pending/job guard, and the bar's poll and paint (no
+  component test harness). The Samsung run is the proof for those.
+- Swift: D004 tag text only; not compile-verified (no Xcode, D004).
+- Engine, FFI surface, bindings, checkpoint/resume: untouched.
+- Promotion valve: none — no kill entry with a permanent lesson; no
+  tracked item closed.
+- Steps: 25/30 (branch 1, plan 1, red tests 3, rejected run 1, offline
+  red 1, cause 2, online resolve 1, JS 4, Kotlin + D004 4, ladder 3, APK
+  check 1, `--fix` 1, this entry 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).

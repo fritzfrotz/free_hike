@@ -2,6 +2,10 @@
 import { useEffect, useRef } from 'react';
 import { useCompilerStore } from '../../store/compilerStore';
 import { readHandoffProgress } from '../../services/handoffProgress';
+import { compileStateLabel, readCompileProgress } from '../../services/compileProgress';
+
+/** How often the pending job's record is re-read (P9.C8, option B′). */
+const COMPILE_POLL_MS = 3_000;
 
 /** Formats a byte count as a fixed-point MB figure for the copy readout. */
 function toMB(bytes: number): string {
@@ -27,6 +31,7 @@ export default function BackgroundHandoffBar() {
   const barRef = useRef<HTMLDivElement>(null);
   const readoutRef = useRef<HTMLSpanElement>(null);
   const rafIdRef = useRef<number | null>(null);
+  const compileStateRef = useRef<HTMLSpanElement>(null);
 
   // Paint loop — alive only during the copy stage.
   useEffect(() => {
@@ -59,6 +64,37 @@ export default function BackgroundHandoffBar() {
     };
   }, [stage]);
 
+  // P9.C8 — while a job is pending, re-read the native record every 3 s and
+  // paint the state word + percent straight onto the DOM, one frame per
+  // poll (not a continuous rAF loop: the number changes every few seconds
+  // and a compile runs for tens of minutes). Discovery also notices the
+  // job finishing, which starts the copy stage and ends this poll.
+  const compilePending = stage === 'idle' && isBackgroundCompiling;
+  useEffect(() => {
+    if (!compilePending) return;
+    let stopped = false;
+    let frame: number | null = null;
+    const paint = () => {
+      frame = null;
+      if (stopped || !compileStateRef.current) return;
+      compileStateRef.current.textContent = compileStateLabel(readCompileProgress(), Date.now()).text;
+    };
+    paint();
+    const timer = setInterval(() => {
+      void useCompilerStore
+        .getState()
+        .discoverBackgroundJobs()
+        .then(() => {
+          if (!stopped && frame === null) frame = requestAnimationFrame(paint);
+        });
+    }, COMPILE_POLL_MS);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [compilePending]);
+
   const handoffActive = stage !== 'idle';
   if (!handoffActive && !isBackgroundCompiling) return null;
 
@@ -88,7 +124,8 @@ export default function BackgroundHandoffBar() {
             {stage === 'done'     && <><strong>Region ready:</strong> {jobId} is now the active offline map.</>}
             {stage === 'error'    && <><strong>Background import failed:</strong> {error}</>}
             {stage === 'idle'     && isBackgroundCompiling && (
-              <><strong>Background compile queued</strong> — it will run while the device is charging.</>
+              // Text written imperatively (P9.C8 poll above) — React never re-renders it.
+              <><strong>Background compile:</strong> <span ref={compileStateRef} className="tabular-nums" /></>
             )}
           </span>
         </div>

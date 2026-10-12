@@ -20,13 +20,12 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import uniffi.freehike.CompilationStatus
-import uniffi.freehike.ProgressCallback
 import uniffi.freehike.ThermalState
 import uniffi.freehike.compileChunk
 import uniffi.freehike.purgeJob
 import uniffi.freehike.thermalState
 
-// DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified — platforms: ios,android
+// DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified. The iOS background compile shows Queued and no percent while pending, its sink saves no progress (P9.C8) — platforms: ios,android
 /**
  * The Android background window (P8.C3 §2–3) — the WorkManager mirror of
  * the iOS `BackgroundCompileScheduler`: drives 2000ms budget-yield slices
@@ -100,6 +99,13 @@ class BackgroundCompileWorker(
         }
 
         val job = record.toCompileJob()
+        // P9.C8: logcat line plus the saved progress point the WebView polls.
+        val progressSink = CompileProgressSink(
+            jobId = record.jobId,
+            clock = System::currentTimeMillis,
+            save = { PendingJobStore.saveProgress(applicationContext, it) },
+            log = { Log.i(TAG, it) },
+        )
         var slices = 0
         while (true) {
             // WorkManager's stop signal (constraint lost — e.g. charger
@@ -117,7 +123,7 @@ class BackgroundCompileWorker(
             }
 
             val status = try {
-                compileChunk(job, SLICE_BUDGET_MS, LoggingProgressSink)
+                compileChunk(job, SLICE_BUDGET_MS, progressSink)
             } catch (t: Throwable) {
                 // UniFFI surfaces Rust panics as exceptions; treat like
                 // CompilationStatus.FailedFatal (no retry) and release the
@@ -258,13 +264,6 @@ class BackgroundCompileWorker(
             )
         } else {
             ForegroundInfo(NOTIFICATION_ID, notification)
-        }
-    }
-
-    /** Headless progress sink: logcat keeps field debugging honest. */
-    private object LoggingProgressSink : ProgressCallback {
-        override fun onProgress(percentage: Float, status: String) {
-            Log.i(TAG, "BG compile ${percentage.toInt()}% — $status")
         }
     }
 

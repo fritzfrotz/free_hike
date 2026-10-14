@@ -4638,3 +4638,205 @@ stay in the git-ignored device-logs folder.
   stop; both reached 6 % in about 24–26 s. That run lost its first handoff
   attempt to a low-memory destroy; this one copied on the first attempt
   and then failed at the remount.
+
+## P9.C11 — double teardown fix, GPS + memory instrumentation, RC2 (plan, 2026-10-13)
+
+**Operator calls (chunk spec):** continue on `wip/boot` (HEAD `9bb5f15`),
+merge base main `7304817`. Fix the double `remove()`; instrument the GPS
+tap path and the map's lifecycle events, no guessed fix; log memory once
+per worker slice; build RC2 by the three-step recipe from fresh
+intermediates; verify the run-script capture lines on the phone. Budget
+set by the agent after reading the tree (operator rule for this chunk):
+**40**. Changes outside MapView's teardown, the GPS/tracking path and the
+worker's logging are HITL. Commit by the operator.
+
+**Goal:** the first-region remount tears the map down once and the page
+survives; RC2's capture shows every GPS tap, fix and camera move with the
+map's size and lifecycle events, and a per-slice memory curve.
+
+**Change:**
+- `removeMapOnce` (new `src/services/mapTeardown.ts`): remembers removed
+  instances (WeakSet, marked before the call), so the cleanup's two
+  references (`map`, `mapRef.current`) remove one map once; a throw from
+  `remove()` is logged and the cleanup goes on to close the worker.
+- `mapDiagLine` (new `src/services/mapDiagnostics.ts`): one line with
+  centre, zoom, pitch, canvas buffer + CSS size and container size; never
+  throws, prints non-finite values as they are.
+- MapView: `[GPS]` lines for the tap, each fix (lat/lng, accuracy, fix
+  time) and each `flyTo` with its target; `[MapView] map <event>` lines
+  for error, webglcontextlost, webglcontextrestored, idle, remove — each
+  with `mapDiagLine`. `locationTracker` passes the fix time through.
+  No camera logic change (hypothesis only: a new 3-D `flyTo` per fix
+  while tracking).
+- Worker: after each slice, `BG mem slice=N pss_kb rss_anon_kb native_kb
+  java_kb` under `BackgroundCompileWorker` (new `CompileMemoryLog.kt`,
+  Android-free formatting + a guarded sampler). The engine exposes no
+  dirty-heap figure over FFI (the in-process peak counter is D009); none
+  is added (FFI surface = HITL).
+
+**Files:** `src/services/mapTeardown.ts` + test, `src/services/mapDiagnostics.ts`
++ test (new), `src/ui/components/MapView.tsx`,
+`src/ui/services/locationTracker.ts`,
+`android/.../CompileMemoryLog.kt` (new), `android/.../BackgroundCompileWorker.kt`,
+`android/app/src/test/.../CompileMemoryLogTest.kt` (new), `TRACKER.md`
+(generated), LOOPLOG.
+
+**Proofs (named before implementation):**
+- vitest `removeMapOnce: the cleanup's two references to one map remove it exactly once`
+- vitest `removeMapOnce: a second call on the same instance is a no-op`
+- vitest `removeMapOnce: null and undefined are harmless`
+- vitest `removeMapOnce: a throwing remove() is logged, not rethrown`
+- vitest `mapDiagLine: camera, canvas and container size in one line`
+- vitest `mapDiagLine: a non-finite camera or a missing container still yields a line`
+- JUnit `rssAnonKb reads RssAnon from proc status and is null when absent`
+- JUnit `memory line carries slice, pss, rss_anon, native and java heap`
+Device-only (no component harness): the remount itself and every log
+line's appearance in logcat. RC2 is the proof for those.
+
+**Steps [E]/[D]:** 1 [E] calls (spec). 2 [D] red tests. 3 [D] helpers,
+MapView, tracker, Kotlin log. 4 [D] ladder ×2: frontend L1, Gradle unit
+tests, Rust L1 (no Rust change; counts only), janitor `--check`. 5 [D] RC2:
+`npm run build` → `npx cap sync android` → `gradlew --offline clean
+assembleDebug`; size, SHA-256, bundle strings. 6 [D] capture lines
+verified over adb. 7 [D] janitor `--fix`, close entry, stage → STOP.
+Allocation (40): plan 1, red tests 3, red runs 2, implementation 8,
+ladder 4, Rust 2, RC2 3, device checks 6, fix/close/stage 3 = 32; fixes 8.
+Baseline counts: vitest 15 files / 86 tests; JUnit 2; Rust 234 passed,
+7 ignored.
+
+### P9.C11 — execution + close (2026-10-14)
+
+- Red: vitest — both new suites failed on import. JUnit — `Unresolved
+  reference 'CompileMemoryLog'`, after two misfired runs (no JAVA_HOME for
+  the Java 21 toolchain; `--tests` without the `:app:` scope). Green after
+  one implementation round; no fix attempts.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 17 files /
+  92 tests (was 15 / 86; +6 = the named proofs), JUnit 5 (was 3 — the plan
+  said 2, it missed the template test; +2 = the named proofs), run 2
+  forced with `--rerun-tasks`, janitor `--check` clean. Rust L1 (no Rust
+  change): fmt ok, clippy ok, 234 passed / 7 ignored (unchanged).
+  Janitor `--fix`: B008's MapView line 374 → 376; nothing else.
+- Dev preview: the known sprite error (B008) now carries the diagnostic
+  line from a live MapLibre (camera, canvas, container); idle/remove/GPS
+  lines not reached there (the P9.C9 load stall; geolocation denied).
+- RC2 build identity (pre-merge, chunk P9.C11 on `wip/boot` 9bb5f15 + this
+  diff), by the recipe with `gradlew --offline clean :app:assembleDebug`:
+  debug APK 12,157,766 B, SHA-256
+  `6c77155a96983f4aabfdf7b4a5d1c6875bb6b516e3da39505016165c2a8e0a5f`.
+  Bundle `index-BrgriVVU.js` 1,341,810 B (same as dist); carries the new
+  `[GPS] tap:` / `[GPS] fix` / `[GPS] flyTo (tracking)` / teardown strings
+  and "No offline map yet"; no "Innsbruck Center"; dex carries `BG mem
+  slice=`; arm64 `libfreehike_ffi.so` 5,065,152 B (unchanged).
+- Capture lines checked on the phone (Samsung SM-S918B, Android 16, RC1
+  build installed): `setsid` present; a detached capture survived an adb
+  server restart (all shells closed) re-parented to init and kept
+  writing; pull works; a launch → force-stop → relaunch showed the
+  force-stop line, the kill and the new process start. Not exercised
+  live: airplane toggle (system setting — query checked against the 10-12
+  captures), reboot, a resumed compile or download (queries checked
+  against RC1 lines and the code). WorkManager's boot receiver is
+  disabled on the phone with no job pending. The first stop command
+  (`pkill -f` with a plain pattern) matched its own shell and ended the
+  session after stopping the capture; the stop line in the report uses a
+  self-excluding pattern, not re-run on the phone (budget).
+- Hypothesis left open (no fix): the GPS-tap blank map. RC1 shows no
+  error; the candidate is a new 3-D `flyTo` per fix while tracking. RC2's
+  `[GPS]` and `[MapView] map …` lines decide it.
+- Flagged deviations (operator veto offered): (1) `removeMapOnce` also
+  catches and logs a throwing first `remove()` so the cleanup still
+  closes the worker; (2) the existing `[MapLibre]` error line now carries
+  the diagnostic suffix; (3) helpers live in two new files
+  (`mapTeardown.ts`, `mapDiagnostics.ts`) and `CompileMemoryLog.kt`;
+  (4) memory figures are the whole app process — the engine reports no
+  heap figure of its own (D009 holds the in-process counter).
+- Process slips: one listing outside the repo (the Android SDK
+  build-tools folder) while looking for dexdump, against the operator's
+  inside-the-repo rule; nothing written there. The test capture pulled to
+  the git-ignored device-logs folder.
+- Promotion valve: none; no tracked item closed.
+- Steps: 40/40 (plan 1, red tests 3, red runs 4, helpers 2, MapView 6,
+  tracker 3, Kotlin 2, ladder 4, Rust 2, janitor 1, RC2 2, device 6
+  incl. one failed start and the self-matching stop, this entry 1,
+  stage 1 — the Rust baseline counted inside "Rust"). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator (wip branch).
+
+## P9.C11 addendum — GPS camera fix, RC2 rebuild (plan, 2026-10-14)
+
+**Operator calls:** budget 20. Cause read live on the phone (RC1, debug
+web view, read-only): the dot is correct (Lisbon), the camera is pinned at
+the region bounds' north-west corner, still moving; min zoom 14 (archive
+header, tile source 14–14). The fly-to arc wants to zoom out below the
+clamp and restarts on every fix while tracking. Fix in the GPS path only;
+clamp, bounds, C9 boot binding and the C11 logging stay (the `[GPS]` lines
+rename `flyTo` → `easeTo`, operator-accepted). D012 recorded as a
+comment-only tag in `tiles/src/finalize.rs` (option (a)). The earlier RC2
+build was never installed; this rebuild is RC2.
+
+**Change:** new `src/services/gpsCamera.ts`: `followFix` (tracking — plain
+`easeTo` to the fix, no zoom) and `centerOnFix` (tap — `easeTo` to the fix
+at the target zoom; an ease interpolates zoom between its endpoints, so it
+never drops below either, both ≥ the clamp). MapView calls these in place
+of its two `flyTo`s.
+
+**Files:** `src/services/gpsCamera.ts` + test (new),
+`src/ui/components/MapView.tsx`, `freehike-core/tiles/src/finalize.rs`
+(comment only), `TRACKER.md` (generated), LOOPLOG.
+
+**Proofs (named before implementation):**
+- `followFix: pans with easeTo and never sets a zoom`
+- `centerOnFix: eases to the target zoom and never calls flyTo`
+- `centerOnFix: an ease from any start zoom at or above the clamp stays at
+  or above it`
+Not reachable by a unit test: which helper MapView calls on a fix and on a
+tap — RC2 run step 11 is the device proof.
+
+**Steps:** 1 plan, 2 red test, 3 red run, 4 helper, 5–7 MapView, 8 D012,
+9–10 ladder ×2 (frontend L1, janitor `--check`, `cargo fmt --check`),
+11 janitor `--fix`, 12 web build + sync, 13 clean APK, 14 close entry,
+15 stage; fixes 5. Before: vitest 17 / 92, JUnit 5, Rust 234 / 7 ignored.
+
+### P9.C11 addendum — execution + close (2026-10-14)
+
+- Red: the `gpsCamera` suite failed on import. Green after one
+  implementation round; no fix attempts.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 18 files /
+  95 tests (was 17 / 92; +3 = the named proofs), janitor `--check` clean,
+  `cargo fmt --check` ok; run 2 also clippy ok and Rust 234 passed /
+  7 ignored (unchanged; the Rust diff is one comment). No Kotlin change
+  (JUnit stays 5, not re-run). Janitor `--fix`: D012 added
+  (`tiles/src/finalize.rs:409`), B008's MapView line 376 → 377.
+- Tap choice: a plain ease, not a capped flyTo — an ease interpolates zoom
+  between its endpoints, so it cannot dip below the clamp, and it stays off
+  the arc code that misbehaved under the clamp.
+- Not reached by a unit test: which helper MapView calls on a fix and on a
+  tap; RC2 run step 11 is the device proof.
+- RC2 build identity (pre-merge, chunk P9.C11 incl. this addendum on
+  `wip/boot` 9bb5f15 + the staged diff), `npm run build` → `npx cap sync
+  android` → `gradlew --offline clean :app:assembleDebug`: debug APK
+  12,157,818 B, SHA-256
+  `e233990c6c0aa5da7a442a3e4c42fd0996373102a8048729f71cea355456bed9`.
+  Bundle `index-CPnGWMFa.js` 1,341,880 B (same as dist): `[GPS] easeTo
+  (tracking)`, `[GPS] easeTo (tap)`, `[GPS] tap:`, `[GPS] fix lat=`,
+  `map.remove() threw`, "No offline map yet" present; `[GPS] flyTo`,
+  "Innsbruck Center", "Patscherkofel" absent; dex carries `BG mem slice=`;
+  arm64 `libfreehike_ffi.so` 5,065,152 B (unchanged). Supersedes the
+  earlier RC2 APK (`6c77155a…`, never installed).
+- Recorded, no work:
+  - D012 (tagged): z5–14 jobs produce only z14 tiles (tile source 14–14) —
+    cause of the 10-07 blank-when-zoomed-out and of the P9.C9 clamp at 14.
+  - Accuracy ring: the radius expression multiplies by cos(lat) instead of
+    dividing and uses the wrong metres-per-pixel constant — ring too small.
+  - GPS button showed grey (tracking off) while the camera was still being
+    moved at the bounds corner; whether tracking was on is not established.
+- Flagged deviation (operator-accepted before execution): the `[GPS]`
+  lines say `easeTo`; the tracking line reports `zoom=current`.
+- Promotion valve: candidate lesson — under a min-zoom clamp, never use
+  flyTo (its arc zooms out). Not promoted; operator call (it could become a
+  `forbidden-pattern` on `\.flyTo\(` under `src/**`).
+- Steps: 15/20 (plan 1, red test 1, red run 1, helper 1, MapView 3, D012 1,
+  ladder 2, `--fix` 1, web build + sync 1, APK 1, this entry 1, stage 1).
+  Pivots: 0.
+
+**Status:** AGENT-CLOSED — whole P9.C11 staged; commit by the operator
+(wip branch).

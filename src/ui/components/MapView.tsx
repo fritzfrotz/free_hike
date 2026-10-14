@@ -12,6 +12,9 @@ import { registerPMTilesSource, type TelemetryData } from '../../services/pmtile
 import { mapInitOutcome, stripBasemap, stripTerrain } from '../../services/styleTerrain';
 import { viewClampFromHeader, type ViewClamp } from '../../services/viewClamp';
 import { regionDisplayName } from '../../services/regionLabel';
+import { removeMapOnce } from '../../services/mapTeardown';
+import { mapDiagLine } from '../../services/mapDiagnostics';
+import { centerOnFix, followFix } from '../../services/gpsCamera';
 import RegionSelectorOverlay from './RegionSelectorOverlay';
 
 export type { TelemetryData };
@@ -663,7 +666,16 @@ export default function MapView({
         });
         // Surface the underlying Error message/stack — logging the raw event
         // object prints "[object Object]" and hides the actual failure.
-        activeMap.on('error', (e) => console.error('[MapLibre]', e.error?.message ?? e.error ?? e));
+        activeMap.on('error', (e) => console.error(
+          `[MapLibre] ${e.error?.message ?? e.error ?? e} | ${mapDiagLine(activeMap, activeMap.getContainer())}`,
+        ));
+        // P9.C11: lifecycle lines for the device capture (RC1's GPS-tap
+        // blank map logged nothing) — each with the camera and canvas size.
+        for (const type of ['webglcontextlost', 'webglcontextrestored', 'idle', 'remove'] as const) {
+          activeMap.on(type, () => console.log(
+            `[MapView] map ${type}: ${mapDiagLine(activeMap, activeMap.getContainer())}`,
+          ));
+        }
       };
 
       // One style file, fetched here and shaped BEFORE MapLibre sees it —
@@ -752,9 +764,11 @@ export default function MapView({
       // fail-loud guard, an unexpected empty registry would now error every
       // tile request instead of degrading silently.
 
-      // Explicitly remove map instances to free map canvas/WebGL context
-      map?.remove();
-      mapRef.current?.remove();
+      // Explicitly remove the map to free its canvas/WebGL context. `map`
+      // and `mapRef.current` name the same instance; MapLibre 5.24 throws on
+      // a second remove(), so the second name must be a no-op (P9.C11).
+      removeMapOnce(map);
+      removeMapOnce(mapRef.current);
       mapRef.current = null;
 
       // Ask the worker to close its OPFS handles and wait for confirmation
@@ -809,8 +823,14 @@ export default function MapView({
 
     startTracking(
       // onPosition — identical MapLibre update logic as the old watchPosition cb
-      ({ lng, lat, accuracy }) => {
+      ({ lng, lat, accuracy, time }) => {
         if (cancelled) return;
+        // P9.C11: every fix in the device capture (RC1 GPS-tap blank map).
+        console.log(
+          `[GPS] fix lat=${lat.toFixed(6)} lng=${lng.toFixed(6)} acc=${accuracy.toFixed(1)}m ` +
+          `t=${time !== null ? new Date(time).toISOString() : 'none'} ` +
+          `tracking=${useMapStore.getState().isTrackingCamera}`,
+        );
 
         userLocationRef.current = { lng, lat, accuracy };
         onPositionUpdate?.({ lng, lat, accuracy });
@@ -842,9 +862,14 @@ export default function MapView({
 
         // Auto-follow camera only when tracking is active. Read straight off
         // the store (outside the React tree) — no ref-mirror needed since
-        // useMapStore.getState() always returns the latest value.
+        // useMapStore.getState() always returns the latest value. A plain pan
+        // at the current zoom — no flyTo arc under the view clamp (P9.C11).
         if (useMapStore.getState().isTrackingCamera) {
-          map.flyTo({ center: [lng, lat], zoom: 15, essential: true });
+          console.log(
+            `[GPS] easeTo (tracking) target=${lng.toFixed(6)},${lat.toFixed(6)} zoom=current ` +
+            `from ${mapDiagLine(map, map.getContainer())}`,
+          );
+          followFix(map, { lng, lat });
         }
       },
       // onError
@@ -888,10 +913,17 @@ export default function MapView({
   /** Snap camera to current GPS fix and engage auto-follow. */
   const handleCenterOnMe = useCallback(() => {
     const map = mapRef.current;
-    if (!map) return;
     const loc = userLocationRef.current;
+    // P9.C11: the tap itself, with the last fix and the map's state.
+    console.log(
+      `[GPS] tap: fix=${loc ? `${loc.lat.toFixed(6)},${loc.lng.toFixed(6)} acc=${loc.accuracy.toFixed(1)}m` : 'none'} ` +
+      `tracking=${useMapStore.getState().isTrackingCamera} ` +
+      `map=${map ? mapDiagLine(map, map.getContainer()) : 'none'}`,
+    );
+    if (!map) return;
     if (loc) {
-      map.flyTo({ center: [loc.lng, loc.lat], zoom: 15, essential: true });
+      console.log(`[GPS] easeTo (tap) target=${loc.lng.toFixed(6)},${loc.lat.toFixed(6)} zoom=15`);
+      centerOnFix(map, loc, 15);
     }
     setTrackingCamera(true);
   }, [setTrackingCamera]);

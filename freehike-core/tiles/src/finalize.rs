@@ -406,6 +406,7 @@ pub fn assemble_archive(
     let mut copy_order: Vec<(u64, u64)> = Vec::new();
     let mut data_len = 0u64;
     let mut dir = Vec::with_capacity(entries.len());
+    // DEBT(D012): z5–14 jobs produce only z14 tiles (tile source reports 14–14) — cause of the 10-07 blank-when-zoomed-out and of the P9.C9 view clamp at 14 (P9.C11) — platforms: core
     let (mut min_zoom, mut max_zoom) = (u8::MAX, 0u8);
 
     for &(tid, old_off, len) in &entries {

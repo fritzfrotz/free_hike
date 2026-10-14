@@ -16,11 +16,13 @@
   - freehike-core/scripts/mem_gate.sh:29
 - **D011** — post-compile handoff copies the archive through the web view in chunks; interrupted by a low-memory destroy on 10-12, succeeded on the next open. The 3 s progress poll re-runs discovery, so it is a second entry point into the handoff copy (P9.C8) — platforms: web
   - src/services/opfsMover.ts:65
+- **D012** — z5–14 jobs produce only z14 tiles (tile source reports 14–14) — cause of the 10-07 blank-when-zoomed-out and of the P9.C9 view clamp at 14 (P9.C11) — platforms: core
+  - freehike-core/tiles/src/finalize.rs:409
 
 ## Open Bugs
 
 - **B008** — [minor] style asset gaps, sprite URL rejected as relative by MapLibre and a contour-label fontstack is not in the vendored glyph set (local glyph fallback renders digits) — repro: boot dev app, console shows sprite error + glyph range warnings
-  - src/ui/components/MapView.tsx:374
+  - src/ui/components/MapView.tsx:377
 
 ## Rule Exemptions
 

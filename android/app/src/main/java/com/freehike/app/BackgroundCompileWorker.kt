@@ -142,6 +142,9 @@ class BackgroundCompileWorker(
                 return@withContext Result.failure()
             }
             slices += 1
+            // P9.C11: one memory point per slice for the device capture's
+            // curve against the 50 MB budget. Logging only; never throws.
+            CompileMemoryLog.sample(slices)?.let { Log.i(TAG, it) }
 
             if (slices == 1) {
                 // The FFI survived a full slice, so this run is not part of

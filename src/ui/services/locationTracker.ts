@@ -49,6 +49,8 @@ export interface GpsPosition {
   lat: number;
   /** Horizontal accuracy radius in metres (68 % confidence). */
   accuracy: number;
+  /** Fix time, ms since the epoch, or null when the platform gives none. */
+  time: number | null;
 }
 
 /**
@@ -102,6 +104,7 @@ export async function startTracking(
             lng:      position.longitude,
             lat:      position.latitude,
             accuracy: position.accuracy,
+            time:     position.time,
           });
         }
       }
@@ -119,7 +122,7 @@ export async function startTracking(
   const id = navigator.geolocation.watchPosition(
     (position) => {
       const { longitude: lng, latitude: lat, accuracy } = position.coords;
-      onPosition({ lng, lat, accuracy });
+      onPosition({ lng, lat, accuracy, time: position.timestamp });
     },
     (err) => {
       console.warn('[LocationTracker] Web GPS error:', err.message);

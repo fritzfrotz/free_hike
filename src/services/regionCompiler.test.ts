@@ -182,7 +182,7 @@ describe('enqueueRegionDownload — the D6 gate, JS side', () => {
     const args = mapCompiler.enqueueBackgroundJob.mock.calls[0][0];
     expect(args.sourceId).toBe(DEMO_SOURCE_ID);
     expect(args.bbox).toBe(BBOX);
-    expect(args.minZoom).toBe(5);
+    expect(args.minZoom).toBe(14);
     expect(args.maxZoom).toBe(14);
     expect(JSON.stringify(args)).not.toMatch(/https?:/);
     expect(useCompilerStore.getState().isBackgroundCompiling).toBe(true);

@@ -24,8 +24,11 @@ import { MapCompiler } from '../plugins/MapCompiler';
 import { useCompilerStore } from '../store/compilerStore';
 import { reportFetchProgress, resetFetchProgress } from './fetchProgress';
 
-/** Vector tile range compiled by the engine. */
-export const COMPILE_MIN_ZOOM = 5;
+/**
+ * Vector tile range compiled by the engine. The engine tiles at zoom 14
+ * only (Pass 3's BASE_TILE_ZOOM); MapLibre overzooms above it. DL-005.
+ */
+export const COMPILE_MIN_ZOOM = 14;
 export const COMPILE_MAX_ZOOM = 14;
 
 /** The v0.1 demo source (DL-003): Geofabrik's Portugal extract. */

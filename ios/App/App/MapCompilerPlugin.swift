@@ -245,7 +245,7 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let budgetMs = UInt32(max(0, min(call.getInt("budgetMs") ?? 250, 600_000)))
-        let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 5, 22)))
+        let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 14, 22)))
         let maxZoom = UInt8(max(0, min(call.getInt("maxZoom") ?? 14, 22)))
 
         let jobsDir = FileManager.default
@@ -399,7 +399,7 @@ public class MapCompilerPlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject(MapCompilerPlugin.unsafeJobIdMessage)
             return
         }
-        let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 5, 22)))
+        let minZoom = UInt8(max(0, min(call.getInt("minZoom") ?? 14, 22)))
         let maxZoom = UInt8(max(0, min(call.getInt("maxZoom") ?? 14, 22)))
         let jobsDir = defaultJobsDir()
 

@@ -912,6 +912,7 @@ pub fn run_slice(
 
                 // Stage 2: assemble the archive at its final destination —
                 // BEFORE the loop exit purges the index this data lives in.
+                // DEBT(D015): the job bbox only sets the archive header bounds (and the spec hash) — no pass filters by it, so a compile tiles the whole extract (Portugal: 28,354 tiles while the view is clamped to the Lisbon box) — platforms: core
                 let bounds = (job.bbox.west, job.bbox.south, job.bbox.east, job.bbox.north);
                 let out_path = archive_path(&job.output_dir, &job.job_id);
                 let info = match tiles::assemble_archive(&db, &data_path, &out_path, bounds) {

@@ -135,7 +135,7 @@ class MapCompilerPlugin : Plugin() {
             return
         }
         val budgetMs = (call.getInt("budgetMs") ?: 250).coerceIn(0, 600_000)
-        val minZoom = (call.getInt("minZoom") ?: 5).coerceIn(0, 22)
+        val minZoom = (call.getInt("minZoom") ?: 14).coerceIn(0, 22)
         val maxZoom = (call.getInt("maxZoom") ?: 14).coerceIn(0, 22)
 
         val jobsDir = context.filesDir.absolutePath + "/map_jobs"
@@ -562,7 +562,7 @@ class MapCompilerPlugin : Plugin() {
             call.reject(UNSAFE_JOB_ID_MESSAGE)
             return
         }
-        val minZoom = (call.getInt("minZoom") ?: 5).coerceIn(0, 22)
+        val minZoom = (call.getInt("minZoom") ?: 14).coerceIn(0, 22)
         val maxZoom = (call.getInt("maxZoom") ?: 14).coerceIn(0, 22)
         val jobsDir = context.filesDir.absolutePath + "/map_jobs"
 

@@ -4997,3 +4997,95 @@ Close: steps 6/8 (entry 1, D013 tag 1, D014 tag 1, janitor `--fix` +
 are comment lines only; no build or test run (no code change). Pivots: 0.
 
 **Status:** AGENT-CLOSED — commit by the operator.
+
+## D012 — zoom 14 only, stated honestly (plan, 2026-10-14)
+
+**Operator calls (10-14):** option (a) of the D012 sizing (read-only, 0
+steps). v0.1 ships zoom 14 only; coarse zooms are the first post-ship
+engine item (in-Pass-3 shape, measurement run first), kept in Base Camp.
+Budget 18 (operator: 17 sized + 1 margin). Branch `wip/d012`; agent
+stages and stops, operator commits and pushes. Accepted as proposed:
+close D012; the job-bbox finding opens as D015 (DEBT, core) at the
+header-bounds line; the PendingJobStore read fallback stays 5 (every
+record write stores the key, so the fallback never applies, and 14 there
+could only ever change a fingerprint); the FFI `CompileJob` doc comment
+("Minimum zoom level to generate") stays, logged as remaining (FFI gate).
+
+**Goal:** no code, text or record promises a zoom the engine does not
+build. **Files:** `src/services/regionCompiler.ts`,
+`src/services/regionCompiler.test.ts`, `src/plugins/MapCompiler.ts`,
+`android/.../MapCompilerPlugin.kt`, `ios/App/App/MapCompilerPlugin.swift`,
+`README.md`, `freehike-core/tiles/src/finalize.rs` (tag only),
+`freehike-core/compiler/src/engine.rs` (tag only),
+`docs/decision-ledger.md`, this log, `TRACKER.md` (generated).
+**Ladder:** frontend L1 (`tsc -b`, `npx eslint .`, `npm test`) ×2; Rust
+edits are comment lines only (no build); Swift unverified (D004).
+
+**Steps:**
+1. [D] branch `wip/d012` — `git branch --show-current` reads it.
+2. [D] this plan entry.
+3. [E] red test: `enqueue_passes_source_id_never_a_url` expects
+   `minZoom` 14 (`regionCompiler.test.ts:185`) — the one visible test change.
+4. [D] red run — that test fails with expected 14, received 5.
+5. [D] `COMPILE_MIN_ZOOM` 5 → 14 — the on-screen label
+   (`RegionPicker.tsx:150`) and new job records follow the constant.
+6. [D] Android plugin request defaults 5 → 14 (`MapCompilerPlugin.kt`,
+   both enqueue paths).
+7. [D] Swift plugin request defaults 5 → 14 (both paths) — unverified, D004.
+8. [D] `MapCompiler.ts` comment "defaults 5–14" → 14.
+9. [D] README: street level only; whole extract tiled, view clamped to the bbox.
+10. [D] D012 tag removed (`finalize.rs`).
+11. [D] D015 tag at the header-bounds line (`engine.rs`).
+12. [E] DL-005 in `docs/decision-ledger.md`.
+13. [D] close entry (`closes D012`).
+14. [D] janitor `--fix` + `--check` — clean, D012 gone, D015 listed.
+15–16. [D] frontend ladder ×2 green.
+17. [D] stage.
+
+In-flight jobs: the worker builds its job from the stored record
+(`BackgroundCompileWorker.kt:102` → `toCompileJob()`); a stored 5 keeps
+its fingerprint, so its checkpoint still matches and nothing is purged. A
+new enqueue is refused while a record exists. iOS: `Record.minZoom` is a
+required stored field.
+
+### D012 — execution + close (2026-10-14)
+
+closes D012 — the 14–14 header is correct for a build that tiles zoom 14
+only; the stale promise was the job spec (`COMPILE_MIN_ZOOM` 5, the
+picker's "z5–14", the native defaults), now 14 everywhere the request is
+formed. Tag removed from `finalize.rs`; the reason lives in DL-005.
+
+- Red (step 4): `enqueue_passes_source_id_never_a_url` failed with
+  "expected 5 to be 14"; green after step 5.
+- Changed: `COMPILE_MIN_ZOOM` 14 (`regionCompiler.ts`); test expectation
+  5 → 14 (`regionCompiler.test.ts:185`, the one test change); request
+  defaults `?: 5` → `?: 14` at both Android enqueue paths
+  (`MapCompilerPlugin.kt:138`, `:565`) and both Swift paths
+  (`MapCompilerPlugin.swift:248`, `:402`); `MapCompiler.ts:148` comment;
+  README zoom paragraph; DL-005; D015 opened at `engine.rs:915`
+  (job bbox only sets header bounds and the spec hash).
+- Swift: two literal changes, NOT compile-verified (no Xcode) — adds to
+  the iOS debt carried under D004.
+- Unchanged by decision: `PendingJobStore.kt:118` read fallback stays 5.
+- Remaining (FFI gate, not touched): the generated `CompileJob` doc
+  comment "Minimum zoom level to generate (inclusive)" in the bindings
+  (`ffi/src/lib.rs:75` and both vendored trees) still reads as if lower
+  zooms were built.
+- Rust: comment lines only (`finalize.rs` tag removed, `engine.rs` tag
+  added); no cargo run.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 18 files /
+  95 tests both runs (unchanged count: one expectation changed, none
+  added or removed).
+- Janitor: `--fix` + `--check` run after this entry (step 16); result in
+  the close report and the staged `TRACKER.md`.
+- Not exercised: on device; the picker label is read from the constant
+  (`RegionPicker.tsx:150`), not rendered in this chunk.
+
+Promotion valve: no candidate (the lesson — a spec field nothing reads —
+is specific to this field). Steps: 17/18 (branch 1, plan 1, red test 1,
+red run 1, constant 1, Kotlin 1, Swift 1, TS comment 1, README 1, D012 tag
+1, D015 tag 1, DL-005 1, ladder 2, this entry 1, janitor 1, stage 1).
+Pivots: 0.
+
+**Status:** AGENT-CLOSED — staged on `wip/d012`; commit and push by the
+operator.

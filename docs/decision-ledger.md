@@ -45,3 +45,10 @@ Valhalla over GraphHopper · redb · FlatGeobuf · on-device compile over server
 - Prediction (operator): "I expect the terrain cut to be one small chunk; wrong if Code stops at the checkpoint-semantics gate or it needs a second chunk." (Recorded with the chunk already including the belt.)
 - Prediction (Claude, second opinion): one chunk at the proposed budget; the engine deletion and the belt are mechanical, the risk is the map style — wrong if "no terrain archive" needs more than removing the terrain/hillshade/contour wiring from MapView (i.e. the style JSON itself has to fork).
 - Checkpoint: when P-SOV.C3 closes. Verdict: ___
+
+## DL-005 · v0.1 ships zoom 14 only, stated honestly (2026-10-14)
+- Decision (operator): the v0.1 map is street level only — zoom-14 tiles, overzoom above, no zoom-out below 14. The job spec, the picker label and the native defaults say 14–14; the README says so. Closes D012.
+- Optimizing for: a shipped claim that matches the archive, four working days before the tag.
+- Traded away: zoom-out in v0.1; an overview of the compiled region.
+- Reasons: the engine has never built a tile below 14 — the z5–14 range predates Pass 3 (2026-07-13 vs 2026-07-14) and nothing on a device ever consumed it; coarse zooms are a new feature under the v0.1 scope rule (map compile, serverless, one region, airplane-mode verified; new features out); the P9.C9 view clamp (2026-10-12) already settles the demo view at the archive's zoom and bounds.
+- Next: coarse zooms are the first post-ship engine item — lower-zoom rows written inside Pass 3 per way, filtered per zoom; first step a measurement run (rows, bytes and time per zoom on the Portugal extract). Tracked in Base Camp, not in the repo.

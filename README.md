@@ -6,6 +6,8 @@ FreeHike is a 100% local-first, serverless, offline hiking app for iOS and Andro
 
 > **Status: in active development.** The compiler pipeline (OSM → PMTiles basemap, GeoTIFF → Terrain-RGB) is implemented and validated against real data on desktop. Background compilation, device integration, and UI polish are in progress. Not yet ready for the trail.
 
+> **Zoom in v0.1: street level only.** The compiler builds zoom-14 tiles; the map shows zoom 14 and enlarges them above it, with no zoom-out below 14. Coarser zooms come in the next release. A compile tiles the whole downloaded extract (for the demo, all of Portugal), while the demo view is clamped to the Lisbon box.
+
 ## How it works
 
 ```

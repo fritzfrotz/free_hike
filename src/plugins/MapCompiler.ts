@@ -145,7 +145,7 @@ export interface StartJobOptions {
   bbox: string;
   /** Stable ID enables resume across app restarts; defaults to a UUID. */
   jobId?: string;
-  /** Zoom range to compile (defaults 5–14). */
+  /** Zoom range to compile (defaults 14–14; the engine tiles zoom 14 only, DL-005). */
   minZoom?: number;
   maxZoom?: number;
   /**

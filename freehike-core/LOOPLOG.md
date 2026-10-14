@@ -4840,3 +4840,160 @@ tap — RC2 run step 11 is the device proof.
 
 **Status:** AGENT-CLOSED — whole P9.C11 staged; commit by the operator
 (wip branch).
+
+## Samsung release-candidate run — observed (2026-10-14, rc2)
+
+Mode: execute and observe; tracker tags only (comment lines), no code
+change. Summary only; raw captures and the phone-state copies stay in the
+git-ignored device-logs folder (`phone-state/timeline.txt` holds the
+clock timeline this entry is built from). Budget 8.
+
+- **Device:** Samsung SM-S918B (S23 Ultra), Android 16.
+- **Build:** main `58190b2` (P9.C11 incl. the GPS addendum), debug APK
+  12,157,818 B, SHA-256
+  `e233990c6c0aa5da7a442a3e4c42fd0996373102a8048729f71cea355456bed9`
+  (installed copy size and hash checked by the operator at step 1).
+- **Evidence sources:** (log) the two on-phone captures and the buffer
+  dump; (phone record) read over USB after the run — app files and fetch
+  sidecar via run-as, WorkManager's database, usage stats (kept across
+  reboots), exit info, USB history; (operator notes) chat reports, two
+  screenshots at 12:52. No clock times were noted for any step (stopwatch).
+
+### Capture death
+
+The first capture's last write was 12:25:57.94 (the phone's file time,
+equal to its last, cut-off line). logcat writes the file in 4 KB blocks:
+the operator's step-2 check saw 237,568 B twice, the final file is one
+block more (241,664 B), so the process was alive after step 2. An app
+open writes about 10 KB within 3 s in this filter (measured on the
+post-reboot opens), and the first open at 12:26:28 added no block: the
+capture died between 12:25:58 and 12:26:28. Cause unknown — the phone
+keeps no log from before the reboots. The step-3 unplug came before the
+first open, so it falls inside that window; ruled weak as the cause: the
+second capture kept writing through a real unplug at 12:38:28 (USB
+history), and adbd ran unrestarted from 12:37:03. Consequence: nothing
+before the second reboot is in a log; steps 3–8 rest on phone records and
+operator notes.
+
+### Steps
+
+1. **Install RC2, verify size/SHA — pass** (operator terminal; log: RC1
+   removed 12:24:57, installer broadcast 12:25:03).
+2. **Start the capture, check it grows — pass with a caveat** (operator
+   saw no growth over 10 s; the file grew one block later — 4 KB
+   buffering, not a dead process at that point).
+3. **Unplug, onto the brick, open the app — pass per operator, no
+   detail.** Phone record: first open 12:26:28 (usage stats). The capture
+   died inside 12:25:58–12:26:28 (above).
+4. **Start the Portugal fetch — pass** (phone record: extract complete
+   12:28:33, 425,722,569 B = the sidecar's total, `verified=1`).
+5. **Kill mid-download, reopen, resume from disk — partly established.**
+   Phone record: sidecar `restarts=0` with the complete, verified file —
+   the download was never thrown away and restarted; the app left the
+   foreground 12:26:54–12:27:10 and the download finished 83 s after the
+   reopen (RC1: 142 s for the whole file). Not shown by any record: that
+   the bytes on disk were reused, the fingerprint match, the ~100 MB
+   point, whether a second Download tap was needed. Operator: "app
+   continues dl after kill".
+6. **Airplane on, enqueue, "Compiling N%" within a minute — pass per
+   operator, time not noted.** Phone record: first compile
+   foreground-service start 12:29:16. Airplane-on is in no record (only
+   the off at 12:52:02).
+7. **Kill mid-compile past 20 %, resume from checkpoint — operator notes
+   only** (pass per operator, percent not stated). Usage stats show the
+   compile service stop 12:31:03 and a restart at the app reopen 12:31:07;
+   that pattern cannot tell a force-stop from another stop, and exit info
+   holds nothing before 12:37.
+8. **Reboot mid-compile past 50 % — established (second reboot).** Two
+   reboots were done (script wording read as two instructions):
+   12:32:12 → 12:32:58 and 12:36:32 → 12:37:28 (usage stats). Before
+   them the operator read RescheduleReceiver and SystemJobService enabled
+   (USB). After the second, WorkManager's boot receiver started the app
+   process at 12:37:52 with the app not opened (log); the engine resumed
+   from its checkpoint at pass 3, blocks_done 189,018 (51 %) (log); the
+   operator opened the app at 12:38:23. After the first reboot the app was
+   opened 12 s after startup and the service started at 12:33:11, so a
+   resume by itself cannot be told from a resume on opening. WorkManager:
+   the work ended SUCCEEDED with run_attempt_count 6; five worker starts
+   are visible (12:29:16, 12:31:07, 12:33:11, 12:34:20, 12:37:52), the
+   sixth is not placed.
+9. **Lock on the brick until finished — done.** Log: finished 12:50:23,
+   400 slices in this run, 2,435,208 blocks.
+10. **Open after the finish (teardown case) — pass, established.** Log:
+    app open 12:50:54, the first-region remount removed the empty map at
+    12:51:01 with no throw; operator screenshot 12:52: Portugal map drawn,
+    pill, telemetry 91,833 KB (= the archive's 94,036,621 B).
+11. **Airplane off, GPS tap, drag / tap / pinch / lock-unlock — pass,
+    established for the camera.** Log: airplane off 12:52:02; first fix
+    12:52:06; `[GPS] easeTo (tracking)` to the fix and the next `map idle`
+    at exactly that centre, zoom 14; no `flyTo` anywhere; tracking off at
+    12:52:15 (drag). The four taps at 12:51:41–56 came before the first fix
+    (`fix=none`) and moved nothing. Operator screenshot 12:52: blue dot
+    visible; pinch and lock-unlock: operator notes only ("everything
+    worked"). Clock order: step 12's force-stop (12:51:34) came before
+    these taps.
+12. **Force-stop after the compile, reopen — pass, established.** Exit
+    info: force stop from Settings at 12:51:34 (the boot-receiver process);
+    relaunch 12:51:39, map bound (log).
+13. **Stop the capture, pull, dumps, queries — done.** Second capture
+    1,372,160 B, last write 12:52:36; buffer dump 33.9 MB; query outputs
+    q-airplane 2, q-kills 8, q-compile-resume 804, q-download-resume 2,
+    q-memory 401 lines.
+
+### Memory (post-reboot slices only, 400; none before — capture dead)
+
+- `rss_anon_kb` (whole app process: ART, Capacitor, the web view's
+  in-process share): max 138,968 kB (≈ 136 MiB) at slice 141 (12:40:54);
+  last slice before the handoff (400, 12:50:23) 96,780 kB. Over 50 MB.
+- `native_kb` (malloc'd, the closest proxy for the engine): max
+  34,398 kB (≈ 33.6 MiB) at slice 38 (12:38:34); slice 400 29,046 kB.
+  Under 50 MB.
+- The process figure is not the engine's budget figure; the engine
+  reports none of its own (D009).
+
+### Output vs 10-12
+
+28,354 tiles (same); archive 94,036,621 B vs 93,988,534 B (+48,087 B);
+2,435,208 blocks vs 2,433,767. The input differs: Geofabrik extract
+`261013` (425,722,569 B) instead of `261011` (425,467,579 B).
+
+### GPS
+
+The addendum's fix is confirmed on the device: tracking eases to the fix
+at the current zoom and the camera settles on it; no corner pinning. Taps
+before the first fix do nothing.
+
+### Findings (tracker lines)
+
+- **D013** (tagged, `BackgroundCompileWorker.kt`): the post-reboot run
+  (boot-receiver start) went one unbroken ~12.5 min, 400 slices, with no
+  compile foreground-service start in usage stats and no
+  promotion-refused line — past WorkManager's 10-minute limit.
+  Unexplained.
+- **D014** (tagged, `MainActivity.kt`): "Error injecting safe area CSS"
+  three times on every boot — Capacitor's SystemBars injects before
+  `document.documentElement` exists (vendored code, not tracked).
+
+### Operator notes
+
+- After the second reboot: "Compiling" at 51 % with no movement for
+  ~3 min, then very slow (52 %), then normal; from ~70 % it jumped to 100 %
+  quickly. Log alongside: thermal Serious 12:37:54–12:39:54 (halved
+  budget, cooling pauses), Fair from 12:39:54, Nominal from 12:46:04;
+  ways advanced about 2,000 a minute until 12:40, then 503,234 by
+  12:40:51; 70 % at 12:46:59, pass 3 ended (75 %) at 12:49:03, the
+  finalize phase ran 75 → 100 % in about 80 s.
+- Step 5: "app continues dl after kill".
+
+Promotion valve: candidate — on-phone captures need an independent check
+of the logcat process, not file growth (4 KB buffering hides a live
+capture and a dead one alike for minutes). Not promoted; operator call.
+No tracked item closed.
+
+Steps: see the close line below.
+Close: steps 6/8 (entry 1, D013 tag 1, D014 tag 1, janitor `--fix` +
+`--check` 1, this line 1, stage 1). Janitor: clean, 7 debt / 1 bug
+(D013 `BackgroundCompileWorker.kt:92`, D014 `MainActivity.kt:39`). Tags
+are comment lines only; no build or test run (no code change). Pivots: 0.
+
+**Status:** AGENT-CLOSED — commit by the operator.

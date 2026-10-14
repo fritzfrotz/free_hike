@@ -89,6 +89,7 @@ class BackgroundCompileWorker(
             return@withContext Result.failure()
         }
 
+        // DEBT(D013): RC2 post-reboot run (boot-receiver start) went one unbroken ~12.5 min, 400 slices, with no compile FGS start in usage stats and no promotion-refused line — past the 10-minute cap, unexplained (LOOPLOG rc2 run) — platforms: android
         try {
             setForeground(createForegroundInfo())
         } catch (t: Throwable) {

@@ -36,6 +36,7 @@ class MainActivity : BridgeActivity() {
             Log.e(TAG, "thermal bridge unavailable at boot", t)
         }
 
+        // DEBT(D014): "Error injecting safe area CSS" three times on every boot — Capacitor SystemBars (vendored) injects before document.documentElement exists (LOOPLOG rc2 run) — platforms: android
         super.onCreate(savedInstanceState)
     }
 

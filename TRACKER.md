@@ -18,6 +18,10 @@
   - src/services/opfsMover.ts:65
 - **D012** — z5–14 jobs produce only z14 tiles (tile source reports 14–14) — cause of the 10-07 blank-when-zoomed-out and of the P9.C9 view clamp at 14 (P9.C11) — platforms: core
   - freehike-core/tiles/src/finalize.rs:409
+- **D013** — RC2 post-reboot run (boot-receiver start) went one unbroken ~12.5 min, 400 slices, with no compile FGS start in usage stats and no promotion-refused line — past the 10-minute cap, unexplained (LOOPLOG rc2 run) — platforms: android
+  - android/app/src/main/java/com/freehike/app/BackgroundCompileWorker.kt:92
+- **D014** — "Error injecting safe area CSS" three times on every boot — Capacitor SystemBars (vendored) injects before document.documentElement exists (LOOPLOG rc2 run) — platforms: android
+  - android/app/src/main/java/com/freehike/app/MainActivity.kt:39
 
 ## Open Bugs
 

@@ -26,6 +26,7 @@ import uniffi.freehike.purgeJob
 import uniffi.freehike.thermalState
 
 // DEBT(D004): iOS build/link and device smokes need an Xcode machine, latest FFI enum-split changes not compile-verified. The iOS background compile shows Queued and no percent while pending, its sink saves no progress (P9.C8) — platforms: ios,android
+// DEBT(D018): notification permission is never requested, so on Android 13+ the compile's foreground-service notification is suppressed and none shows (RC2 log 12:37:54) — platforms: android
 /**
  * The Android background window (P8.C3 §2–3) — the WorkManager mirror of
  * the iOS `BackgroundCompileScheduler`: drives 2000ms budget-yield slices
@@ -33,14 +34,18 @@ import uniffi.freehike.thermalState
  * state, WorkManager stops us, or thermal Critical tells us to hand the
  * window back and cool down.
  *
- * FGS binding: `setForeground` with `dataSync` promotes the worker to a
- * Foreground Service, lifting WorkManager's 10-minute cap to the
- * platform's dataSync allowance (6h per 24h on Android 14+ — the ceiling
- * ARCHITECTURE.md's checkpoint contract is built to survive). If promotion
- * is refused (API 31+ background-start restriction), the worker still runs
- * under the 10-minute cap: with 2s slices that is ~300 checkpointed slices
- * per window, and the retry chain continues from disk — degraded pace,
- * never lost work.
+ * FGS binding: `setForeground` with `dataSync` asks for a Foreground
+ * Service, which lifts JobScheduler's per-job limit to the platform's
+ * dataSync allowance (6h per 24h on Android 15+ — the ceiling
+ * ARCHITECTURE.md's checkpoint contract is built to survive). WorkManager
+ * 2.10.2 hands the request to its own SystemForegroundService and returns:
+ * a refusal there is caught and logged inside that service, never thrown
+ * here, and WorkManager still treats the work as foreground — it ignores
+ * JobScheduler's stop and keeps its wake lock. There is no 10-minute retry
+ * lane in this library version: an unpromoted run goes on for as long as
+ * the process stays alive (D013 in LOOPLOG). Only a refused service start
+ * throws out of `setForeground`. Work is never lost either way — every
+ * slice ends on a durable checkpoint.
  */
 class BackgroundCompileWorker(
     context: Context,
@@ -89,13 +94,14 @@ class BackgroundCompileWorker(
             return@withContext Result.failure()
         }
 
-        // DEBT(D013): RC2 post-reboot run (boot-receiver start) went one unbroken ~12.5 min, 400 slices, with no compile FGS start in usage stats and no promotion-refused line — past the 10-minute cap, unexplained (LOOPLOG rc2 run) — platforms: android
+        // DEBT(D016): a boot start (WorkManager's boot receiver) gets no foreground service on Android 15+ — the dataSync start of a boot-started app is refused; inferred from usage stats, not observed (RC2 buffer for that process starts 12:43:23) — platforms: android
         try {
             setForeground(createForegroundInfo())
         } catch (t: Throwable) {
-            // API 31+ refuses FGS promotion from some background states.
-            // Not fatal: see class docs — the 10-minute lane still makes
-            // durable progress.
+            // Only a refused service start lands here (API 31+ background-
+            // start restriction); a refusal inside WorkManager's service
+            // never does — see class docs. Not fatal: the run goes on and
+            // every slice checkpoints.
             Log.w(TAG, "FGS promotion refused; continuing under the 10-minute cap", t)
         }
 

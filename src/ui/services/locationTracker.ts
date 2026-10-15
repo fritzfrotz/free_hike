@@ -80,6 +80,7 @@ export async function startTracking(
 
   // ── Native path (iOS / Android) ────────────────────────────────────────────
   if (Capacitor.isNativePlatform()) {
+    // DEBT(D017): on Android the background message makes the plugin start a location foreground service on every map mount, for the app's whole life; it kept RC2's post-reboot compile alive and hides compile foreground-service gaps in device runs — platforms: web
     const id = await BackgroundGeolocation.addWatcher(
       {
         // Show a persistent notification so Android allows background updates.

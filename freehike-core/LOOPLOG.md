@@ -5089,3 +5089,110 @@ Pivots: 0.
 
 **Status:** AGENT-CLOSED — staged on `wip/d012`; commit and push by the
 operator.
+
+## D013 — post-reboot run explained, debt tags, README (plan, 2026-10-15)
+
+**Operator calls (10-15):** option (a) of the D013 sizing (read-only; 1
+scratchpad step, 0 in the repo). No code change: comment fix, three debt
+tags, README paragraph, D013 closed. Budget 10 (reaching it = stop and
+ask). Branch `wip/d013`; agent stages and stops. The observation run is
+not a separate run: one step joins the release-build run script.
+Decision reversed (10-12 → 10-15): v0.1 gets no progress notification and
+no foreground-service redesign; both move post-ship, pending a boot path
+that works on Android 15+.
+
+**Goal:** no comment, tag or README line claims a background behaviour the
+code and WorkManager 2.10.2 do not have.
+**Files:** `android/.../BackgroundCompileWorker.kt` (comments + tags),
+`src/ui/services/locationTracker.ts` (tag only), `README.md`, this log,
+`TRACKER.md` (generated).
+**Ladder:** comment lines and Markdown only — no build or test run
+(precedent: D012's Rust tag edits). Janitor `--fix` + `--check`.
+
+**Steps:**
+1. [D] branch `wip/d013`.
+2. [D] this plan entry.
+3. [D] worker class doc: the refused-promotion model fixed (WorkManager
+   swallows the refusal inside its service and still treats the work as
+   foreground; no 10-minute retry lane); D018 tag (notification permission).
+4. [D] worker promotion site: D013 tag → D016 (boot start, no foreground
+   service on Android 15+); refusal comment fixed.
+5. [D] D017 tag at the GPS watcher (`locationTracker.ts`).
+6. [E] README background-compile paragraph (operator's wording, (a)).
+7. [D] close entry (`closes D013`, decision reversal, run-script step).
+8. [D] janitor `--fix` + `--check` — clean, D013 gone, D016–D018 listed.
+9. [D] stage.
+10. held: the release-build run script is not a tracked file; where its
+    new step lives is the operator's call.
+
+### D013 — execution + close (2026-10-15)
+
+closes D013 — the RC2 post-reboot run (12:37:52 → 12:50:23, 400 slices)
+is explained. Sources: the RC2 buffer dump, boot capture and phone-state
+copies (git-ignored), and WorkManager 2.10.2 bytecode.
+- Start: WorkManager's boot receiver started the process; the worker's
+  `setForeground` sent the service start, and the system allowed it
+  (12:37:54).
+- No foreground service: usage stats record none after the reboot, though
+  they recorded the earlier ones. Android 15+ refuses a dataSync start for
+  a boot-started app (targetSdk 36). WorkManager catches that refusal inside
+  its own service, so the worker's `setForeground` returned normally and
+  the "promotion refused" line never ran. The refusal line itself is not in
+  any capture (the buffer for that process starts at 12:43:23): inferred,
+  not observed → D016.
+- No cap: WorkManager had already marked the work foreground and taken a
+  wake lock with no timeout. JobScheduler's stop at 12:44:24 was logged
+  "Ignored stopWork … is in foreground"; the slices went on.
+- Kept alive: from the app open at 12:38:24 the GPS watcher held a
+  location foreground service (the plugin promotes on every map mount,
+  with the background message) until 12:51:31 → D017. The compile
+  notification was suppressed — notification permission is never requested
+  → D018.
+- Not known: the OS reason for the 12:44:24 stop (job stats list canceled
+  1, constraints 1, thermal 2, "olaf" 3).
+
+**Decision reversed (operator, 10-15):** the 10-12 call (v0.1 gets a
+proper foreground service with compile progress in its notification) is
+reversed. Notification and foreground-service redesign move post-ship,
+pending a boot path that works on Android 15+.
+
+- Changed (comments, tags, Markdown only): worker class doc — the
+  refused-promotion model now matches WorkManager 2.10.2 (no 10-minute
+  retry lane), and the dataSync allowance is credited to Android 15+, not
+  14+; the promotion-site comment says which refusal throws; D013 tag →
+  D016 at the same line; D018 above the worker class; D017 at the GPS
+  watcher (`locationTracker.ts`, `platforms: web` — the call site is under
+  `src/`, the behaviour is Android's); README "Background compile in v0.1
+  (Android)" paragraph.
+- Left as is (scope: no code change): the worker's log string
+  "continuing under the 10-minute cap" (`BackgroundCompileWorker.kt`)
+  still names the lane that does not exist.
+- No build or test run: comment lines and Markdown only.
+
+**Release-build run script — proposed step (the script is not a tracked
+file; where it lives is the operator's call):** reboot mid-compile, past
+20 %, phone on the charger. Do not open the app. Leave it locked on the
+charger for 20 minutes, then pull the capture and the phone-state copies
+(usage stats, job scheduler dump, WorkManager database). The capture
+filter adds WorkManager's tags so a refusal inside its foreground service
+is caught. Result: the slice timeline shows a continuous run, bursts or
+none, and the README's Android 15+ line is then marked observed or struck.
+Not opening the app keeps the GPS service (D017) out of the result.
+
+Promotion valve: candidate — "a library's success return is not proof
+the OS granted the request; check the OS record (usage stats)". Not
+promoted; operator call.
+Steps: 9/10 (branch 1, plan 1, worker class doc + D018 1, promotion site
++ D016 1, D017 1, README 1, this entry 1, janitor 1, stage 1); 1 held for
+the run-script step. Pivots: 0.
+
+**Status:** AGENT-CLOSED — staged on `wip/d013`; commit and push by the
+operator.
+
+Correction (2026-10-15): Steps: 13/15 (10 planned + 3 after two budget
+raises, 10 → 12 → 15: janitor `--fix` + `--check` 1, this line 1,
+re-stage 1). The held step was used for the D018 move (tag now above the
+worker's documentation block, as D004 is placed). The run-script wording
+stays in this entry as the source for the operator's chat/Session Log
+script; no tracked file. The agent miscounted the closing steps once
+(proposed 12, needed 13). Janitor: clean, 9 debt / 1 bug.

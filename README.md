@@ -8,6 +8,8 @@ FreeHike is a 100% local-first, serverless, offline hiking app for iOS and Andro
 
 > **Zoom in v0.1: street level only.** The compiler builds zoom-14 tiles; the map shows zoom 14 and enlarges them above it, with no zoom-out below 14. Coarser zooms come in the next release. A compile tiles the whole downloaded extract (for the demo, all of Portugal), while the demo view is clamped to the Lisbon box.
 
+> **Background compile in v0.1 (Android).** Android compiles while charging. Started from the app, it runs as a foreground service; progress shows in the app only — on Android 13 and later no notification appears. After a phone restart it resumes by itself; on Android 15+ it may advance only in short bursts until you open the app (not yet observed on a device).
+
 ## How it works
 
 ```

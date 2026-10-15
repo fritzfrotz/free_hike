@@ -370,6 +370,56 @@ function checkPrivacy(root, opts, errors) {
 }
 
 // ---------------------------------------------------------------------------
+// Scanning: signing (P10.C1 — the release keystore and its passwords live in
+// a signing folder outside the repo; no tracked file carries either)
+// ---------------------------------------------------------------------------
+
+/** Keystore file names, and the properties files a signing config reads. */
+const SIGNING_FILE_NAMES = [
+  /(?:^|\/)[^/]+\.(?:jks|keystore|p12|pfx)$/i,
+  /(?:^|\/)(?:keystore|[^/]*signing[^/]*)\.properties$/i,
+];
+
+/** A Java KeyStore, whatever its name. */
+const JKS_MAGIC = Buffer.from([0xfe, 0xed, 0xfe, 0xed]);
+
+/** [regex, applies to rel]. A password key with a value in a .properties
+ *  file, or a password set to a string literal in any file (`key "v"`,
+ *  `key = 'v'`, `key("v")`). Reading the value from elsewhere (getProperty)
+ *  and a quoted key name in a list pass. */
+const SIGNING_PATTERNS = [
+  [/^[ \t]*[\w.-]*(?:store|key)[_.-]?pass(?:word)?[ \t]*[=:][ \t]*\S/gim, (rel) => rel.endsWith('.properties')],
+  [/(?<!["'\w])(?:store|key)Password(?:[ \t]*[=(][ \t]*|[ \t]+)(["'])[^"'\n]+\1/g, () => true],
+];
+
+function checkSigning(root, opts, errors) {
+  const hint = 'keystores and signing passwords stay in the signing folder outside the repo (P10.C1); ' +
+    'remove the file or value (it is not printed here)';
+  for (const [rel, buf] of privacySources(root, opts)) {
+    if (SIGNING_FILE_NAMES.some((re) => re.test(rel))) {
+      errors.push(`${rel}: signing (keystore-file) — ${hint}`);
+      continue;
+    }
+    if (buf.subarray(0, 4).equals(JKS_MAGIC)) {
+      errors.push(`${rel}: signing (keystore-bytes) — ${hint}`);
+      continue;
+    }
+    if (buf.includes(0)) continue; // binary
+    const text = buf.toString('utf8');
+    const seen = new Set();
+    for (const [re, applies] of SIGNING_PATTERNS) {
+      if (!applies(rel)) continue;
+      for (const m of text.matchAll(re)) {
+        const line = text.slice(0, m.index).split('\n').length;
+        if (seen.has(line)) continue;
+        seen.add(line);
+        errors.push(`${rel}:${line}: signing (password) — ${hint}`);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // TRACKER.md generation + drift checks
 // ---------------------------------------------------------------------------
 
@@ -452,8 +502,8 @@ function main() {
   const mode = args.includes('--fix') ? 'fix' : args.includes('--check') ? 'check' : null;
   const rootIdx = args.indexOf('--root');
   const root = rootIdx >= 0 ? path.resolve(args[rootIdx + 1]) : path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
-  // --staged: the privacy pass reads the index (pre-commit hook); the tag and
-  // rule passes keep reading the disk.
+  // --staged: the privacy and signing passes read the index (pre-commit
+  // hook); the tag and rule passes keep reading the disk.
   const staged = args.includes('--staged');
   if (!mode || (staged && mode !== 'check')) {
     console.error('usage: tracker-janitor.mjs --check [--staged] | --fix  [--root <dir>]');
@@ -473,6 +523,7 @@ function main() {
   const rules = parseRules(root, errors);
   checkForbiddenPatterns(root, files, rules, scan.exemptions, errors);
   checkPrivacy(root, { gitRoot, staged }, errors);
+  checkSigning(root, { gitRoot, staged }, errors);
 
   if (mode === 'fix') {
     fs.writeFileSync(path.join(root, 'TRACKER.md'), renderTracker(scan));

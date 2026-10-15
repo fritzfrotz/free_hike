@@ -14,7 +14,10 @@ data class CompileProgress(
 )
 
 /**
- * The background worker's progress sink (P9.C8). Keeps the logcat line and
+ * The background worker's progress sink (P9.C8). Writes the logcat line —
+ * every callback when [verbose] (debuggable builds), else once per integer
+ * percent (P10.C1: a release build carries no per-slice line, but the
+ * percent timeline stays in a capture) — and
  * hands a [CompileProgress] to [save] on integer change or once
  * [HEARTBEAT_MS] have passed since the last save — the WebView polls the
  * saved point and calls a job paused when it is more than 15 s old, so a
@@ -32,15 +35,20 @@ class CompileProgressSink(
     private val clock: () -> Long,
     private val save: (CompileProgress) -> Unit,
     private val log: (String) -> Unit,
+    private val verbose: Boolean,
 ) : ProgressCallback {
 
     private var lastPercent = -1
+    private var lastLoggedPercent = -1
     private var lastSaveMs = 0L
 
     override fun onProgress(percentage: Float, status: String) {
         try {
             val percent = percentage.toInt().coerceIn(0, 100)
-            runCatching { log("BG compile $percent% — $status") }
+            if (verbose || percent != lastLoggedPercent) {
+                lastLoggedPercent = percent
+                runCatching { log("BG compile $percent% — $status") }
+            }
             val now = clock()
             if (percent != lastPercent || now - lastSaveMs >= HEARTBEAT_MS) {
                 save(CompileProgress(jobId, percent, status, now))

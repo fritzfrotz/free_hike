@@ -1,6 +1,20 @@
 apply plugin: 'com.android.application'
 apply plugin: 'org.jetbrains.kotlin.android'
 
+// P10.C1: release signing. The keystore and its properties file live in a
+// signing folder outside the repo: $FREEHIKE_SIGNING_PROPERTIES, else
+// .freehike-signing/release.properties under the user home. The properties
+// file holds storeFile (relative to its own folder), storePassword, keyAlias
+// and keyPassword; no tracked file carries any of them (janitor signing pass).
+def signingPropsFile = file(System.getenv('FREEHIKE_SIGNING_PROPERTIES')
+        ?: new File(System.getProperty('user.home'), '.freehike-signing/release.properties').path)
+def signingKeys = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']
+def signingProps = new Properties()
+if (signingPropsFile.isFile()) {
+    signingPropsFile.withInputStream { signingProps.load(it) }
+}
+def signingReady = signingKeys.every { signingProps.getProperty(it) }
+
 android {
     namespace = "com.freehike.app"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -8,8 +22,9 @@ android {
         applicationId "com.freehike.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        // DL-006: versionCode = major*10000 + minor*100 + patch.
+        versionCode 100
+        versionName "0.1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -17,11 +32,39 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (signingReady) {
+                storeFile new File(signingPropsFile.parentFile, signingProps.getProperty('storeFile'))
+                storePassword signingProps.getProperty('storePassword')
+                keyAlias signingProps.getProperty('keyAlias')
+                keyPassword signingProps.getProperty('keyPassword')
+            }
+        }
+    }
     buildTypes {
         release {
+            if (signingReady) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+    }
+}
+
+// A release build never comes out unsigned: without a complete signing
+// properties file, any release packaging task fails here, naming the
+// missing keys (never a value). Debug builds need no signing folder.
+gradle.taskGraph.whenReady { graph ->
+    def releaseTask = graph.allTasks.find {
+        it.project == project && it.name ==~ /(assemble|bundle|package)Release/
+    }
+    if (releaseTask != null && !signingReady) {
+        def missing = signingKeys.findAll { !signingProps.getProperty(it) }
+        throw new GradleException(
+            "Release signing (P10.C1): ${signingPropsFile.isFile() ? 'properties file lacks ' + missing.join(', ') : 'no properties file at ' + signingPropsFile}"
+        )
     }
 }
 

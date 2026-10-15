@@ -321,3 +321,70 @@ test('privacy: a serial a few words after the keyword is caught; port/baud/forma
   assert.doesNotMatch(check.output, /docs\/ok\.md/);
   assert.ok(!check.output.includes('XQ77A0112233'));
 });
+
+// ---------------------------------------------------------------------------
+// Signing pass (P10.C1): keystores and signing secrets never enter a tracked
+// file. Same sources as the privacy pass (tree, or the index with --staged).
+// ---------------------------------------------------------------------------
+
+test('signing: keystore files, JKS bytes and password lines are refused, value never printed', () => {
+  const jks = Buffer.concat([Buffer.from([0xfe, 0xed, 0xfe, 0xed, 0, 0, 0, 2]), Buffer.alloc(32, 7)]);
+  const root = fixture({
+    'freehike-core/LOOPLOG.md': '# log\n',
+    'android/app/release.jks': 'x',
+    'keys/upload.keystore': 'x',
+    'keys/Upload.P12': 'x',
+    'keys/cert.pfx': 'x',
+    'android/keystore.properties': 'storeFile=a\n',
+    'android/release-signing.properties': 'keyAlias=a\n',
+    'assets/blob.dat': jks,
+    'android/gradle.properties': 'org.gradle.jvmargs=-Xmx1g\nMYAPP_UPLOAD_STORE_PASSWORD=hunter22secret\n',
+    'android/local.properties': 'sdk.dir=/opt/sdk\nkeyPassword: hunter22secret\n',
+    'android/app/build.gradle': 'signingConfigs { release {\n    storePassword "hunter22secret"\n} }\n',
+    'android/app/build.gradle.kts': 'val a = 1\nkeyPassword = \'hunter22secret\'\nstorePassword("hunter22secret")\n',
+  });
+  const check = run(root, '--check');
+  assert.equal(check.status, 1, check.output);
+  for (const rel of [
+    'android/app/release.jks', 'keys/upload.keystore', 'keys/Upload.P12', 'keys/cert.pfx',
+    'android/keystore.properties', 'android/release-signing.properties',
+  ]) {
+    assert.match(check.output, new RegExp(`${rel.replace(/\./g, '\\.')}: signing \\(keystore-file\\)`), rel);
+  }
+  assert.match(check.output, /assets\/blob\.dat: signing \(keystore-bytes\)/);
+  assert.match(check.output, /android\/gradle\.properties:2: signing \(password\)/);
+  assert.match(check.output, /android\/local\.properties:2: signing \(password\)/);
+  assert.match(check.output, /android\/app\/build\.gradle:2: signing \(password\)/);
+  assert.match(check.output, /android\/app\/build\.gradle\.kts:2: signing \(password\)/);
+  assert.match(check.output, /android\/app\/build\.gradle\.kts:3: signing \(password\)/);
+  assert.ok(!check.output.includes('hunter22secret'), 'password value leaked into output');
+});
+
+test('signing: a config that reads the secrets from outside the repo, and prose about it, pass', () => {
+  const root = fixture({
+    'freehike-core/LOOPLOG.md': [
+      '# log',
+      'The properties file names storeFile, storePassword, keyAlias and keyPassword;',
+      'keystore.properties and *.jks never enter the tree.',
+      '',
+    ].join('\n'),
+    'android/app/build.gradle': [
+      'def signingProps = new Properties()',
+      "def signingKeys = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']",
+      'signingConfigs {',
+      '    release {',
+      "        storeFile new File(signingDir, signingProps.getProperty('storeFile'))",
+      "        storePassword signingProps.getProperty('storePassword')",
+      "        keyAlias signingProps.getProperty('keyAlias')",
+      "        keyPassword signingProps.getProperty('keyPassword')",
+      '    }',
+      '}',
+      '',
+    ].join('\n'),
+    'android/gradle.properties': 'android.useAndroidX=true\n',
+    'android/.gitignore': '*.jks\n*.keystore\n',
+  });
+  const check = run(root, '--check');
+  assert.equal(check.status, 0, check.output);
+  assert.doesNotMatch(check.output, /signing \(/);
+});

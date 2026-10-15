@@ -181,7 +181,8 @@ class MapCompilerPlugin : Plugin() {
                     when (status) {
                         is CompilationStatus.Yielded -> {
                             val cp = status.checkpoint
-                            Log.i(
+                            // Per-slice: debuggable builds only (P10.C1).
+                            if (DebugBuild.isDebuggable(context)) Log.i(
                                 TAG,
                                 "slice $slices yielded: phase=${cp.phase} block=${cp.nextBlock} " +
                                     "pbfOffset=${cp.pbfByteOffset} bytesWritten=${cp.bytesWritten}"
@@ -406,7 +407,8 @@ class MapCompilerPlugin : Plugin() {
                     when (status) {
                         is FetchStatus.Yielded -> {
                             val s = status.state
-                            Log.i(
+                            // Per-slice: debuggable builds only (P10.C1).
+                            if (DebugBuild.isDebuggable(context)) Log.i(
                                 TAG,
                                 "fetch $sourceId slice $slices yielded: ${s.bytesHave}/${s.bytesTotal} bytes, restarts=${s.restarts}"
                             )

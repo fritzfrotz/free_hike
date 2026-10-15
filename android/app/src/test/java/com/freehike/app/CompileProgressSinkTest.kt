@@ -18,6 +18,7 @@ class CompileProgressSinkTest {
             clock = { 0L },
             save = { throw IllegalStateException("prefs write failed") },
             log = { throw RuntimeException("log failed") },
+            verbose = true,
         )
         failingSave.onProgress(12.3f, "pass1")
         failingSave.onProgress(13.0f, "pass1")
@@ -27,6 +28,7 @@ class CompileProgressSinkTest {
             clock = { throw Error("clock failed") },
             save = {},
             log = {},
+            verbose = false,
         )
         failingClock.onProgress(1.0f, "pass1")
     }
@@ -40,6 +42,7 @@ class CompileProgressSinkTest {
             clock = { now },
             save = { saved += it },
             log = {},
+            verbose = true,
         )
 
         sink.onProgress(1.2f, "a")   // first callback: save
@@ -58,5 +61,35 @@ class CompileProgressSinkTest {
         assertEquals(listOf(1_000L, 6_000L, 7_000L), saved.map { it.atMs })
         assertEquals(listOf("a", "a", "b"), saved.map { it.status })
         assertEquals(setOf("job"), saved.map { it.jobId }.toSet())
+    }
+
+    @Test
+    fun `release logs one line per integer percent, debug one per callback`() {
+        var now = 0L
+        fun run(verbose: Boolean): List<String> {
+            val lines = mutableListOf<String>()
+            val sink = CompileProgressSink(
+                jobId = "job",
+                clock = { now },
+                save = {},
+                log = { lines += it },
+                verbose = verbose,
+            )
+            now = 0L
+            sink.onProgress(0.0f, "a")   // first callback
+            sink.onProgress(0.7f, "a")   // same integer
+            now += 6_000
+            sink.onProgress(0.9f, "a")   // same integer, heartbeat save: not a log line
+            sink.onProgress(1.0f, "b")   // integer change
+            sink.onProgress(1.5f, "b")   // same integer
+            sink.onProgress(4.2f, "c")   // integer change (skips 2, 3)
+            return lines
+        }
+
+        assertEquals(
+            listOf("BG compile 0% — a", "BG compile 1% — b", "BG compile 4% — c"),
+            run(verbose = false),
+        )
+        assertEquals(6, run(verbose = true).size)
     }
 }

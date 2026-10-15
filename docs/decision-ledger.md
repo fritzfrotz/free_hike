@@ -52,3 +52,9 @@ Valhalla over GraphHopper · redb · FlatGeobuf · on-device compile over server
 - Traded away: zoom-out in v0.1; an overview of the compiled region.
 - Reasons: the engine has never built a tile below 14 — the z5–14 range predates Pass 3 (2026-07-13 vs 2026-07-14) and nothing on a device ever consumed it; coarse zooms are a new feature under the v0.1 scope rule (map compile, serverless, one region, airplane-mode verified; new features out); the P9.C9 view clamp (2026-10-12) already settles the demo view at the archive's zoom and bounds.
 - Next: coarse zooms are the first post-ship engine item — lower-zoom rows written inside Pass 3 per way, filtered per zoom; first step a measurement run (rows, bytes and time per zoom on the Portugal extract). Tracked in Base Camp, not in the repo.
+
+## DL-006 · Version 0.1.0 is versionCode 100 (2026-10-15)
+- Decision (operator): `versionCode = major*10000 + minor*100 + patch`; v0.1 ships as versionName 0.1.0, versionCode 100 (`android/app/build.gradle`). Debug and release builds share the pair; a build is told apart by its SHA-256 and signing certificate in the LOOPLOG build-identity block.
+- Optimizing for: a code any APK can be traced back to by arithmetic, increasing with every release.
+- Traded away: build numbers inside a version (two builds of 0.1.0 carry the same code); minor and patch cap at 99.
+- Context: release signing with the operator's key from P10.C1 on (LOOPLOG). The earlier debug installs (versionCode 1, debug key) cannot be updated in place by a release build: different signer.

@@ -106,12 +106,16 @@ class BackgroundCompileWorker(
         }
 
         val job = record.toCompileJob()
+        // P10.C1: per-slice lines only in debuggable builds; a release
+        // build logs progress once per integer percent.
+        val verbose = DebugBuild.isDebuggable(applicationContext)
         // P9.C8: logcat line plus the saved progress point the WebView polls.
         val progressSink = CompileProgressSink(
             jobId = record.jobId,
             clock = System::currentTimeMillis,
             save = { PendingJobStore.saveProgress(applicationContext, it) },
             log = { Log.i(TAG, it) },
+            verbose = verbose,
         )
         var slices = 0
         while (true) {
@@ -151,7 +155,8 @@ class BackgroundCompileWorker(
             slices += 1
             // P9.C11: one memory point per slice for the device capture's
             // curve against the 50 MB budget. Logging only; never throws.
-            CompileMemoryLog.sample(slices)?.let { Log.i(TAG, it) }
+            // Debuggable builds only (P10.C1).
+            if (verbose) CompileMemoryLog.sample(slices)?.let { Log.i(TAG, it) }
 
             if (slices == 1) {
                 // The FFI survived a full slice, so this run is not part of

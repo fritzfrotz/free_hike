@@ -5196,3 +5196,148 @@ worker's documentation block, as D004 is placed). The run-script wording
 stays in this entry as the source for the operator's chat/Session Log
 script; no tracked file. The agent miscounted the closing steps once
 (proposed 12, needed 13). Janitor: clean, 9 debt / 1 bug.
+
+## P10.C1 — signed release APK, release log gating (plan, 2026-10-15)
+
+**Operator calls (10-15):** option 1b (release logs one progress line per
+integer percent, debug one per callback); signing files in a home-folder
+`.freehike-signing/` directory, read by Gradle from `$FREEHIKE_SIGNING_PROPERTIES`
+or the user home, with the properties file naming the keystore relative to
+its own folder (no home path written anywhere); DL-006 for the version
+formula, 0.1.0 / 100. Budget 28 (reaching it = stop and ask). Branch
+`wip/release`; agent stages and stops. Build log = this LOOPLOG's
+build-identity block. If the agent's shell cannot read the signing folder,
+the operator runs `assembleRelease` and the agent verifies the APK. A
+`lintVitalRelease` failure = stop and ask. No GitHub Release (tag box).
+
+**Goal:** a signed release APK, 0.1.0 / 100, whose SHA-256 and byte size are
+in this log, and which writes no per-second GPS line and no per-slice line
+to logcat (except one progress line per integer percent).
+**Mechanism:** one signal — the APK's debuggable flag. Web: Capacitor 8.4.1
+forwards `console.*` to logcat only through its `Logger`, which with
+`loggingBehavior: 'debug'` logs only when the APK is debuggable; pinned
+explicitly. Kotlin: the same flag (`ApplicationInfo.FLAG_DEBUGGABLE`).
+**Files:** `capacitor.config.ts`, `src/test/releaseLogging.test.ts` (new),
+`android/.../CompileProgressSink.kt` + its test, `android/.../DebugBuild.kt`
+(new), `BackgroundCompileWorker.kt`, `MapCompilerPlugin.kt`,
+`scripts/tracker-janitor.mjs` + its test, `android/.gitignore`,
+`android/app/build.gradle`, `docs/decision-ledger.md`, this log,
+`TRACKER.md` (generated).
+**Ladder:** frontend L1 (`tsc -b`, `eslint .`, vitest), janitor self-test,
+JVM unit tests (`testDebugUnitTest`), ×2 consecutive; cross-compile `.so`
+from HEAD; release + debug APK build; static APK checks.
+
+**Steps:**
+1. [D] branch `wip/release`.
+2. [D] this plan entry.
+3. [D] red: `releaseLogging.test.ts` — `loggingBehavior` is `'debug'`
+   (fails: unset).
+4. [D] `capacitor.config.ts`: `loggingBehavior: 'debug'`.
+5. [E] red: sink test — non-verbose logs once per integer percent, verbose
+   once per callback (fails: no `verbose` parameter).
+6. [D] sink: `verbose` parameter.
+7. [D] `DebugBuild.kt`: the debuggable flag, read once.
+8. [D] worker: sink `verbose`, `BG mem slice=` gated.
+9. [D] plugin: foreground `slice N yielded` and fetch slice lines gated.
+10. [E] red: janitor tests — signing pass refuses keystore names, JKS magic,
+    password lines/literals; passes the real Gradle shape.
+11. [D] janitor signing pass.
+12. [D] `android/.gitignore`: keystore lines on.
+13. [D] `build.gradle`: signing config, release-task guard, 0.1.0 / 100.
+14. [D] DL-006.
+15–16. [D] ladder ×2.
+17. [D] `cargo ndk` `.so` from HEAD.
+18–19. [D] `npm run build` → `cap sync` → `gradlew --offline clean
+    :app:assembleRelease :app:assembleDebug`; static checks (read-only):
+    bundle, `capacitor.config.json`, debuggable flag release vs debug,
+    `apksigner verify`, cert SHA-256 digest only.
+20. [D] close entry with the build-identity block.
+21. [D] janitor `--fix` + `--check`.
+22. [D] stage.
+Planned 22 + slack; budget 28.
+
+### P10.C1 — execution + close (2026-10-15)
+
+No tracked item closes here (release box; no D/B tag existed for it).
+
+- Red → green:
+  - `releaseLogging.test.ts` failed ("expected undefined to be 'debug'")
+    before `loggingBehavior: 'debug'` was set in `capacitor.config.ts`.
+  - `CompileProgressSinkTest` failed to compile ("No parameter with name
+    'verbose'") before the sink took `verbose`; the new test drives six
+    callbacks: release 3 lines (0 %, 1 %, 4 %), debug 6; a heartbeat save
+    is not a log line.
+  - Janitor: the refusing test failed (16/17) before the signing pass.
+- Changed:
+  - `DebugBuild.kt` (new): `FLAG_DEBUGGABLE`, the flag Capacitor reads for
+    the web layer. Worker: sink `verbose` from it; `BG mem slice=` debug
+    only. Plugin: foreground `slice N yielded` and fetch `slice N yielded`
+    debug only. Lifecycle lines unchanged. The web GPS / easeTo / map-idle
+    call sites are unchanged: release silence comes from Capacitor.
+  - Janitor signing pass (`tracker-janitor.mjs`), same sources as the
+    privacy pass (tree in CI, index with `--staged` in the hook): keystore
+    file names (`.jks`, `.keystore`, `.p12`, `.pfx`, `keystore.properties`,
+    `*signing*.properties`), JKS magic bytes, password keys with a value in
+    `.properties` files, password string literals anywhere. Values never
+    printed. `android/.gitignore` ignores the same names.
+  - `build.gradle`: signing config read from the signing folder (env
+    `FREEHIKE_SIGNING_PROPERTIES`, else the user-home default), `storeFile`
+    resolved against the properties file's own folder; release signed only
+    when all four keys are present; a release packaging task without them
+    fails in `taskGraph.whenReady`, naming the missing keys or file.
+    Version 0.1.0 / 100 (DL-006).
+- Guard proof (before the properties file existed): `:app:assembleRelease`
+  failed in 0.7 s with "Release signing (P10.C1): no properties file at …",
+  no release APK written.
+- Ladder ×2 consecutive: `tsc -b` ok, `eslint .` ok, vitest 19 files / 96
+  tests both runs (was 18 / 95: one file, one test added); janitor
+  self-test 17/17 both runs (was 15: two added); JVM unit tests 6/6 both
+  runs (`testDebugUnitTest`, second with `--rerun-tasks`); janitor
+  `--check` clean on the tree.
+- Build: `npm run build` → `npx cap sync android` → `gradlew --offline
+  clean :app:assembleRelease :app:assembleDebug`, exit 0;
+  `lintVitalRelease` ran and passed. `cap sync` changed no tracked file.
+
+**Build identity (pre-merge, chunk P10.C1):**
+- Release APK `app-release.apk`: 10,867,445 B, SHA-256
+  `2bbf9948ae8c4c61514fc6839614785bac0af819686c02936f75e98aa368a2a2`.
+  versionCode 100, versionName 0.1.0, no `application-debuggable`.
+  `apksigner verify`: verifies, APK Signature Scheme v2 (v1/v3/v4 not
+  used; minSdk 24). Signer certificate SHA-256 digest
+  `cf030fdc886ce4618f9dad04033e9e0cb46ab5e178ff204dccbd998164e72da6`.
+- Debug APK `app-debug.apk` (same sources, for contrast): 12,157,862 B,
+  SHA-256 `8ba48d3edba2521b7328677fcd9e3ee9ca5b3902da8f09cf6027c7abdd18baa7`,
+  `application-debuggable`, debug certificate digest `7052051b…`.
+- Both APKs: one app bundle `index-DVNU4ems.js`, 1,341,882 B (same as
+  `dist`); "No offline map yet" and "continues while charging" present,
+  "Innsbruck Center" and "Patscherkofel" absent; no `assets/public/local/`;
+  bundled `capacitor.config.json` has `loggingBehavior` `debug`; dex
+  carries `DebugBuild`; arm64 `libfreehike_ffi.so` 5,065,152 B, SHA-256
+  `d971baba834f90577e91746f879ba461306e3dfc801c62de6836c6a4d4bbbc7f`.
+- The `.so` was rebuilt from HEAD (`cargo ndk … --release -p ffi`, only
+  the `ffi` crate recompiled): same size as the RC2 `.so`, different
+  SHA-256 (was `ce17c371…`). Not investigated.
+
+- Not exercised: on device. No release APK has run on a phone; logcat
+  silence in release (no `Capacitor/Console`, no per-slice lines, one
+  progress line per percent) is inferred from the debuggable flag being
+  absent and the config inside the APK, not observed. The release APK
+  cannot be installed over the earlier debug installs (different signer):
+  uninstalling deletes the compiled region and the pending job.
+- Flagged deviations (operator veto offered): (1) the janitor's literal
+  pattern was tightened mid-chunk after a false positive on the key-name
+  list in `build.gradle:11`; the list shape is now in the passing test;
+  (2) the plan entry's "Planned 22" left out the red and ladder runs;
+  (3) `gradlew build` (or any task graph containing `assembleRelease`) now
+  needs the signing folder; debug and unit-test tasks do not.
+
+Promotion valve: no candidate — the lesson ("a framework default already
+gates the logs; pin it, don't re-gate") is now a test, not prose.
+Steps: 26/28 (branch 1, plan 1, web red test 1, red run 1, config 1, sink
+test 1, red run 1, sink 1, DebugBuild 1, worker 1, plugin 1, janitor tests
++ red run 1, red read 1, signing pass 1, gitignore 1, build.gradle 1,
+pattern fix + test 1, DL-006 1, ladder 2, `.so` 1, guard proof 1, build 1,
+this entry 1, janitor 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — staged on `wip/release`; commit and push by the
+operator.

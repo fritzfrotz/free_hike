@@ -5341,3 +5341,172 @@ this entry 1, janitor 1, stage 1). Pivots: 0.
 
 **Status:** AGENT-CLOSED — staged on `wip/release`; commit and push by the
 operator.
+
+## Release-build device run — observed (2026-10-15, release)
+
+Mode: execute and observe; no code change. Summary only; raw captures,
+pre-reboot and final system dumps stay in the git-ignored device-logs
+folder. Budget 12 (operator). Agent drove adb; the operator handled the
+phone and reported in chat.
+
+- **Device:** Samsung SM-S918B (S23 Ultra), Android 16.
+- **Build:** main `c7ced7e` (P10.C1), release APK 10,867,445 B, SHA-256
+  `2bbf9948ae8c4c61514fc6839614785bac0af819686c02936f75e98aa368a2a2`.
+  The installed copy was read back from the phone byte for byte: same
+  size and SHA-256. versionName 0.1.0, versionCode 100, not debuggable.
+  The phone shows only a short signer hash (scheme v2); the full signer
+  digest `cf030fdc…2da6` in the P10.C1 block follows from the identical
+  bytes, not from a phone read.
+- **Capture:** three detached `adb logcat -v time` captures on the Mac
+  (main, system, events, crash), one per boot, plus a full dump every
+  3 min and a full dump before each reboot. The phone caps each log
+  buffer at 5 MiB (`-G 32M` refused; system and events raised from 2 MiB
+  and 0.5 MiB to 5). Gaps: the shutdown seconds of each reboot only;
+  each restarted capture replays the buffer from boot. A release build
+  has no run-as: no app files, fetch sidecar or WorkManager database
+  were read this run.
+
+### 10-14 capture death (step 0)
+
+Not established. The 10-14 capture ran on the phone under `setsid` with
+its input and output on /dev/null, started from the operator's terminal,
+so no Mac-side process or tool call could end it. The phone keeps no
+record of its death. Today's captures run on the Mac instead and stop at
+a USB unplug; none happened.
+
+### Steps
+
+0. **Capture alive — pass.** Growth checked over 20 s and the process
+   checked re-parented to init.
+1. **Install — pass.** Debug install removed, release installed; version
+   and bytes as above.
+2. **Boot — pass, clean.** The native library loaded and the thermal
+   bridge armed. No error or banner line from the app; the process's E/W
+   lines are platform noise (codec tables, a missing vendor library,
+   Bluetooth permission for WebView media). No `Capacitor/Console` line.
+   D014's safe-area warning was a console line and cannot be seen in a
+   release build: not seen ≠ fixed.
+3. **Download verified — pass (operator call, on evidence other than the
+   planned line).** The Portugal extract (Geofabrik 261014,
+   425,825,833 B) downloaded fresh in 31 slices, about 2 min 40 s. The
+   planned "verified-checksum line" does not exist in logcat: the
+   fetcher's `fetch: verified` note goes to the progress callback, not
+   to the Android logger, and was never in a capture (10-12, 10-14
+   included). Evidence instead: `Finished` is returned only after the
+   MD5 check and the `verified=true` sidecar save, and at enqueue the
+   compile gate logged `query_fetch … found (425825833/425825833 bytes,
+   verified=true)`; the engine refuses an unverified download, so the
+   compile starting is the proof.
+4. **Quietness — 0 + 61.** The grep `Capacitor/Console | BG mem |
+   slice .* yielded` matched 0 lines (also case-insensitive), then and
+   over the whole run. The Rust layer logs at Info on every slice, and
+   that logging isn't gated: 61 per-slice lines from the download alone
+   (31 entered, 30 Yielded). Over the whole run: 5,134 per-slice Rust
+   lines out of 5,170 Rust lines.
+5. **Airplane on, foreground service, progress lines — pass.** Airplane
+   on at about 14:12 (system broadcast; cellular down within 2 s). The
+   compile's foreground service was allowed in the same second as the
+   enqueue (dataSync type, compile notification channel). Progress: one
+   line per integer percent within each worker run (detail below).
+6. **Reboot mid-compile — first attempt not headless, second pass.**
+   - Reboot 1 at 40 % (about 14:18). After the unlock, the app was opened
+     from the Recents screen about 6 s after boot; the engine resumed
+     80 ms after the activity resumed. Not headless; the operator pressed
+     Home and the reboot was redone. In that boot the first worker's
+     foreground service was stopped by the system after 35 s ("Stop FGS
+     timeout"); the worker saved its checkpoint and a new worker started
+     at once. Cause not established (that start carried the boot-time
+     temporary allowlist, 20 s).
+   - Reboot 2 at 50 % (about 14:22), app in the background. WorkManager's
+     boot receiver started the app process about 1 min after the reboot,
+     with no activity; the compile resumed from its checkpoint (pass 3)
+     within 1 s and ran **to 100 % without the app ever being opened**:
+     about 20 min, 568 slices, worker result SUCCESS. No other process
+     start, no Recents or activity launch, no kill in that boot until the
+     operator opened the app afterwards.
+   - Deviation (operator call, flagged): step 6 ran to the finish instead
+     of 20 min plus an open; step 7 became "open → handoff".
+7. **Open, handoff, network silence — pass.**
+   - Opened about 1 min after the finish: the activity started in the
+     compile's own process; the handoff acknowledge (sandbox archive
+     released, temporary state purged) logged 2.4 s later. The web-side
+     copy logs nothing in a release build: the order "copy closed and
+     byte-checked, then acknowledge" is the code's contract, not a log
+     line. 94 MB in at most 2.4 s from a cold web view is faster than
+     expected for the chunked copy (D011); the copied file can't be read
+     without run-as. Operator: "looks good, I see the map, rotate zoom
+     tilt work".
+   - Airplane off at about 14:46. Between the two airplane timestamps
+     (34 min, three boots): no data network came up (cellular down at the
+     start, no Wi-Fi or cellular connect after; the boot-time default
+     network had no INTERNET capability and no routes); no non-local URL
+     and no network error from the app's processes (6,710 lines); the
+     only network requests registered by the app's user ID are the
+     WebView's network-change listeners, one pair per web view creation.
+     Not resolved: the system's socket-destroy pass named the app's user
+     ID 5 and 10 s after the compile's foreground service ended; the line
+     doesn't say whether a socket existed, and with no data network any
+     socket could only have been local.
+8. **Operator checks.** GPS tap: pass ("gps works"). Force-stop and
+   reopen: pass (operator; log shows the stop from Settings and the
+   relaunch; a refused Samsung prelaunch for the stopped package before
+   it is system-side). Search a place: not applicable — no search
+   feature exists in the build (operator confirmed; no search code in
+   `src/` or native code). GPX track: not applicable — no GPX code
+   anywhere in the repo.
+
+### Compile figures
+
+- 28,354 tiles (same as 10-12 and 10-14); archive 94,062,239 B (10-14:
+  94,036,621 B; newer extract); 2,436,030 blocks.
+- Slices: 311 before reboot 1, 135 in the reboot-1 boot, 568 after
+  reboot 2.
+- Progress lines: 88, 85 distinct percents. Skipped percents are phase
+  jumps (21–39 partly, at the pass-1 → 2 boundary; 98–99 at the end).
+  Repeats (46 % ×3, 50 % ×2) are the first line of a new worker after a
+  restart. No repeats within one worker.
+- Thermal: Fair/Serious during the download and the first compile
+  minutes, Serious again for about 6 min after reboot 1, Nominal from
+  about 14:27 to the finish.
+- Memory: not observed. The release build gates the per-slice memory
+  line, by design (P10.C1).
+
+### Headless reboot, worded for the README
+
+"After a phone reboot mid-compile, Android restarted the compile in the
+background on its own, without the app being opened, and it ran to
+completion (release build, Samsung S23 Ultra, Android 16, airplane mode,
+on USB power). The finished map was handed to the app on the next open."
+
+### Findings (not tagged; budget)
+
+1. Release logcat is not quiet on the native side: about five Rust Info
+   lines per compile slice and two per download slice, ungated. P10.C1's
+   goal ("no per-slice line") holds for Kotlin and the web layer only.
+2. README overclaims: `README.md:37` "native background geolocation with
+   GPX export" — no GPX code exists; the same section's "proven with
+   SIGKILL torture tests" conflicts with D010 (never built).
+3. The planned verified-checksum line doesn't exist in logcat (step 3).
+4. A 35 s foreground-service stop by the system after reboot 1 (step 6),
+   cause unknown; recovered by a worker restart.
+5. Samsung logs `setRequestedFrameRate` for the WebView about 120 times a
+   second under the app's process (also in the 10-14 debug run): system
+   code, but it cycles the 5 MiB buffer in minutes.
+
+### Not observed
+
+Headless resume on battery or unplugged (USB was connected throughout);
+a reboot with the app swiped away; the copied archive's size in app
+storage; memory figures; iOS; the safe-area warning (D014) in release;
+the cause of the 10-14 capture death.
+
+Promotion valve: candidate — a device-run script must name only log lines
+that exist in the build being run (step 3 waited on a line that was never
+logged). Not promoted; operator call. No tracked item closed.
+
+Steps: 12/12 (capture start 1, install 1, pre-reboot dump 1, reboot 1,
+capture restart 1, dump + reboot 2 1, capture restart 1, final dumps +
+capture stop 1, branch 1, this entry 1, janitor 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — staged on `wip/run`; commit and push by the
+operator.

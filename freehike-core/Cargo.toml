@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["FreeHike contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/freehike/freehike"
+repository = "https://github.com/fritzfrotz/free_hike"
 
 [workspace.dependencies]
 uniffi = "0.29"

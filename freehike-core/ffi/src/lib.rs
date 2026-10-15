@@ -48,6 +48,7 @@ uniffi::setup_scaffolding!("freehike");
 fn ensure_logging() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
+        // DEBT(D019): per-slice Rust lines are ungated in release — Info is the max level in every build, so a release compile writes about five lines per slice to logcat (release run 2026-10-15, finding 1) — platforms: core
         #[cfg(target_os = "android")]
         android_logger::init_once(
             android_logger::Config::default()

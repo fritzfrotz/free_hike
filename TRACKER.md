@@ -26,6 +26,8 @@
   - src/ui/services/locationTracker.ts:83
 - **D018** — notification permission is never requested, so on Android 13+ the compile's foreground-service notification is suppressed and none shows (RC2 log 12:37:54) — platforms: android
   - android/app/src/main/java/com/freehike/app/BackgroundCompileWorker.kt:29
+- **D019** — per-slice Rust lines are ungated in release — Info is the max level in every build, so a release compile writes about five lines per slice to logcat (release run 2026-10-15, finding 1) — platforms: core
+  - freehike-core/ffi/src/lib.rs:51
 
 ## Open Bugs
 

@@ -96,9 +96,10 @@ violate these most)
 
 ## Process facts
 
-- This project runs a two-model process: an implementing agent writes the
-  code; a reviewing model from a different vendor audits plans and
-  close-reports adversarially; mechanical
+- This project runs a two-session process: an implementing agent writes the
+  code; a separate Claude session, working with the operator, reviews plans
+  and close-reports adversarially (no second-vendor review is in place);
+  mechanical
   enforcement (tests, CI, janitor) verifies both; the human operator holds all
   gates. Write reports to be checkable, not persuasive: name the test, the
   file, the count — every claim should be verifiable in under a minute.

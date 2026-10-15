@@ -5510,3 +5510,130 @@ capture stop 1, branch 1, this entry 1, janitor 1, stage 1). Pivots: 0.
 
 **Status:** AGENT-CLOSED — staged on `wip/run`; commit and push by the
 operator.
+
+## P10.C2 — v0.1.0 README (plan, 2026-10-15)
+
+**Operator calls (10-15):** the README draft of 10-15 approved with eleven
+changes (reviewer described as a separate Claude session with the operator,
+no second-vendor claim; ledger "with their reasons"; reboot bullet split
+into resume-from-checkpoint, finish-after-open (D017) and the headless case;
+storage-warning line dropped — the RC1 entry records no banner and the
+warning console-only since P9.C10; compile time "9–14 minutes"; methodology
+link → `agentic_operating_manual.md`; DL-001 sentence and safe-area line
+dropped; terrain "after v0.1 ships, ranked ahead of routing"; tag `v0.1.0`;
+repository URL fixed; both release placeholders filled from the 10-15
+release run entry). Added in chat: manual §3.5 edit (load-bearing decisions
+carry their reasons in the ledger; predictions are kept outside the repo
+and scored at checkpoints) — operator-authorized, logged here as the §1.6
+record of a chat-authorized manual change; DL-001 to DL-005 keep their
+predictions as history, untouched. Repository URL fixed in `package.json`
+and `freehike-core/Cargo.toml`. D019 tag for the ungated per-slice Rust
+lines (release run finding 1) plus one Known-issues line. Source comments
+stripped. Budget 12 → 13. Branch `wip/readme`; agent stages and stops.
+
+**Goal:** the README claims nothing the run entries, tracked debts or ledger
+do not support, and its release section reports the release build's own run.
+**Files:** `README.md`, `docs/decision-ledger.md`,
+`agentic_operating_manual.md` (§3.5 only), `package.json`,
+`freehike-core/Cargo.toml`, `freehike-core/ffi/src/lib.rs` (tag only), this
+log, `TRACKER.md` (generated).
+**Ladder:** Markdown, metadata and one comment line — no build or test run
+(precedent D012/D013). Read-only checks: every relative link in the README
+read as a file; `cargo fmt --check` (parses the edited workspace manifest
+and the tagged file); `package.json` parsed by node. Janitor `--fix` +
+`--check`.
+
+**Steps:**
+1. [D] branch `wip/readme`.
+2. [D] this plan entry.
+3. [D] `README.md` written from the approved draft with the changes.
+4. [D] `docs/decision-ledger.md` header: format line "with their reasons";
+   predictions outside the repo.
+5. [D] manual §3.5 text.
+6. [D] `package.json` repository URL.
+7. [D] `freehike-core/Cargo.toml` repository URL.
+8. [D] D019 tag at the Rust logger init (`ffi/src/lib.rs`, `ensure_logging`
+   — the init the operator called "the engine's logging init" lives in the
+   ffi crate; comment on a private fn, no surface change).
+9. [D] janitor `--fix` + `--check` — clean, D019 listed.
+10. [D] close entry.
+11. [D] stage.
+Planned 11; budget 13.
+
+### P10.C2 — execution + close (2026-10-15)
+
+No tracked item closes here; D019 opens (`ffi/src/lib.rs:51`, release run
+finding 1). Release run finding 2 (README overclaims: GPX export, SIGKILL
+torture proof) is resolved by the rewrite — neither claim remains.
+
+- README: rewritten from the approved draft with the eleven changes; source
+  comments stripped. Release placeholders filled from the 10-15 release run
+  entry: the background-compile paragraph's restart clause is the entry's
+  "Headless reboot, worded for the README" sentence verbatim, the "short
+  bursts" clause dropped; the Tested-on table gains the release row (main
+  `c7ced7e`, release 0.1.0 (100)). Kill-mid-download cites RC2, the only
+  run with a kill mid-download (10-12 had a transient error, the release
+  run no kill). One Known-issues line for D019. Storage-warning line
+  dropped (RC1: no banner, warning console-only since P9.C10).
+- Ledger header: "with their reasons"; predictions outside the repo;
+  DL-001 to DL-005 untouched. Manual §3.5: same rule, chat-authorized
+  (operator, 10-15); this entry is its §1.6 record. The manual's version
+  header line was not touched (not in the authorization).
+- Repository URL → `github.com/fritzfrotz/free_hike` in `package.json` and
+  `freehike-core/Cargo.toml` (the only two tracked occurrences of the old
+  URL).
+- D019 tag: one comment line in `ensure_logging` (`ffi/src/lib.rs`), the
+  Rust logger init — not in the engine, where no init exists.
+- Checks (read-only): the six relative README links (`ARCHITECTURE.md`,
+  `LICENSE`, `TRACKER.md`, `agentic_operating_manual.md`,
+  `docs/decision-ledger.md`, `freehike-core/LOOPLOG.md`) each opened;
+  `cargo fmt --check` clean (manifest parsed); `package.json` parsed by
+  node. No build or test run: Markdown, metadata and one comment line.
+- Janitor `--fix` + `--check`: clean, 10 debt / 1 bug.
+- Flagged deviations (operator veto offered): (1) build line `cargo ndk …
+  -o android/app/src/main/jniLibs` → `-o ../android/…` — the block `cd`s
+  into `freehike-core/` first and there is no root workspace; the old line
+  (also in the previous README) wrote the library to the wrong place; one
+  extra step. (2) The release link is absolute
+  (`https://github.com/fritzfrotz/free_hike/releases/tag/v0.1.0`), not the
+  draft's relative `../../releases/…` route, which no file read can check;
+  the release itself does not exist yet.
+- Left open: `AGENTS.md` "Process facts" still describes a reviewing model
+  from a different vendor, which the README now says is not in place
+  (AGENTS.md edits are an operator gate); the `package.json` description
+  still says DEM data and terrain tiles (not in scope); "9–14 minutes" —
+  9 is the 10-12 run (8 min 51 s), no run entry states 14.
+
+Promotion valve: no candidate. Steps: 12/13 (branch 1, plan 1, README 1,
+build-line fix 1, ledger 1, manual 1, package.json 1, Cargo.toml 1, D019 1,
+janitor 1, this entry 1, stage 1). Pivots: 0.
+
+**Status:** AGENT-CLOSED — staged on `wip/readme`; commit and push by the
+operator.
+
+### P10.C2 — addendum (2026-10-15)
+
+**Operator calls (10-15):** budget 13 → 16; three additions, operator-
+authorized: `AGENTS.md` process facts (the reviewer is a separate Claude
+session with the operator; no second-vendor review is in place), the
+manual's version header lists the §3.5 amendment with today's date, the
+`package.json` description without DEM data or terrain tiles.
+
+- `AGENTS.md`: "two-model process … a reviewing model from a different
+  vendor" → "two-session process … a separate Claude session, working with
+  the operator … (no second-vendor review is in place)".
+- Manual header: "2026-10-15 amendment: §3.5 predictions outside the repo".
+- `package.json` description: OpenStreetMap data → vector basemap; DEM and
+  terrain removed (DL-004).
+- "9–14 minutes" (README quickstart): 9 = the 10-12 airplane run (8 min
+  51 s); 14 = the 10-12 RC1 entry, "339 slices, about 13.5 min from request
+  to finish", a run that included an unplug.
+- Janitor `--fix` + `--check` re-run in this command; result in the close
+  report and the re-staged `TRACKER.md`. `package.json` parsed by node.
+- Step count, corrected: the close entry and the stage ran as one Bash
+  command, so the first pass was 11 steps by §1.4's definition (logged as
+  12). This addendum: 3 edits + this command (entry, janitor, re-stage) =
+  4. Total 15/16. Pivots: 0.
+
+**Status:** AGENT-CLOSED — re-staged on `wip/readme`; commit and push by the
+operator.

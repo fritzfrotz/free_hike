@@ -1,9 +1,10 @@
 # Decision Ledger
 
-Technical, load-bearing decisions. Format: optimizing-for / traded-away /
-premises / prediction / wrong-if / checkpoint / verdict. Reversible
-decisions don't get nodes; one-way doors do. Predictions are scored at
-checkpoints. Reversals are recorded before patching.
+Technical, load-bearing decisions, with their reasons. Format:
+decision / optimizing-for / traded-away / premises / reasons. Reversible
+decisions don't get nodes; one-way doors do. Predictions are kept outside
+the repo and scored at checkpoints; DL-001 to DL-005 keep theirs as
+history. Reversals are recorded before patching.
 Prefix convention: DL-### = decision ledger, D### = tracker debt.
 
 ## DL-001 · Methodology v2.1 (2026-09-09)

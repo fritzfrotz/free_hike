@@ -2,11 +2,11 @@
   "name": "freehike",
   "private": true,
   "version": "0.1.0",
-  "description": "Zero-cost offline hiking maps: the phone downloads raw OpenStreetMap + DEM data and compiles its own vector basemap and terrain tiles on-device — no servers, ever.",
+  "description": "Zero-cost offline hiking maps: the phone downloads raw OpenStreetMap data and compiles its own vector basemap on-device — no servers, ever.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/freehike/freehike.git"
+    "url": "https://github.com/fritzfrotz/free_hike.git"
   },
   "type": "module",
   "scripts": {

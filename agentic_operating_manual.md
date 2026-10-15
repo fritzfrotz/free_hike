@@ -1,7 +1,7 @@
 # FreeHike Agentic Operating Manual
 
 > v1 (retired 2026-09-09) — built everything up to v0.1 finish-line start.
-> v2.1 (active, 2026-09-09; 2026-09-23 amendment: §1.4 budget) — see Part 3. v2 (mandatory hand-coding as
+> v2.1 (active, 2026-09-09; 2026-09-23 amendment: §1.4 budget; 2026-10-15 amendment: §3.5 predictions outside the repo) — see Part 3. v2 (mandatory hand-coding as
 > training) was drafted and dropped before first use as artificial slowdown.
 > Parts 1–2 remain binding mechanics; v2.1 changes the operator's role, not the loop.
 
@@ -327,6 +327,7 @@ Decided upfront, never in the moment.
 
 ### 3.5 Predictions
 
-Load-bearing decisions carry a prediction ("expect …; wrong if …") in
-`docs/decision-ledger.md` and are scored at checkpoints. First checkpoint:
-2026-09-22 (DL-001).
+Load-bearing decisions carry their reasons in `docs/decision-ledger.md`.
+Predictions ("expect …; wrong if …") are kept outside the repo and scored
+at checkpoints. DL-001 to DL-005 keep their recorded predictions as
+history.
